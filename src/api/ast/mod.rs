@@ -1,8 +1,10 @@
+#[allow(dead_code)]
 pub struct Process {
     ident: String,
     branches: Vec<Branch>,
 }
 
+#[allow(dead_code)]
 pub struct Branch {
     ty: BranchType,
     variables: Vec<Variable>,
@@ -13,6 +15,7 @@ pub enum BranchType {
     Constructor,
 }
 
+#[allow(dead_code)]
 pub struct Variable {
     ident: Ident,
     ty: Path,
