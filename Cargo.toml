@@ -1,0 +1,8 @@
+[package]
+name = "lake-frontend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+miette = {version = "7.6.0", features = ['fancy']}
+peg = "0.8.5"
