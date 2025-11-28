@@ -27,13 +27,12 @@ pub fn ident(input: &str) -> Result<(&str, Ident)> {
     .parse(input);
     let (next, raw) = res.map_err(|err| match err {
         nom::Err::Incomplete(needed) => todo!("{needed:?}"),
-        nom::Err::Error(error) => ParserError::IdentParsingError {
-            source_code: error.input.into(),
-            bad_bit: (
-                input.find_substring(error.input).unwrap(),
-                error.input.len(),
-            )
-                .into(),
+        nom::Err::Error(error) => match input.find_substring(error.input) {
+            Some(start) => ParserError::IdentParsingError(
+                error.input.into(),
+                (start, error.input.len()).into(),
+            ),
+            None => ParserError::BadSubsting(error.input.into()),
         },
         nom::Err::Failure(remaining) => todo!("Failure: {remaining}"),
     })?;
@@ -60,10 +59,7 @@ mod tests {
     fn parse_ident_error() -> Result<()> {
         assert_eq!(
             ident("123"),
-            Err(ParserError::IdentParsingError {
-                source_code: "123".into(),
-                bad_bit: (0, 3).into()
-            })
+            Err(ParserError::IdentParsingError("123".into(), (0, 3).into()))
         );
         Ok(())
     }

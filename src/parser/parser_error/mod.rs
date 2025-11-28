@@ -1,5 +1,4 @@
-use miette::{Diagnostic, NamedSource, SourceSpan};
-use nom::error::{ErrorKind, ParseError};
+use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
 #[allow(dead_code)]
@@ -15,14 +14,19 @@ pub enum ParserError {
             "You must only use identifiers that begin with letters or underscores and use only letters, numbers, and underscores."
         )
     )]
-    IdentParsingError {
-        #[allow(dead_code)]
-        #[source_code]
-        source_code: String,
-        #[allow(dead_code)]
-        #[label("Something wrong here")]
-        bad_bit: SourceSpan,
-    },
+    IdentParsingError(
+        #[source_code] String,
+        #[label("Something wrong here")] SourceSpan,
+    ),
+
+    #[error("Substring not found error")]
+    #[diagnostic(
+        code(parser::error::substringNotFound),
+        help(
+            "This is a compiler bug! Report about it here: (https://github.com/morphqdd/lake_frontend)"
+        )
+    )]
+    BadSubsting(String),
 }
 
 // impl<I> ParseError<I> for ParserError
