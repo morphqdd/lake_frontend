@@ -22,6 +22,12 @@ pub struct Variable {
     default: Option<Value>,
 }
 
+impl Variable {
+    pub fn new(ident: Ident, ty: Path, default: Option<Value>) -> Self {
+        Self { ident, ty, default }
+    }
+}
+
 pub enum Value {
     Int(i32),
     String(String),
@@ -37,5 +43,5 @@ impl Ident {
 }
 pub enum Path {
     Path(Box<Path>),
-    Type { ty_ident: String },
+    Type(Ident),
 }
