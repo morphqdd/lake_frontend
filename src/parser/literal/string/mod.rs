@@ -1,6 +1,6 @@
 use nom::{
     FindSubstring, IResult, Parser,
-    bytes::complete::{tag, take_till, take_until},
+    bytes::complete::{tag, take_till},
     combinator::recognize,
     sequence::pair,
 };
@@ -10,6 +10,7 @@ use crate::{
     parser::parser_error::{ParserError, Result},
 };
 
+#[allow(dead_code)]
 pub fn string(input: &str) -> Result<(&str, Literal)> {
     let res: IResult<&str, &str> = recognize(pair(
         tag(r#"""#),
@@ -17,7 +18,7 @@ pub fn string(input: &str) -> Result<(&str, Literal)> {
     ))
     .parse(input);
     let (next, str) = res.map_err(|err| match err {
-        nom::Err::Incomplete(needed) => todo!(),
+        nom::Err::Incomplete(_needed) => todo!(),
         nom::Err::Error(err) => match input.find_substring(err.input) {
             Some(start) => ParserError::StringParsingError(
                 input.into(),
