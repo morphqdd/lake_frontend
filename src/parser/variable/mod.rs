@@ -1,12 +1,10 @@
 use nom::{
-    IResult, Parser,
     bytes::complete::tag,
-    character::complete::{multispace0, one_of},
-    multi::{many, many0},
+    character::complete::multispace0,
 };
 
 use crate::{
-    api::ast::{Ident, Path, Variable},
+    api::ast::{Path, Variable},
     parser::{ident::ident, literal::number::number, parser_error::Result},
 };
 
@@ -15,7 +13,7 @@ pub fn variable(input: &str) -> Result<(&str, Variable)> {
     let next = match multispace0::<_, nom::error::Error<_>>(next) {
         Ok((next, _)) => next,
         Err(err) => match err {
-            nom::Err::Incomplete(needed) => todo!(),
+            nom::Err::Incomplete(_needed) => todo!(),
             nom::Err::Error(_) => todo!(),
             nom::Err::Failure(_) => todo!(),
         },
@@ -25,7 +23,7 @@ pub fn variable(input: &str) -> Result<(&str, Variable)> {
     let (next, default_val) = match res {
         Ok((next, _)) => number(next)?,
         Err(err) => match err {
-            nom::Err::Incomplete(needed) => todo!(),
+            nom::Err::Incomplete(_needed) => todo!(),
             nom::Err::Error(_) => todo!(),
             nom::Err::Failure(_) => todo!(),
         },
