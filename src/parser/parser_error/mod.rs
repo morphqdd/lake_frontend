@@ -16,7 +16,7 @@ pub enum ParserError {
     )]
     IdentParsingError(
         #[source_code] String,
-        #[label("Something wrong here")] SourceSpan,
+        #[label("Wrong ident here")] SourceSpan,
     ),
 
     #[error("Substring not found error")]
@@ -27,8 +27,17 @@ pub enum ParserError {
         )
     )]
     BadSubsting(String),
-}
 
+    #[error("Number parsing error")]
+    #[diagnostic(
+        code(parser::error::numberParsingError),
+        help("Expected a integer consisting only of digits (0–9).")
+    )]
+    NumberParsingError(
+        #[source_code] String,
+        #[label("Wrong number here")] SourceSpan,
+    ),
+}
 // impl<I> ParseError<I> for ParserError
 // where
 //     I: nom::Offset + ToString,

@@ -8,12 +8,10 @@ use crate::{
     parser::parser_error::{ParserError, Result},
 };
 
-#[allow(dead_code)]
 pub fn is_ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
-#[allow(dead_code)]
 pub fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -42,11 +40,13 @@ pub fn ident(input: &str) -> Result<(&str, Ident)> {
 
 #[cfg(test)]
 mod tests {
-    use miette::Result;
 
     use crate::{
         api::ast::Ident,
-        parser::{ident::ident, parser_error::ParserError},
+        parser::{
+            ident::ident,
+            parser_error::{ParserError, Result},
+        },
     };
 
     #[test]
