@@ -15,7 +15,7 @@ pub enum BranchType {
     Constructor,
 }
 
-#[allow(dead_code)]
+#[derive(Debug, PartialEq, PartialOrd)]
 pub struct Variable {
     ident: Ident,
     ty: Path,
@@ -40,6 +40,8 @@ impl Ident {
         Self(n.to_string())
     }
 }
+
+#[derive(Debug, PartialEq, PartialOrd)]
 pub enum Path {
     Path(Box<Path>),
     Type(Ident),
