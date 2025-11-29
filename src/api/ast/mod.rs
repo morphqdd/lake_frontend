@@ -31,6 +31,7 @@ impl Variable {
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum Literal {
     Number(String),
+    String(String),
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]

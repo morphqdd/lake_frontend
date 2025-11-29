@@ -27,10 +27,10 @@ pub fn ident(input: &str) -> Result<(&str, Ident)> {
         nom::Err::Incomplete(needed) => todo!("{needed:?}"),
         nom::Err::Error(error) => match input.find_substring(error.input) {
             Some(start) => ParserError::IdentParsingError(
-                error.input.into(),
-                (start, error.input.len()).into(),
+                input.into(),
+                (start, start + error.input.len()).into(),
             ),
-            None => ParserError::BadSubsting(error.input.into()),
+            None => ParserError::BadSubstring(error.input.into()),
         },
         nom::Err::Failure(remaining) => todo!("Failure: {remaining}"),
     })?;
