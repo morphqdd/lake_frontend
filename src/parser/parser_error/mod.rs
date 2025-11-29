@@ -26,7 +26,7 @@ pub enum ParserError {
             "This is a compiler bug! Report about it here: (https://github.com/morphqdd/lake_frontend)"
         )
     )]
-    BadSubsting(String),
+    BadSubstring(String),
 
     #[error("Number parsing error")]
     #[diagnostic(
@@ -36,6 +36,16 @@ pub enum ParserError {
     NumberParsingError(
         #[source_code] String,
         #[label("Wrong number here")] SourceSpan,
+    ),
+
+    #[error("String parsing error")]
+    #[diagnostic(
+        code(parser::error::stringParsingError),
+        help("Expected a valid string literal enclosed in quotes.")
+    )]
+    StringParsingError(
+        #[source_code] String,
+        #[label("Wrong string here")] SourceSpan,
     ),
 }
 // impl<I> ParseError<I> for ParserError
