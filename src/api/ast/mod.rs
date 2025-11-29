@@ -19,19 +19,18 @@ pub enum BranchType {
 pub struct Variable {
     ident: Ident,
     ty: Path,
-    default: Option<Value>,
+    default: Option<Literal>,
 }
 
 impl Variable {
-    pub fn new(ident: Ident, ty: Path, default: Option<Value>) -> Self {
+    pub fn new(ident: Ident, ty: Path, default: Option<Literal>) -> Self {
         Self { ident, ty, default }
     }
 }
 
-pub enum Value {
-    Int(i32),
-    String(String),
-    Bool(bool),
+#[derive(Debug, PartialEq, PartialOrd)]
+pub enum Literal {
+    Number(String),
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
