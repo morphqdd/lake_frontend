@@ -5,6 +5,7 @@ use crate::{
     parser::{ident::ident, literal::number::number, parser_error::Result},
 };
 
+#[allow(dead_code)]
 pub fn variable(input: &str) -> Result<(&str, Variable)> {
     let (next, var_ident) = ident(input)?;
     let next = match multispace0::<_, nom::error::Error<_>>(next) {
