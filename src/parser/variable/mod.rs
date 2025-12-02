@@ -2,11 +2,7 @@ use nom::{bytes::complete::tag, character::complete::multispace0};
 
 use crate::{
     api::ast::{Path, Variable},
-    parser::{
-        ident::ident,
-        literal::literal,
-        parser_error::Result,
-    },
+    parser::{ident::ident, literal::literal, parser_error::Result},
 };
 
 #[allow(dead_code)]
