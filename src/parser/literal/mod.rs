@@ -5,26 +5,12 @@ use crate::{
     parser::{
         literal::{number::number, string::string},
         parser_error::Result,
+        utils::skip_whitespaces,
     },
 };
 
 pub mod number;
 pub mod string;
-
-fn skip_whitespaces(
-    input: &str,
-    f: fn(&str) -> Result<(&str, Literal)>,
-) -> Result<'_, (&str, Literal)> {
-    let next = match multispace0::<_, nom::error::Error<_>>(input) {
-        Ok((next, _)) => next,
-        Err(err) => match err {
-            nom::Err::Incomplete(_needed) => todo!(),
-            nom::Err::Error(_) => todo!(),
-            nom::Err::Failure(_) => todo!(),
-        },
-    };
-    f(next)
-}
 
 #[allow(dead_code)]
 pub fn literal(input: &str) -> Result<'_, (&str, Literal)> {

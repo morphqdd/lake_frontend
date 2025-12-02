@@ -1,15 +1,18 @@
 use nom::{
-    FindSubstring, IResult, Parser, character::complete::multispace0, multi::many0, sequence::pair,
+    Err, FindSubstring, IResult, Parser, bytes::complete::tag, character::complete::multispace0,
+    multi::many0, sequence::pair,
 };
 
 use crate::{
     api::ast::{Branch, BranchType},
     parser::{
         parser_error::{ParserError, Result},
+        utils::skip_whitespaces,
         variable::variable,
     },
 };
 
+#[allow(dead_code)]
 pub fn branch<'a>(input: &'a str) -> Result<'a, (&'a str, Branch)> {
     let res = many0(pair(
         |input: &'a str| {
@@ -33,6 +36,20 @@ pub fn branch<'a>(input: &'a str) -> Result<'a, (&'a str, Branch)> {
         _ => todo!(),
     })?;
 
+    let (next, _) = skip_whitespaces(next, |input: &'a str| {
+        tag("->")
+            .parse(input)
+            .map_err(|err: nom::Err<nom::error::Error<_>>| match err {
+                nom::Err::Error(err) => match input.find_substring(err.input) {
+                    Some(start) => ParserError::BranchParsingError(
+                        input.into(),
+                        (start, start + err.input.len()).into(),
+                    ),
+                    None => ParserError::BadSubstring(err.input.into()),
+                },
+                _ => todo!(),
+            })
+    })?;
     Ok((
         "",
         Branch::new(
@@ -51,9 +68,10 @@ mod tests {
 
     #[test]
     fn simple_branch_test<'a>() -> Result<'a, ()> {
+        let res = branch("n i32.10 str string ->")?;
         assert_eq!(
-            branch("n i32.10 str string"),
-            Ok((
+            res,
+            (
                 "",
                 Branch::new(
                     BranchType::Action,
@@ -66,7 +84,7 @@ mod tests {
                         Variable::new(Ident::new("str"), Path::Type(Ident::new("string")), None)
                     ]
                 )
-            ))
+            )
         );
         Ok(())
     }
