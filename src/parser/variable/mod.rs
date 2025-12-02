@@ -2,7 +2,7 @@ use nom::{bytes::complete::tag, character::complete::multispace0};
 
 use crate::{
     api::ast::{Path, Variable},
-    parser::{ident::ident, literal::number::number, parser_error::Result},
+    parser::{ident::ident, literal::literal, parser_error::Result},
 };
 
 #[allow(dead_code)]
@@ -20,7 +20,7 @@ pub fn variable(input: &str) -> Result<(&str, Variable)> {
     let res = tag::<_, _, nom::error::Error<_>>(".")(next);
     let (next, default_val) = match res {
         Ok((next, _)) => {
-            let (next, default_val) = number(next)?;
+            let (next, default_val) = literal(next)?;
             (next, Some(default_val))
         }
         Err(err) => match err {
@@ -52,6 +52,22 @@ mod tests {
                     Ident::new("n"),
                     Path::Type(Ident::new("i32")),
                     Some(Literal::Number("1".into()))
+                )
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn simple_variable_with_default_value_as_str_test() -> Result<()> {
+        assert_eq!(
+            variable("n string.\"Jake\""),
+            Ok((
+                "",
+                Variable::new(
+                    Ident::new("n"),
+                    Path::Type(Ident::new("string")),
+                    Some(Literal::String("\"Jake\"".into()))
                 )
             ))
         );
