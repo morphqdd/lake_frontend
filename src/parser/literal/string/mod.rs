@@ -11,7 +11,7 @@ use crate::{
 };
 
 #[allow(dead_code)]
-pub fn string(input: &str) -> Result<(&str, Literal)> {
+pub fn string(input: &str) -> Result<'_, (&str, Literal)> {
     let res: IResult<&str, &str> = recognize(pair(
         tag(r#"""#),
         pair(take_till(|c: char| c == '"'), tag(r#"""#)),
@@ -40,7 +40,7 @@ mod tests {
     };
 
     #[test]
-    fn simple_string_test() -> Result<()> {
+    fn simple_string_test<'a>() -> Result<'a, ()> {
         assert_eq!(
             string(r#""Hello, world!""#),
             Ok(("", Literal::String(r#""Hello, world!""#.into())))
@@ -49,7 +49,7 @@ mod tests {
     }
 
     #[test]
-    fn multiline_string_test() -> Result<()> {
+    fn multiline_string_test<'a>() -> Result<'a, ()> {
         assert_eq!(
             string(
                 r#""

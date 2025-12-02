@@ -4,12 +4,20 @@ pub struct Process {
     branches: Vec<Branch>,
 }
 
+#[derive(Debug, PartialEq, PartialOrd)]
 #[allow(dead_code)]
 pub struct Branch {
     ty: BranchType,
     variables: Vec<Variable>,
 }
 
+impl Branch {
+    pub fn new(ty: BranchType, variables: Vec<Variable>) -> Self {
+        Self { ty, variables }
+    }
+}
+
+#[derive(Debug, PartialEq, PartialOrd)]
 pub enum BranchType {
     Action,
     Constructor,

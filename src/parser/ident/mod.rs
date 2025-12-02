@@ -17,7 +17,7 @@ pub fn is_ident_char(c: char) -> bool {
 }
 
 #[allow(dead_code)]
-pub fn ident(input: &str) -> Result<(&str, Ident)> {
+pub fn ident(input: &str) -> Result<'_, (&str, Ident)> {
     let res: IResult<&str, &str> = recognize(pair(
         take_while1(is_ident_start),
         take_while1(is_ident_char).or(|i| Ok((i, ""))),
@@ -50,13 +50,13 @@ mod tests {
     };
 
     #[test]
-    fn simple_ident_test() -> Result<()> {
+    fn simple_ident_test<'a>() -> Result<'a, ()> {
         assert_eq!(ident("ident"), Ok(("", Ident::new("ident"))));
         Ok(())
     }
 
     #[test]
-    fn parse_ident_error() -> Result<()> {
+    fn parse_ident_error<'a>() -> Result<'a, ()> {
         assert_eq!(
             ident("123"),
             Err(ParserError::IdentParsingError("123".into(), (0, 3).into()))

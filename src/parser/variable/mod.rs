@@ -6,7 +6,7 @@ use crate::{
 };
 
 #[allow(dead_code)]
-pub fn variable(input: &str) -> Result<(&str, Variable)> {
+pub fn variable(input: &str) -> Result<'_, (&str, Variable)> {
     let (next, var_ident) = ident(input)?;
     let next = match multispace0::<_, nom::error::Error<_>>(next) {
         Ok((next, _)) => next,
@@ -43,7 +43,7 @@ mod tests {
     };
 
     #[test]
-    fn simple_variable_with_default_value_test() -> Result<()> {
+    fn simple_variable_with_default_value_test<'a>() -> Result<'a, ()> {
         assert_eq!(
             variable("n i32.1"),
             Ok((
@@ -59,7 +59,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_variable_with_default_value_as_str_test() -> Result<()> {
+    fn simple_variable_with_default_value_as_str_test<'a>() -> Result<'a, ()> {
         assert_eq!(
             variable("n string.\"Jake\""),
             Ok((
@@ -75,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_variable_test() -> Result<()> {
+    fn simple_variable_test<'a>() -> Result<'a, ()> {
         assert_eq!(
             variable("n i32"),
             Ok((

@@ -6,7 +6,7 @@ use crate::{
 };
 
 #[allow(dead_code)]
-pub fn number(input: &str) -> Result<(&str, Literal)> {
+pub fn number(input: &str) -> Result<'_, (&str, Literal)> {
     let res: IResult<&str, &str> = take_while1(|ch: char| ch.is_dec_digit()).parse(input);
     let (next, raw) = res.map_err(|err| match err {
         nom::Err::Incomplete(needed) => todo!("{needed:?}"),
@@ -33,19 +33,19 @@ mod tests {
     };
 
     #[test]
-    fn simple_number_test() -> Result<()> {
+    fn simple_number_test<'a>() -> Result<'a, ()> {
         assert_eq!(number("123"), Ok(("", Literal::Number("123".into()))));
         Ok(())
     }
 
     #[test]
-    fn not_only_number_test() -> Result<()> {
+    fn not_only_number_test<'a>() -> Result<'a, ()> {
         assert_eq!(number("40abs"), Ok(("abs", Literal::Number("40".into()))));
         Ok(())
     }
 
     #[test]
-    fn not_number_test() -> Result<()> {
+    fn not_number_test<'a>() -> Result<'a, ()> {
         assert_eq!(
             number("abs"),
             Err(ParserError::NumberParsingError("abs".into(), (0, 3).into()))
