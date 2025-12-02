@@ -2,7 +2,11 @@ use nom::{bytes::complete::tag, character::complete::multispace0};
 
 use crate::{
     api::ast::{Path, Variable},
-    parser::{ident::ident, literal::number::number, parser_error::Result},
+    parser::{
+        ident::ident,
+        literal::{literal, number::number},
+        parser_error::Result,
+    },
 };
 
 #[allow(dead_code)]
@@ -20,7 +24,7 @@ pub fn variable(input: &str) -> Result<(&str, Variable)> {
     let res = tag::<_, _, nom::error::Error<_>>(".")(next);
     let (next, default_val) = match res {
         Ok((next, _)) => {
-            let (next, default_val) = number(next)?;
+            let (next, default_val) = literal(next)?;
             (next, Some(default_val))
         }
         Err(err) => match err {
