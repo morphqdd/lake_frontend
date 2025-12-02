@@ -4,7 +4,7 @@ use crate::{
     api::ast::{Path, Variable},
     parser::{
         ident::ident,
-        literal::{literal, number::number},
+        literal::literal,
         parser_error::Result,
     },
 };
