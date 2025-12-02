@@ -63,6 +63,22 @@ mod tests {
     }
 
     #[test]
+    fn simple_variable_with_default_value_as_str_test() -> Result<()> {
+        assert_eq!(
+            variable("n string.\"Jake\""),
+            Ok((
+                "",
+                Variable::new(
+                    Ident::new("n"),
+                    Path::Type(Ident::new("string")),
+                    Some(Literal::String("\"Jake\"".into()))
+                )
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn simple_variable_test() -> Result<()> {
         assert_eq!(
             variable("n i32"),
