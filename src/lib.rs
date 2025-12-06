@@ -1,3 +1,4 @@
+#![feature(trim_prefix_suffix)]
 #![deny(
     clippy::unwrap_used,
     clippy::get_unwrap,
@@ -9,4 +10,5 @@
 )]
 
 pub mod api;
+pub mod lexer;
 pub(crate) mod parser;
