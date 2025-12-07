@@ -11,6 +11,7 @@ pub enum Token<'src> {
     SquareBrackets(Vec<Spanned<Self>>),
     CurlyBrackets(Vec<Spanned<Self>>),
 
+    At,
     Arrow,
     Dot,
     Plus,
@@ -44,6 +45,7 @@ impl<'src> Display for Token<'src> {
             Token::Parens(_) => write!(f, "( ... )"),
             Token::SquareBrackets(_) => write!(f, "[ ... ]"),
             Token::CurlyBrackets(_) => write!(f, "{{ ... }}"),
+            Token::At => write!(f, "@"),
         }
     }
 }

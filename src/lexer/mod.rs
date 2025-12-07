@@ -22,6 +22,7 @@ pub fn lexer<'src>()
                 "false" => Token::False,
                 s => Token::Ident(s),
             }),
+            just("@").to(Token::At),
             just(".").to(Token::Dot),
             just("->").to(Token::Arrow),
             just("+").to(Token::Plus),
