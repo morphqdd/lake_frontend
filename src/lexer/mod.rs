@@ -32,7 +32,7 @@ pub fn lexer<'src>()
             text::int(10)
                 .then(just('.').then(text::digits(10)).or_not())
                 .to_slice()
-                .map(|s: &'src str| Token::Num(s.parse().unwrap())),
+                .map(|s: &'src str| Token::Num(s.parse().unwrap_or(0.0))),
             any()
                 .and_is(one_of("\"").not())
                 .repeated()
