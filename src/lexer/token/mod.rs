@@ -8,6 +8,8 @@ pub enum Token<'src> {
     Num(f64),
     String(&'src str),
     Parens(Vec<Spanned<Self>>),
+    SquareBrackets(Vec<Spanned<Self>>),
+    CurlyBrackets(Vec<Spanned<Self>>),
 
     Arrow,
     Dot,
@@ -39,7 +41,9 @@ impl<'src> Display for Token<'src> {
             Token::False => write!(f, "false"),
             Token::True => write!(f, "true"),
             Token::Slash => write!(f, "/"),
-            Token::Parens(_) => write!(f, "(...)"),
+            Token::Parens(_) => write!(f, "( ... )"),
+            Token::SquareBrackets(_) => write!(f, "[ ... ]"),
+            Token::CurlyBrackets(_) => write!(f, "{{ ... }}"),
         }
     }
 }

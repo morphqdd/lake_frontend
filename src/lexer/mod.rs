@@ -22,12 +22,14 @@ pub fn lexer<'src>()
                 "false" => Token::False,
                 s => Token::Ident(s),
             }),
+            just(".").to(Token::Dot),
+            just("->").to(Token::Arrow),
             just("+").to(Token::Plus),
             just("-").to(Token::Minus),
             just("*").to(Token::Star),
             just("/").to(Token::Slash),
             text::int(10)
-                .then(just('.').then(text::digits(10).or_not()))
+                .then(just('.').then(text::digits(10)).or_not())
                 .to_slice()
                 .map(|s: &'src str| Token::Num(s.parse().unwrap())),
             any()
@@ -38,12 +40,22 @@ pub fn lexer<'src>()
                 .to_slice()
                 .map(|s: &str| Token::String(s.trim_prefix("\"").trim_suffix("\""))),
             token
+                .clone()
                 .repeated()
                 .collect()
                 .delimited_by(just("("), just(")"))
-                .labelled("token tree")
-                .as_context()
                 .map(Token::Parens),
+            token
+                .clone()
+                .repeated()
+                .collect()
+                .delimited_by(just("["), just("]"))
+                .map(Token::SquareBrackets),
+            token
+                .repeated()
+                .collect()
+                .delimited_by(just("{"), just("}"))
+                .map(Token::SquareBrackets),
         ))
         .spanned()
         .padded()
@@ -70,5 +82,137 @@ mod test {
                 span: SimpleSpan::new((), 0..21)
             }])
         )
+    }
+
+    #[test]
+    fn num_decimal_test() {
+        assert_eq!(
+            lexer().parse("10").into_result(),
+            Ok(vec![Spanned {
+                inner: Token::Num(10.),
+                span: SimpleSpan::new((), 0..2)
+            }])
+        );
+    }
+
+    #[test]
+    fn num_float_test() {
+        assert_eq!(
+            lexer().parse("10.10").into_result(),
+            Ok(vec![Spanned {
+                inner: Token::Num(10.10),
+                span: SimpleSpan::new((), 0..5)
+            }])
+        );
+    }
+
+    #[test]
+    fn variable_test() {
+        assert_eq!(
+            lexer().parse("n i32.1").into_result(),
+            Ok(vec![
+                Spanned {
+                    inner: Token::Ident("n"),
+                    span: SimpleSpan::new((), 0..1)
+                },
+                Spanned {
+                    inner: Token::Ident("i32"),
+                    span: SimpleSpan::new((), 2..5)
+                },
+                Spanned {
+                    inner: Token::Dot,
+                    span: SimpleSpan::new((), 5..6)
+                },
+                Spanned {
+                    inner: Token::Num(1.),
+                    span: SimpleSpan::new((), 6..7)
+                }
+            ])
+        )
+    }
+
+    #[test]
+    fn math_expr_test() {
+        assert_eq!(
+            lexer().parse("2*4/5+2-4").into_result(),
+            Ok(vec![
+                Spanned {
+                    inner: Token::Num(2.),
+                    span: SimpleSpan::new((), 0..1)
+                },
+                Spanned {
+                    inner: Token::Star,
+                    span: SimpleSpan::new((), 1..2)
+                },
+                Spanned {
+                    inner: Token::Num(4.),
+                    span: SimpleSpan::new((), 2..3)
+                },
+                Spanned {
+                    inner: Token::Slash,
+                    span: SimpleSpan::new((), 3..4)
+                },
+                Spanned {
+                    inner: Token::Num(5.),
+                    span: SimpleSpan::new((), 4..5)
+                },
+                Spanned {
+                    inner: Token::Plus,
+                    span: SimpleSpan::new((), 5..6)
+                },
+                Spanned {
+                    inner: Token::Num(2.),
+                    span: SimpleSpan::new((), 6..7)
+                },
+                Spanned {
+                    inner: Token::Minus,
+                    span: SimpleSpan::new((), 7..8)
+                },
+                Spanned {
+                    inner: Token::Num(4.),
+                    span: SimpleSpan::new((), 8..9)
+                },
+            ])
+        )
+    }
+
+    #[test]
+    fn branch_test() {
+        assert_eq!(
+            lexer().parse("n i32.1 -> print [ n ]").into_result(),
+            Ok(vec![
+                Spanned {
+                    inner: Token::Ident("n"),
+                    span: SimpleSpan::new((), 0..1)
+                },
+                Spanned {
+                    inner: Token::Ident("i32"),
+                    span: SimpleSpan::new((), 2..5)
+                },
+                Spanned {
+                    inner: Token::Dot,
+                    span: SimpleSpan::new((), 5..6)
+                },
+                Spanned {
+                    inner: Token::Num(1.),
+                    span: SimpleSpan::new((), 6..7)
+                },
+                Spanned {
+                    inner: Token::Arrow,
+                    span: SimpleSpan::new((), 8..10)
+                },
+                Spanned {
+                    inner: Token::Ident("print"),
+                    span: SimpleSpan::new((), 11..16)
+                },
+                Spanned {
+                    inner: Token::SquareBrackets(vec![Spanned {
+                        inner: Token::Ident("n"),
+                        span: SimpleSpan::new((), 19..20)
+                    },]),
+                    span: SimpleSpan::new((), 17..22)
+                },
+            ])
+        );
     }
 }
