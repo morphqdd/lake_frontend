@@ -7,9 +7,7 @@ use chumsky::{
     text,
 };
 
-use crate::lexer::token::Token;
-
-pub mod token;
+use crate::api::token::Token;
 
 pub fn lexer<'src>()
 -> impl Parser<'src, &'src str, Vec<Spanned<Token<'src>>>, extra::Err<Rich<'src, char>>> {
@@ -32,7 +30,7 @@ pub fn lexer<'src>()
             text::int(10)
                 .then(just('.').then(text::digits(10)).or_not())
                 .to_slice()
-                .map(|s: &'src str| Token::Num(s.parse().unwrap_or(0.0))),
+                .map(Token::Num),
             any()
                 .and_is(one_of("\"").not())
                 .repeated()
@@ -49,21 +47,17 @@ pub fn lexer<'src>()
                 }),
             token
                 .clone()
+                .padded()
                 .repeated()
                 .collect()
                 .delimited_by(just("("), just(")"))
                 .map(Token::Parens),
             token
-                .clone()
+                .padded()
                 .repeated()
                 .collect()
-                .delimited_by(just("["), just("]"))
-                .map(Token::SquareBrackets),
-            token
-                .repeated()
-                .collect()
-                .delimited_by(just("{"), just("}"))
-                .map(Token::SquareBrackets),
+                .delimited_by(just("[").padded(), just("]").padded())
+                .map(|t| Token::SquareBrackets(t)),
         ))
         .spanned()
         .padded()
@@ -79,7 +73,7 @@ mod test {
         span::{SimpleSpan, Span, Spanned},
     };
 
-    use crate::lexer::{lexer, token::Token};
+    use crate::{api::token::Token, lexer::lexer};
 
     #[test]
     fn string_test() {
@@ -97,7 +91,7 @@ mod test {
         assert_eq!(
             lexer().parse("10").into_result(),
             Ok(vec![Spanned {
-                inner: Token::Num(10.),
+                inner: Token::Num("10"),
                 span: SimpleSpan::new((), 0..2)
             }])
         );
@@ -108,7 +102,7 @@ mod test {
         assert_eq!(
             lexer().parse("10.10").into_result(),
             Ok(vec![Spanned {
-                inner: Token::Num(10.10),
+                inner: Token::Num("10.10"),
                 span: SimpleSpan::new((), 0..5)
             }])
         );
@@ -132,7 +126,7 @@ mod test {
                     span: SimpleSpan::new((), 5..6)
                 },
                 Spanned {
-                    inner: Token::Num(1.),
+                    inner: Token::Num("1"),
                     span: SimpleSpan::new((), 6..7)
                 }
             ])
@@ -145,7 +139,7 @@ mod test {
             lexer().parse("2*4/5+2-4").into_result(),
             Ok(vec![
                 Spanned {
-                    inner: Token::Num(2.),
+                    inner: Token::Num("2"),
                     span: SimpleSpan::new((), 0..1)
                 },
                 Spanned {
@@ -153,7 +147,7 @@ mod test {
                     span: SimpleSpan::new((), 1..2)
                 },
                 Spanned {
-                    inner: Token::Num(4.),
+                    inner: Token::Num("4"),
                     span: SimpleSpan::new((), 2..3)
                 },
                 Spanned {
@@ -161,7 +155,7 @@ mod test {
                     span: SimpleSpan::new((), 3..4)
                 },
                 Spanned {
-                    inner: Token::Num(5.),
+                    inner: Token::Num("5"),
                     span: SimpleSpan::new((), 4..5)
                 },
                 Spanned {
@@ -169,7 +163,7 @@ mod test {
                     span: SimpleSpan::new((), 5..6)
                 },
                 Spanned {
-                    inner: Token::Num(2.),
+                    inner: Token::Num("2"),
                     span: SimpleSpan::new((), 6..7)
                 },
                 Spanned {
@@ -177,7 +171,7 @@ mod test {
                     span: SimpleSpan::new((), 7..8)
                 },
                 Spanned {
-                    inner: Token::Num(4.),
+                    inner: Token::Num("4"),
                     span: SimpleSpan::new((), 8..9)
                 },
             ])
@@ -202,7 +196,7 @@ mod test {
                     span: SimpleSpan::new((), 5..6)
                 },
                 Spanned {
-                    inner: Token::Num(1.),
+                    inner: Token::Num("1"),
                     span: SimpleSpan::new((), 6..7)
                 },
                 Spanned {

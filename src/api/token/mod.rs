@@ -5,7 +5,7 @@ use chumsky::span::Spanned;
 #[derive(Debug, PartialEq, PartialOrd, Clone)]
 pub enum Token<'src> {
     Ident(&'src str),
-    Num(f64),
+    Num(&'src str),
     String(&'src str),
     Parens(Vec<Spanned<Self>>),
     SquareBrackets(Vec<Spanned<Self>>),
