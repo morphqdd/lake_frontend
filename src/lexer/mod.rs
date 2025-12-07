@@ -36,10 +36,17 @@ pub fn lexer<'src>()
             any()
                 .and_is(one_of("\"").not())
                 .repeated()
-                .collect::<String>()
+                .to_slice()
                 .delimited_by(just("\""), just("\""))
                 .to_slice()
-                .map(|s: &str| Token::String(s.trim_prefix("\"").trim_suffix("\""))),
+                .map(|s: &'src str| {
+                    Token::String(
+                        s.strip_prefix("\"")
+                            .unwrap_or(s)
+                            .strip_suffix("\"")
+                            .unwrap_or(s),
+                    )
+                }),
             token
                 .clone()
                 .repeated()

@@ -1,4 +1,3 @@
-#![feature(trim_prefix_suffix)]
 #![deny(
     clippy::unwrap_used,
     clippy::get_unwrap,
