@@ -16,8 +16,10 @@ main is
 		10 -> print [ "x is ten" ]
 		20 -> print [ "x is twenty" ]
 	s: string. "hello" -> print [ s ]
-	p: person. { eye_color: &[255 255 255] } -> person [ p2 ]
-	n: i32. 10 -> factorial [ n ]
+	p: person. { eye_color: &[255 255 255] } -> person [ p ]
+	n: i32. 10 -> 
+		factorial [ n ]
+		print [ n ]
 
 coop main | person [ person.{ eye_color: &[] } ]
 ```

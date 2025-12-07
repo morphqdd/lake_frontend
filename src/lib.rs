@@ -9,4 +9,5 @@
 )]
 
 pub mod api;
+pub mod lexer;
 pub(crate) mod parser;
