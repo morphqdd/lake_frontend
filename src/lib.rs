@@ -11,4 +11,4 @@
 pub mod api;
 pub mod error_handle;
 pub mod lexer;
-pub(crate) mod parser;
+pub mod parser;

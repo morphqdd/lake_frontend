@@ -1,49 +1,34 @@
-#[allow(dead_code)]
-pub struct Process {
-    ident: String,
-    branches: Vec<Branch>,
-}
+use chumsky::span::Spanned;
 
-#[allow(dead_code)]
-pub struct Branch {
-    ty: BranchType,
-    variables: Vec<Variable>,
-}
-
-pub enum BranchType {
-    Action,
-    Constructor,
-}
+use crate::api::expr::Expr;
 
 #[derive(Debug, PartialEq, PartialOrd)]
-pub struct Variable {
-    ident: Ident,
-    ty: Path,
-    default: Option<Literal>,
+pub struct Pattern<'src> {
+    ident: Ident<'src>,
+    ty: Type<'src>,
+    default: Option<Spanned<Expr<'src>>>,
 }
 
-impl Variable {
-    pub fn new(ident: Ident, ty: Path, default: Option<Literal>) -> Self {
+impl<'src> Pattern<'src> {
+    pub fn new(
+        ident: Ident<'src>,
+        ty: Type<'src>,
+        default: Option<Spanned<Expr<'src>>>,
+    ) -> Pattern<'src> {
         Self { ident, ty, default }
     }
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
-pub enum Literal {
-    Number(String),
-    String(String),
-}
-
-#[derive(Debug, PartialEq, PartialOrd)]
-pub struct Ident(String);
-impl Ident {
-    pub fn new(n: &str) -> Self {
-        Self(n.to_string())
+pub struct Ident<'src>(&'src str);
+impl<'src> Ident<'src> {
+    pub fn new(inner: &'src str) -> Ident<'src> {
+        Self(inner)
     }
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
-pub enum Path {
-    Path(Box<Path>),
-    Type(Ident),
+pub enum Type<'src> {
+    Path(Ident<'src>, Box<Type<'src>>),
+    Type(Ident<'src>),
 }
