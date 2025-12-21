@@ -1,5 +1,6 @@
 use chumsky::{
     IterParser, Parser,
+    container::Container,
     error::Rich,
     extra::Err,
     input::MappedInput,
@@ -10,7 +11,7 @@ use chumsky::{
 };
 
 use crate::api::{
-    ast::{Ident, Pattern, Type},
+    ast::{Branch, Ident, Pattern, Type},
     expr::{Expr, Path},
     token::Token,
 };
@@ -80,36 +81,35 @@ fn expr<'t, 'src: 't>() -> impl Parser<
 > {
     use chumsky::input::Input;
     recursive(|expr| {
-        let ident = select_ref! { Token::Ident(n) => *n };
+        let ident = select_ref! { Token::Ident(n) => *n }.map(Expr::Var);
         let atom = choice((
             select_ref! { Token::Num(n) => Expr::Num(*n) },
             select_ref! { Token::String(n) => Expr::String(*n) },
             just(Token::False).to(Expr::Bool(false)),
             just(Token::True).to(Expr::Bool(true)),
-            ident.map(Expr::Var),
+            ident,
         ));
 
-        choice((
-            atom.spanned(),
-            expr.nested_in(
-                select_ref! { Token::SquareBrackets(ts) = e => ts.split_spanned(e.span())},
-            ),
-        ))
-        .pratt(vec![
+        let call = choice((
+            atom.clone()
+                .spanned()
+                .then(expr.repeated().collect::<Vec<_>>().nested_in(
+                    select_ref!(Token::SquareBrackets(ts) = e => ts.split_spanned(e.span())),
+                ))
+                .map(|(ident, args)| Expr::Jump {
+                    ident: Box::new(ident),
+                    args: args,
+                }),
+            atom.clone(),
+        ));
+
+        call.spanned().pratt(vec![
             infix(left(10), just(Token::Star), |x, _, y, e| {
                 Expr::Mul(Box::new(x), Box::new(y)).with_span(e.span())
             })
             .boxed(),
             infix(left(9), just(Token::Plus), |x, _, y, e| {
                 Expr::Add(Box::new(x), Box::new(y)).with_span(e.span())
-            })
-            .boxed(),
-            infix(left(1), empty(), |x, _, y, e| {
-                Expr::Jump {
-                    ident: Box::new(x),
-                    args: vec![y],
-                }
-                .with_span(e.span())
             })
             .boxed(),
         ])
@@ -123,16 +123,32 @@ pub fn pattern<'t, 'src: 't>() -> impl Parser<
     Err<Rich<'t, Token<'src>>>,
 > {
     select_ref!(Token::Ident(n) => Ident::new(n))
+        .spanned()
         .then(
-            select_ref!(Token::Ident(n) => Type::Type(Ident::new(n)))
+            select_ref!(Token::Ident(n) = e => Type::Type(Ident::new(n).with_span(e.span())))
+                .spanned()
                 .then(just(Token::Dot).ignored().then(expr()).or_not()),
         )
-        .map(
-            |(ident, (ty, default)): (Ident<'_>, (Type<'_>, Option<((), Spanned<Expr<'_>>)>))| {
-                let default = default.map(|(_, expr)| expr);
-                Pattern::new(ident, ty, default)
-            },
-        )
+        .map(|(ident, (ty, default))| {
+            let default = default.map(|(_, expr)| expr);
+            Pattern::new(ident, ty, default)
+        })
+        .spanned()
+}
+
+pub fn branch<'t, 'src: 't>() -> impl Parser<
+    't,
+    MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
+    Spanned<Branch<'src>>,
+    Err<Rich<'t, Token<'src>>>,
+> {
+    pattern()
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .then_ignore(just(Token::Arrow))
+        .then(expr().repeated().collect::<Vec<_>>())
+        .map(|(patterns, body)| Branch::new(patterns, body))
         .spanned()
 }
 
@@ -163,8 +179,17 @@ mod test {
             ast.unwrap(),
             Spanned {
                 inner: Pattern::new(
-                    Ident::new("n"),
-                    Type::Type(Ident::new("i32")),
+                    Spanned {
+                        inner: Ident::new("n"),
+                        span: (0..1).into()
+                    },
+                    Spanned {
+                        inner: Type::Type(Spanned {
+                            inner: Ident::new("i32"),
+                            span: (2..5).into()
+                        }),
+                        span: (2..5).into()
+                    },
                     Some(Spanned {
                         inner: Expr::Num("10".into()),
                         span: (6..8).into()

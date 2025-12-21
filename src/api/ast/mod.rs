@@ -3,16 +3,31 @@ use chumsky::span::Spanned;
 use crate::api::expr::Expr;
 
 #[derive(Debug, PartialEq, PartialOrd)]
+pub struct Branch<'src> {
+    patterns: Vec<Spanned<Pattern<'src>>>,
+    body: Vec<Spanned<Expr<'src>>>,
+}
+
+impl<'src> Branch<'src> {
+    pub fn new(
+        patterns: Vec<Spanned<Pattern<'src>>>,
+        body: Vec<Spanned<Expr<'src>>>,
+    ) -> Branch<'src> {
+        Self { patterns, body }
+    }
+}
+
+#[derive(Debug, PartialEq, PartialOrd)]
 pub struct Pattern<'src> {
-    ident: Ident<'src>,
-    ty: Type<'src>,
+    ident: Spanned<Ident<'src>>,
+    ty: Spanned<Type<'src>>,
     default: Option<Spanned<Expr<'src>>>,
 }
 
 impl<'src> Pattern<'src> {
     pub fn new(
-        ident: Ident<'src>,
-        ty: Type<'src>,
+        ident: Spanned<Ident<'src>>,
+        ty: Spanned<Type<'src>>,
         default: Option<Spanned<Expr<'src>>>,
     ) -> Pattern<'src> {
         Self { ident, ty, default }
@@ -29,6 +44,6 @@ impl<'src> Ident<'src> {
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum Type<'src> {
-    Path(Ident<'src>, Box<Type<'src>>),
-    Type(Ident<'src>),
+    Path(Spanned<Ident<'src>>, Spanned<Box<Type<'src>>>),
+    Type(Spanned<Ident<'src>>),
 }
