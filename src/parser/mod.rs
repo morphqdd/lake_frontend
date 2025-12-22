@@ -3,7 +3,7 @@ use chumsky::{
     container::Container,
     error::Rich,
     extra::Err,
-    input::MappedInput,
+    input::{Input, MappedInput},
     pratt::{Operator, infix, left},
     prelude::{choice, empty, just, recursive},
     select_ref,
@@ -11,7 +11,7 @@ use chumsky::{
 };
 
 use crate::api::{
-    ast::{Branch, Ident, Pattern, Type},
+    ast::{Branch, Ident, Pattern, Process, Type},
     expr::{Expr, Path},
     token::Token,
 };
@@ -90,18 +90,19 @@ fn expr<'t, 'src: 't>() -> impl Parser<
             ident,
         ));
 
-        let call = choice((
-            atom.clone()
-                .spanned()
-                .then(expr.repeated().collect::<Vec<_>>().nested_in(
-                    select_ref!(Token::SquareBrackets(ts) = e => ts.split_spanned(e.span())),
-                ))
-                .map(|(ident, args)| Expr::Jump {
-                    ident: Box::new(ident),
-                    args: args,
-                }),
-            atom.clone(),
-        ));
+        let call =
+            choice((
+                atom.clone()
+                    .spanned()
+                    .then(expr.repeated().collect::<Vec<_>>().nested_in(
+                        select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())),
+                    ))
+                    .map(|(ident, args)| Expr::Jump {
+                        ident: Box::new(ident),
+                        args: args,
+                    }),
+                atom.clone(),
+            ));
 
         call.spanned().pratt(vec![
             infix(left(10), just(Token::Star), |x, _, y, e| {
@@ -147,8 +148,33 @@ pub fn branch<'t, 'src: 't>() -> impl Parser<
         .at_least(1)
         .collect::<Vec<_>>()
         .then_ignore(just(Token::Arrow))
-        .then(expr().repeated().collect::<Vec<_>>())
+        .then(
+            expr()
+                .repeated()
+                .collect::<Vec<_>>()
+                .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span()))),
+        )
         .map(|(patterns, body)| Branch::new(patterns, body))
+        .spanned()
+}
+
+pub fn process<'t, 'src: 't>() -> impl Parser<
+    't,
+    MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
+    Spanned<Process<'src>>,
+    Err<Rich<'t, Token<'src>>>,
+> {
+    select_ref!(Token::Ident(n) => Ident::new(n))
+        .spanned()
+        .then_ignore(just(Token::Is))
+        .then(
+            branch()
+                .repeated()
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span()))),
+        )
+        .map(|(ident, branches)| Process::new(ident, branches))
         .spanned()
 }
 

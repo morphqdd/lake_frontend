@@ -53,6 +53,13 @@ pub fn lexer<'src>()
                 .delimited_by(just("("), just(")"))
                 .map(Token::Parens),
             token
+                .clone()
+                .padded()
+                .repeated()
+                .collect()
+                .delimited_by(just("{"), just("}"))
+                .map(Token::CurlyBrackets),
+            token
                 .padded()
                 .repeated()
                 .collect()

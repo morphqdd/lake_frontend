@@ -1,3 +1,9 @@
-main is
-  n i32.1 -> hello [ n ]
-  _ -> print [ ]
+main is {
+  n i32.1 -> {
+    hello ( n )
+  }
+
+  input string -> {
+    print ( input )
+  }
+}
