@@ -1,49 +1,60 @@
-#[allow(dead_code)]
-pub struct Process {
-    ident: String,
-    branches: Vec<Branch>,
+use chumsky::span::Spanned;
+
+use crate::api::expr::Expr;
+
+#[derive(Debug, PartialEq, PartialOrd)]
+pub struct Process<'src> {
+    ident: Spanned<Ident<'src>>,
+    branches: Vec<Spanned<Branch<'src>>>,
 }
 
-#[allow(dead_code)]
-pub struct Branch {
-    ty: BranchType,
-    variables: Vec<Variable>,
+impl<'src> Process<'src> {
+    pub fn new(ident: Spanned<Ident<'src>>, branches: Vec<Spanned<Branch<'src>>>) -> Process<'src> {
+        Self { ident, branches }
+    }
+}
+#[derive(Debug, PartialEq, PartialOrd)]
+pub struct Branch<'src> {
+    patterns: Vec<Spanned<Pattern<'src>>>,
+    body: Vec<Spanned<Expr<'src>>>,
 }
 
-pub enum BranchType {
-    Action,
-    Constructor,
+impl<'src> Branch<'src> {
+    pub fn new(
+        patterns: Vec<Spanned<Pattern<'src>>>,
+        body: Vec<Spanned<Expr<'src>>>,
+    ) -> Branch<'src> {
+        Self { patterns, body }
+    }
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
-pub struct Variable {
-    ident: Ident,
-    ty: Path,
-    default: Option<Literal>,
+pub struct Pattern<'src> {
+    ident: Spanned<Ident<'src>>,
+    ty: Spanned<Type<'src>>,
+    default: Option<Spanned<Expr<'src>>>,
 }
 
-impl Variable {
-    pub fn new(ident: Ident, ty: Path, default: Option<Literal>) -> Self {
+impl<'src> Pattern<'src> {
+    pub fn new(
+        ident: Spanned<Ident<'src>>,
+        ty: Spanned<Type<'src>>,
+        default: Option<Spanned<Expr<'src>>>,
+    ) -> Pattern<'src> {
         Self { ident, ty, default }
     }
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
-pub enum Literal {
-    Number(String),
-    String(String),
-}
-
-#[derive(Debug, PartialEq, PartialOrd)]
-pub struct Ident(String);
-impl Ident {
-    pub fn new(n: &str) -> Self {
-        Self(n.to_string())
+pub struct Ident<'src>(&'src str);
+impl<'src> Ident<'src> {
+    pub fn new(inner: &'src str) -> Ident<'src> {
+        Self(inner)
     }
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
-pub enum Path {
-    Path(Box<Path>),
-    Type(Ident),
+pub enum Type<'src> {
+    Path(Spanned<Ident<'src>>, Spanned<Box<Type<'src>>>),
+    Type(Spanned<Ident<'src>>),
 }
