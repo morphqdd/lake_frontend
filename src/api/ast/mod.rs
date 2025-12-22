@@ -66,6 +66,10 @@ impl<'src> Pattern<'src> {
     pub fn ident(&self) -> Ident<'src> {
         self.ident.inner.clone()
     }
+
+    pub fn default(&self) -> Option<Expr<'src>> {
+        self.default.clone().map(|expr| expr.inner)
+    }
 }
 
 #[derive(Debug, PartialEq, PartialOrd, Clone)]
