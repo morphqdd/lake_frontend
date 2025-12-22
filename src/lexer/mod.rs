@@ -64,7 +64,7 @@ pub fn lexer<'src>()
                 .repeated()
                 .collect()
                 .delimited_by(just("[").padded(), just("]").padded())
-                .map(|t| Token::SquareBrackets(t)),
+                .map(Token::SquareBrackets),
         ))
         .spanned()
         .padded()

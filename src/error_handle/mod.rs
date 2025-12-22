@@ -12,7 +12,7 @@ fn failure<P: AsRef<Path>>(
     path: P,
 ) {
     let fname: &'static str = path.as_ref().display().to_string().leak();
-    Report::build(ReportKind::Error, (fname, label.1.into_range()))
+    if let Err(err) = Report::build(ReportKind::Error, (fname, label.1.into_range()))
         .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
         .with_message(&msg)
         .with_label(
@@ -27,7 +27,9 @@ fn failure<P: AsRef<Path>>(
         }))
         .finish()
         .print(sources([(fname, src)]))
-        .unwrap();
+    {
+        panic!("Printing error bug!!!\n{err}")
+    }
 }
 
 pub fn parse_failure<P: AsRef<Path>>(errs: Vec<Rich<impl fmt::Display>>, src: &str, path: P) -> ! {

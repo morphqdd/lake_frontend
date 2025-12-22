@@ -9,3 +9,4 @@ chumsky = { git="https://github.com/zesterer/chumsky.git", features = ["pratt"] 
 miette = {version = "7.6.0", features = ['fancy']}
 nom = "8.0.0"
 thiserror = "2.0.17"
+anyhow = "1"

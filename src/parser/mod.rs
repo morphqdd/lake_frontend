@@ -1,18 +1,17 @@
 use chumsky::{
     IterParser, Parser,
-    container::Container,
     error::Rich,
     extra::Err,
     input::{Input, MappedInput},
     pratt::{Operator, infix, left},
-    prelude::{choice, empty, just, recursive},
+    prelude::{choice, just, recursive},
     select_ref,
     span::{SimpleSpan, SpanWrap, Spanned},
 };
 
 use crate::api::{
     ast::{Branch, Ident, Pattern, Process, Type},
-    expr::{Expr, Path},
+    expr::Expr,
     token::Token,
 };
 
@@ -83,8 +82,8 @@ fn expr<'t, 'src: 't>() -> impl Parser<
     recursive(|expr| {
         let ident = select_ref! { Token::Ident(n) => *n }.map(Expr::Var);
         let atom = choice((
-            select_ref! { Token::Num(n) => Expr::Num(*n) },
-            select_ref! { Token::String(n) => Expr::String(*n) },
+            select_ref! { Token::Num(n) => Expr::Num(n) },
+            select_ref! { Token::String(n) => Expr::String(n) },
             just(Token::False).to(Expr::Bool(false)),
             just(Token::True).to(Expr::Bool(true)),
             ident,
@@ -99,7 +98,7 @@ fn expr<'t, 'src: 't>() -> impl Parser<
                     ))
                     .map(|(ident, args)| Expr::Jump {
                         ident: Box::new(ident),
-                        args: args,
+                        args,
                     }),
                 atom.clone(),
             ));
@@ -180,6 +179,9 @@ pub fn process<'t, 'src: 't>() -> impl Parser<
 
 #[cfg(test)]
 mod test {
+    use std::any::type_name;
+
+    use anyhow::bail;
     use chumsky::{Parser, input::Input, span::Spanned};
 
     use crate::{
@@ -187,42 +189,48 @@ mod test {
             ast::{Ident, Pattern, Type},
             expr::Expr,
         },
+        error_handle::parse_failure,
         lexer::lexer,
         parser::pattern,
     };
 
     #[test]
-    fn parse_pattern_test() {
+    fn parse_pattern_test() -> anyhow::Result<()> {
         let input = "n i32.10";
-        let tokens = lexer().parse(input).into_result();
-        assert!(tokens.is_ok());
-        let tokens = tokens.unwrap();
-        let ast = pattern()
-            .parse(tokens[..].split_spanned((0..input.len()).into()))
-            .into_result();
-        assert!(ast.is_ok());
-        assert_eq!(
-            ast.unwrap(),
-            Spanned {
-                inner: Pattern::new(
+        match lexer().parse(input).into_result() {
+            Ok(tokens) => match pattern()
+                .parse(tokens[..].split_spanned((0..input.len()).into()))
+                .into_result()
+            {
+                Ok(ast) => assert_eq!(
+                    ast,
                     Spanned {
-                        inner: Ident::new("n"),
-                        span: (0..1).into()
-                    },
-                    Spanned {
-                        inner: Type::Type(Spanned {
-                            inner: Ident::new("i32"),
-                            span: (2..5).into()
-                        }),
-                        span: (2..5).into()
-                    },
-                    Some(Spanned {
-                        inner: Expr::Num("10".into()),
-                        span: (6..8).into()
-                    })
+                        inner: Pattern::new(
+                            Spanned {
+                                inner: Ident::new("n"),
+                                span: (0..1).into()
+                            },
+                            Spanned {
+                                inner: Type::Type(Spanned {
+                                    inner: Ident::new("i32"),
+                                    span: (2..5).into()
+                                }),
+                                span: (2..5).into()
+                            },
+                            Some(Spanned {
+                                inner: Expr::Num("10"),
+                                span: (6..8).into()
+                            })
+                        ),
+                        span: (0..8).into()
+                    }
                 ),
-                span: (0..8).into()
-            }
-        )
+                Err(errs) => {
+                    parse_failure(errs, input, module_path!());
+                }
+            },
+            Err(errs) => parse_failure(errs, input, module_path!()),
+        }
+        Ok(())
     }
 }
