@@ -1,11 +1,7 @@
 use std::{fs, path::Path};
 
 use chumsky::{Parser, input::Input};
-use lake_frontend::{
-    error_handle::parse_failure,
-    lexer::lexer,
-    parser::process,
-};
+use lake_frontend::{error_handle::parse_failure, lexer::lexer, parser::process};
 
 fn main() {
     let path = Path::new("./examples/simple.lake");
