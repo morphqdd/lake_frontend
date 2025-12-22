@@ -91,3 +91,12 @@ pub enum Type<'src> {
     Path(Spanned<Ident<'src>>, Spanned<Box<Type<'src>>>),
     Type(Spanned<Ident<'src>>),
 }
+
+impl ToString for Type<'_> {
+    fn to_string(&self) -> String {
+        match self {
+            Type::Path(ident, next) => format!("{}:{}", ident.inner.to_string(), next.to_string()),
+            Type::Type(ident) => format!("{}", ident.to_string()),
+        }
+    }
+}
