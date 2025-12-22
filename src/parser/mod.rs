@@ -179,9 +179,9 @@ pub fn process<'t, 'src: 't>() -> impl Parser<
 
 #[cfg(test)]
 mod test {
-    use std::any::type_name;
+    
 
-    use anyhow::bail;
+    
     use chumsky::{Parser, input::Input, span::Spanned};
 
     use crate::{
