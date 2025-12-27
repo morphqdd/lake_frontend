@@ -177,6 +177,15 @@ pub fn process<'t, 'src: 't>() -> impl Parser<
         .spanned()
 }
 
+pub fn program<'t, 'src: 't>() -> impl Parser<
+    't,
+    MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
+    Vec<Spanned<Process<'src>>>,
+    Err<Rich<'t, Token<'src>>>,
+> {
+    process().repeated().at_least(1).collect()
+}
+
 #[cfg(test)]
 mod test {
 
