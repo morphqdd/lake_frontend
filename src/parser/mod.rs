@@ -10,7 +10,7 @@ use chumsky::{
 };
 
 use crate::api::{
-    ast::{Branch, Ident, Pattern, Process, Type},
+    ast::{Branch, Ident, Machine, Pattern, Type},
     expr::Expr,
     token::Token,
 };
@@ -160,7 +160,7 @@ pub fn branch<'t, 'src: 't>() -> impl Parser<
 pub fn process<'t, 'src: 't>() -> impl Parser<
     't,
     MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
-    Spanned<Process<'src>>,
+    Spanned<Machine<'src>>,
     Err<Rich<'t, Token<'src>>>,
 > {
     select_ref!(Token::Ident(n) => Ident::new(n))
@@ -173,14 +173,14 @@ pub fn process<'t, 'src: 't>() -> impl Parser<
                 .collect::<Vec<_>>()
                 .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span()))),
         )
-        .map(|(ident, branches)| Process::new(ident, branches))
+        .map(|(ident, branches)| Machine::new(ident, branches))
         .spanned()
 }
 
 pub fn program<'t, 'src: 't>() -> impl Parser<
     't,
     MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
-    Vec<Spanned<Process<'src>>>,
+    Vec<Spanned<Machine<'src>>>,
     Err<Rich<'t, Token<'src>>>,
 > {
     process().repeated().at_least(1).collect()

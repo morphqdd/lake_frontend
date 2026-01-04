@@ -3,14 +3,18 @@ use chumsky::span::Spanned;
 use crate::api::expr::Expr;
 
 #[derive(Debug, PartialEq, PartialOrd)]
-pub struct Process<'src> {
+pub struct Machine<'src> {
     ident: Spanned<Ident<'src>>,
     branches: Vec<Spanned<Branch<'src>>>,
 }
 
-impl<'src> Process<'src> {
-    pub fn new(ident: Spanned<Ident<'src>>, branches: Vec<Spanned<Branch<'src>>>) -> Process<'src> {
+impl<'src> Machine<'src> {
+    pub fn new(ident: Spanned<Ident<'src>>, branches: Vec<Spanned<Branch<'src>>>) -> Machine<'src> {
         Self { ident, branches }
+    }
+
+    pub fn ident(&self) -> Ident<'src> {
+        self.ident.inner.clone()
     }
 
     pub fn branches(&self) -> Vec<Branch<'src>> {

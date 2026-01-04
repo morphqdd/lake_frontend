@@ -2,9 +2,9 @@ use std::path::Path;
 
 use chumsky::{Parser, input::Input, span::Spanned};
 
-use crate::{api::ast::Process, error_handle::parse_failure, lexer::lexer, parser::program};
+use crate::{api::ast::Machine, error_handle::parse_failure, lexer::lexer, parser::program};
 
-pub fn parse<'src, P: AsRef<Path>>(path: P, src: &'src str) -> Vec<Spanned<Process<'src>>> {
+pub fn parse<'src, P: AsRef<Path>>(path: P, src: &'src str) -> Vec<Spanned<Machine<'src>>> {
     let tokens = lexer()
         .parse(&src)
         .into_result()
