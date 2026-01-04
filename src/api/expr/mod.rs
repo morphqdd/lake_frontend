@@ -1,6 +1,6 @@
 use chumsky::span::Spanned;
 
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
+#[derive(Hash, Clone, Debug, PartialEq, PartialOrd)]
 pub enum Expr<'src> {
     Num(&'src str),
     String(&'src str),
@@ -30,7 +30,7 @@ pub enum Expr<'src> {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
+#[derive(Hash, Clone, Debug, PartialEq, PartialOrd)]
 pub enum Path<'src> {
     Path(Box<Spanned<Self>>),
     Type(&'src str),

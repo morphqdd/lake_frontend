@@ -43,7 +43,7 @@ impl<'src> Branch<'src> {
     }
 }
 
-#[derive(Debug, PartialEq, PartialOrd, Clone)]
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
 pub struct Pattern<'src> {
     ident: Spanned<Ident<'src>>,
     ty: Spanned<Type<'src>>,
@@ -76,7 +76,7 @@ impl<'src> Pattern<'src> {
     }
 }
 
-#[derive(Debug, PartialEq, PartialOrd, Clone)]
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
 pub struct Ident<'src>(&'src str);
 impl<'src> Ident<'src> {
     pub fn new(inner: &'src str) -> Ident<'src> {
@@ -90,7 +90,7 @@ impl ToString for Ident<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, PartialOrd, Clone)]
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
 pub enum Type<'src> {
     Path(Spanned<Ident<'src>>, Spanned<Box<Type<'src>>>),
     Type(Spanned<Ident<'src>>),
