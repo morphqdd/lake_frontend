@@ -76,6 +76,16 @@ impl<'src> Pattern<'src> {
     }
 }
 
+impl<'a> From<&Pattern<'a>> for Expr<'a> {
+    fn from(value: &Pattern<'a>) -> Self {
+        Expr::Let {
+            ident: value.ident.clone(),
+            ty: value.ty.clone(),
+            default: value.default.clone().map(|x| Box::new(x)),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
 pub struct Ident<'src>(&'src str);
 impl<'src> Ident<'src> {

@@ -1,5 +1,7 @@
 use chumsky::span::Spanned;
 
+use crate::api::ast::{Ident, Type};
+
 #[derive(Hash, Clone, Debug, PartialEq, PartialOrd)]
 pub enum Expr<'src> {
     Num(&'src str),
@@ -8,8 +10,8 @@ pub enum Expr<'src> {
     Bool(bool),
     Path(Path<'src>),
     Let {
-        ident: Spanned<&'src str>,
-        ty: Box<Spanned<Self>>,
+        ident: Spanned<Ident<'src>>,
+        ty: Spanned<Type<'src>>,
         default: Option<Box<Spanned<Self>>>,
     },
     Jump {
