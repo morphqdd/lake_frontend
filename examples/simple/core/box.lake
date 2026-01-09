@@ -1,0 +1,11 @@
+@rt_st(raw_box)
+@rt(len {raw_box} {usize})
+
+pub box(T) is {
+  @.raw_box(T)
+
+  @len ptr box(T) -> ret usize {
+    len(ptr)
+  }
+}
+

@@ -1,0 +1,20 @@
+@ffi(syscall { i64 i64 i64 i64 i64 i64 i64 } { i64 })
+@rt(overflow {raw_box usize} {bool})
+
++core.{ box.box result.result error.error }
+
+pub writer is {
+  data_ptr box(u8) -> {
+    self(1 data_ptr box@len(data_ptr))
+  }
+
+  fd i64 data_ptr box(u8) len usize -> ret result({}) {
+    when overflow(data_ptr len) {
+      false -> {       
+        syscall(1 fd data_ptr len 0 0 0)
+        result@ok.{}
+      }
+      true -> { result@err.error.{ "Data is overflowed" } }
+    } 
+  }
+}

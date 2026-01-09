@@ -1,3 +1,0 @@
-n i32.1 -> 
-  print [] 
-  print [ n ]  
