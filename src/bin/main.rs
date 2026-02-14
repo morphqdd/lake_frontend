@@ -1,24 +1,34 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, process};
 
-use chumsky::{Parser, input::Input};
-use lake_frontend::{error_handle::parse_failure, lexer::lexer, parser::process};
+use lake_frontend::prelude::parse;
+
+fn parse_file(path: &Path) {
+    let src = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("error reading {}: {e}", path.display());
+        process::exit(1);
+    });
+    match parse(path, &src) {
+        Ok(ast) => {
+            println!("=== {} ===", path.display());
+            println!("{ast:#?}\n");
+        }
+        Err(errs) => {
+            errs.display(&src, path);
+            process::exit(1);
+        }
+    }
+}
 
 fn main() {
-    let path = Path::new("./examples/simple.lake");
-    let src = fs::read_to_string(path).unwrap();
-    let tokens = lexer().parse(&src).into_result().unwrap_or_else(|errs| {
-        println!("{errs:?}");
-        parse_failure(errs, &src, path)
-    });
-    println!("{:?}", tokens);
-    println!(
-        "{:?}",
-        process()
-            .parse(tokens[..].split_spanned((0..src.len()).into()))
-            .into_result()
-            .unwrap_or_else(|errs| {
-                println!("{errs:?}");
-                parse_failure(errs, &src, path)
-            })
-    )
+    let examples = [
+        // "examples/simple/simple.lake",
+        // "examples/simple/core/error.lake",
+        // "examples/simple/core/result.lake",
+        // "examples/simple/core/box.lake",
+        "examples/simple/core/io.lake",
+    ];
+
+    for path in examples {
+        parse_file(Path::new(path));
+    }
 }

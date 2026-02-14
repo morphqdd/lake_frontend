@@ -1,0 +1,6 @@
++core.error.error
+
+result(T) is {
+  @ok.T
+  @err.error
+}

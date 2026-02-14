@@ -1,37 +1,77 @@
+use std::{cell::RefCell, hash::Hash, rc::Rc};
+
 use chumsky::span::Spanned;
+
+use crate::api::ast::{Directive, Ident, Import, Machine, Type};
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum Expr<'src> {
-    Num(&'src str),
-    String(&'src str),
-    Var(&'src str),
+    // ── Literals ──────────────────────────────────────────────────────────
+    Num(&'src str, Type<'src>),
+    String(&'src str, Type<'src>),
     Bool(bool),
-    Path(Path<'src>),
+    /// Empty struct literal `{}`
+    Unit,
+
+    // ── Variables & paths ─────────────────────────────────────────────────
+    Var(&'src str, Type<'src>),
+
+    // ── Binding ───────────────────────────────────────────────────────────
     Let {
-        ident: Spanned<&'src str>,
-        ty: Box<Spanned<Self>>,
+        ident: Spanned<Ident<'src>>,
+        ty: Spanned<Type<'src>>,
         default: Option<Box<Spanned<Self>>>,
     },
+
+    // ── Calls & access ────────────────────────────────────────────────────
+    /// `func(args)` or `self(args)`
     Jump {
         ident: Box<Spanned<Self>>,
         args: Vec<Spanned<Self>>,
     },
+    /// `receiver@method(args)` — call via `@`
+    MethodCall {
+        receiver: Box<Spanned<Self>>,
+        method: Spanned<Ident<'src>>,
+        args: Vec<Spanned<Self>>,
+    },
+    /// `receiver@field` — access via `@` without call
+    AtAccess {
+        receiver: Box<Spanned<Self>>,
+        field: Spanned<Ident<'src>>,
+    },
+    /// `receiver.field` — dot access
+    DotAccess {
+        receiver: Box<Spanned<Self>>,
+        field: Spanned<Ident<'src>>,
+    },
+    /// `receiver.{ fields }` — struct init
+    StructInit {
+        base: Box<Spanned<Self>>,
+        fields: Vec<Spanned<Self>>,
+    },
+
+    // ── Pattern matching ──────────────────────────────────────────────────
+    /// `when expr { pat -> { body } ... }`
+    When {
+        cond: Box<Spanned<Self>>,
+        branches: Vec<(Spanned<Self>, Vec<Spanned<Self>>)>,
+    },
+
+    // ── Arithmetic ────────────────────────────────────────────────────────
     Mul(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Div(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Add(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Sub(Box<Spanned<Self>>, Box<Spanned<Self>>),
-    Branch {
-        var_pattern: Box<Spanned<Self>>,
-        body: Box<Spanned<Self>>,
-    },
-    Machine {
-        ident: Spanned<&'src str>,
-        branches: Vec<Self>,
-    },
+
+    // ── Top-level items ───────────────────────────────────────────────────
+    Import(Spanned<Rc<RefCell<Import<'src>>>>),
+    Machine(Spanned<Machine<'src>>),
+    Directive(Spanned<Directive<'src>>),
 }
 
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
-pub enum Path<'src> {
-    Path(Box<Spanned<Self>>),
-    Type(&'src str),
+impl Hash for Expr<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+    }
 }
