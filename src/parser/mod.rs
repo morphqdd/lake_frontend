@@ -95,8 +95,6 @@ pub fn pattern<'t, 'src: 't>()
         .spanned()
 }
 
-// ─── expr ─────────────────────────────────────────────────────────────────────
-
 /// Parses a full expression with operator precedence and postfix chains.
 fn expr<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Expr<'src>>, Err<Rich<'t, Token<'src>>>> {
@@ -348,6 +346,13 @@ pub fn machine<'t, 'src: 't>()
 
 // ─── import ───────────────────────────────────────────────────────────────────
 
+type SpannedImport<'src> = Spanned<
+    Vec<(
+        Spanned<Rc<RefCell<Import<'src>>>>,
+        Option<Spanned<Rc<RefCell<Import<'src>>>>>,
+    )>,
+>;
+
 fn import<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Expr<'src>>, Err<Rich<'t, Token<'src>>>> {
     let single_import = select_ref!(Token::Ident(n) = e =>
@@ -357,11 +362,10 @@ fn import<'t, 'src: 't>()
         )))
     );
 
-    let next_single = just(Token::Dot).ignore_then(single_import.clone().spanned());
+    let next_single = just(Token::Dot).ignore_then(single_import.spanned());
 
     // Multi-import: `{ a.b c.d }`
     let multiimport = single_import
-        .clone()
         .spanned()
         .then(next_single.clone().repeated().collect::<Vec<_>>().map(
             |v: Vec<Spanned<Rc<RefCell<Import<'src>>>>>| {
@@ -381,27 +385,20 @@ fn import<'t, 'src: 't>()
         .collect::<Vec<_>>()
         .spanned()
         .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())))
-        .map(
-            |v: Spanned<
-                Vec<(
-                    Spanned<Rc<RefCell<Import<'src>>>>,
-                    Option<Spanned<Rc<RefCell<Import<'src>>>>>,
-                )>,
-            >| {
-                Rc::new(RefCell::new(Import::MultiImport(
-                    v.inner
-                        .into_iter()
-                        .map(|(head, tail)| {
-                            if let Some(tail) = tail {
-                                head.inner.borrow_mut().set_next(tail);
-                            }
-                            head
-                        })
-                        .collect(),
-                )))
-                .with_span(v.span)
-            },
-        );
+        .map(|v: SpannedImport<'src>| {
+            Rc::new(RefCell::new(Import::MultiImport(
+                v.inner
+                    .into_iter()
+                    .map(|(head, tail)| {
+                        if let Some(tail) = tail {
+                            head.inner.borrow_mut().set_next(tail);
+                        }
+                        head
+                    })
+                    .collect(),
+            )))
+            .with_span(v.span)
+        });
 
     let next = just(Token::Dot).ignore_then(multiimport.or(single_import.spanned()));
 
