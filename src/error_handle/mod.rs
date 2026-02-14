@@ -21,7 +21,11 @@ impl LakeError {
         span: SimpleSpan,
         contexts: Vec<(String, SimpleSpan)>,
     ) -> Self {
-        Self { message: message.into(), span, contexts }
+        Self {
+            message: message.into(),
+            span,
+            contexts,
+        }
     }
 
     /// Convert a chumsky `Rich` error into a `LakeError`.
@@ -41,9 +45,7 @@ impl LakeError {
         let fname: &'static str = path.as_ref().display().to_string().leak();
 
         let result = Report::build(ReportKind::Error, (fname, self.span.into_range()))
-            .with_config(
-                ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
-            )
+            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
             .with_message(&self.message)
             .with_label(
                 Label::new((fname, self.span.into_range()))
