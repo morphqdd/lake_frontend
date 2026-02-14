@@ -1,243 +1,512 @@
+use std::{cell::RefCell, rc::Rc};
+
 use chumsky::{
     IterParser, Parser,
     error::Rich,
     extra::Err,
     input::{Input, MappedInput},
-    pratt::{Operator, infix, left},
+    pratt::{infix, left},
     prelude::{choice, just, recursive},
     select_ref,
     span::{SimpleSpan, SpanWrap, Spanned},
 };
 
 use crate::api::{
-    ast::{Branch, Ident, Machine, Pattern, Type},
+    ast::{Branch, Directive, Field, Ident, Import, Machine, MachineItem, Pattern, Type},
     expr::Expr,
     token::Token,
 };
 
-// pub fn parser<'tokens, 'src: 'tokens>() -> impl Parser<
-//     'tokens,
-//     MappedInput<'tokens, Token<'src>, SimpleSpan, &'tokens [Spanned<Token<'src>>]>,
-//     Spanned<Expr<'src>>,
-//     Err<Rich<'tokens, Token<'src>>>,
-// > {
-//     recursive(|expr| {
-//         let ident = select_ref! { Token::Ident(n) => *n };
-//         let path = select_ref! { Token::Ident(n) => Expr::Path(Path::Type(*n)) };
-//         let atom = choice((
-//             select_ref! { Token::Num(n) => Expr::Num(*n) },
-//             select_ref! { Token::String(n) => Expr::String(*n) },
-//             just(Token::False).to(Expr::Bool(false)),
-//             just(Token::True).to(Expr::Bool(true)),
-//             ident.map(Expr::Var),
-//         ));
-//         let var_pattern = ident
-//             .spanned()
-//             .then(path.spanned().map(Box::new))
-//             .then(just(Token::Dot).then(atom.clone()).or_not());
-//         let branch = var_pattern
-//             .repeated()
-//             .then_ignore(just(Token::Arrow))
-//             .then(atom.clone())
-//             .map(|(a, b)| {
-//                 println!("{a:?} {b:?}");
-//                 Expr::Bool(false)
-//             });
-//
-//         choice((
-//             choice([branch]).spanned(),
-//             expr.nested_in(
-//                 select_ref! { Token::SquareBrackets(ts) = e => ts.split_spanned(e.span())},
-//             ),
-//         ))
-//         .pratt(vec![
-//             infix(left(10), just(Token::Star), |x, _, y, e| {
-//                 Expr::Mul(Box::new(x), Box::new(y)).with_span(e.span())
-//             })
-//             .boxed(),
-//             infix(left(9), just(Token::Plus), |x, _, y, e| {
-//                 Expr::Add(Box::new(x), Box::new(y)).with_span(e.span())
-//             })
-//             .boxed(),
-//             infix(left(1), empty(), |x, _, y, e| {
-//                 Expr::Jump {
-//                     ident: Box::new(x),
-//                     args: vec![y],
-//                 }
-//                 .with_span(e.span())
-//             })
-//             .boxed(),
-//         ])
-//     })
-// }
-//
+// ─── Type alias for the token input ───────────────────────────────────────────
 
-fn expr<'t, 'src: 't>() -> impl Parser<
-    't,
-    MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
-    Spanned<Expr<'src>>,
-    Err<Rich<'t, Token<'src>>>,
-> {
-    use chumsky::input::Input;
-    recursive(|expr| {
-        let ident = select_ref! { Token::Ident(n) => *n }.map(Expr::Var);
-        let atom = choice((
-            select_ref! { Token::Num(n) => Expr::Num(n) },
-            select_ref! { Token::String(n) => Expr::String(n) },
-            just(Token::False).to(Expr::Bool(false)),
-            just(Token::True).to(Expr::Bool(true)),
-            ident,
-        ));
+type TokenInput<'t, 'src> = MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>;
 
-        let call =
-            choice((
-                atom.clone()
-                    .spanned()
-                    .then(expr.repeated().collect::<Vec<_>>().nested_in(
-                        select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())),
-                    ))
-                    .map(|(ident, args)| Expr::Jump {
-                        ident: Box::new(ident),
-                        args,
-                    }),
-                atom.clone(),
-            ));
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-        call.spanned().pratt(vec![
-            infix(left(10), just(Token::Star), |x, _, y, e| {
-                Expr::Mul(Box::new(x), Box::new(y)).with_span(e.span())
+fn ident_parser<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Ident<'src>>, Err<Rich<'t, Token<'src>>>> + Clone {
+    select_ref!(Token::Ident(n) = e => Ident::new(n).with_span(e.span()))
+}
+
+// ─── type_expr ────────────────────────────────────────────────────────────────
+
+/// Parses a type expression:
+/// - `i32`, `str`              → `Type::Named`
+/// - `box(T)`, `result({})`   → `Type::Generic`
+/// - `{}`                     → `Type::Unit`
+/// - `{ i64 usize }`          → `Type::Struct`
+fn type_expr<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Type<'src>>, Err<Rich<'t, Token<'src>>>> {
+    recursive(|ty| {
+        // Struct / unit type inside `{ ... }`
+        let struct_ty = ty
+            .clone()
+            .repeated()
+            .collect::<Vec<_>>()
+            .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())))
+            .map(|types: Vec<Spanned<Type<'src>>>| {
+                if types.is_empty() {
+                    Type::Unit
+                } else {
+                    Type::Struct(types)
+                }
             })
-            .boxed(),
-            infix(left(9), just(Token::Plus), |x, _, y, e| {
-                Expr::Add(Box::new(x), Box::new(y)).with_span(e.span())
+            .spanned();
+
+        // Simple ident, optionally followed by generic args `(T U)`
+        let named = ident_parser()
+            .then(
+                ty.clone()
+                    .repeated()
+                    .collect::<Vec<_>>()
+                    .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+                    .or_not(),
+            )
+            .map(|(name, args)| match args {
+                None => Type::Named(name),
+                Some(args) => Type::Generic(name, args),
             })
-            .boxed(),
-        ])
+            .spanned();
+
+        choice((struct_ty, named))
     })
 }
 
-pub fn pattern<'t, 'src: 't>() -> impl Parser<
-    't,
-    MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
-    Spanned<Pattern<'src>>,
-    Err<Rich<'t, Token<'src>>>,
-> {
-    select_ref!(Token::Ident(n) => Ident::new(n))
-        .spanned()
+// ─── pattern ──────────────────────────────────────────────────────────────────
+
+/// Parses a branch parameter: `n i32`, `n str."hello"`, `_`
+///
+/// `_` is the only pattern that may omit the type annotation.
+pub fn pattern<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Pattern<'src>>, Err<Rich<'t, Token<'src>>>> {
+    ident_parser()
         .then(
-            select_ref!(Token::Ident(n) = e => Type::Type(Ident::new(n).with_span(e.span())))
-                .spanned()
-                .then(just(Token::Dot).ignored().then(expr()).or_not()),
+            type_expr()
+                .then(just(Token::Dot).ignore_then(expr()).or_not())
+                .or_not(),
         )
-        .map(|(ident, (ty, default))| {
-            let default = default.map(|(_, expr)| expr);
+        .map(|(ident, opt)| {
+            let (ty, default) = match opt {
+                Some((ty, default)) => (ty, default),
+                None => (Type::Unit.with_span(ident.span), None),
+            };
             Pattern::new(ident, ty, default)
         })
         .spanned()
 }
 
-pub fn branch<'t, 'src: 't>() -> impl Parser<
-    't,
-    MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
-    Spanned<Branch<'src>>,
-    Err<Rich<'t, Token<'src>>>,
-> {
-    pattern()
-        .repeated()
-        .at_least(1)
-        .collect::<Vec<_>>()
+// ─── expr ─────────────────────────────────────────────────────────────────────
+
+/// Parses a full expression with operator precedence and postfix chains.
+fn expr<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Expr<'src>>, Err<Rich<'t, Token<'src>>>> {
+    recursive(|expr| {
+        // ── atoms ────────────────────────────────────────────────────────
+        let num = select_ref! {
+            Token::Num(n) = e =>
+                Expr::Num(n, Type::Named(Ident::new("i64").with_span(e.span())))
+        };
+        let string_lit = select_ref! {
+            Token::String(n) = e =>
+                Expr::String(n, Type::Named(Ident::new("str").with_span(e.span())))
+        };
+        let bool_false = just(Token::False).to(Expr::Bool(false));
+        let bool_true = just(Token::True).to(Expr::Bool(true));
+        let var = select_ref! {
+            Token::Ident(n) = e =>
+                Expr::Var(n, Type::Named(Ident::new("{}").with_span(e.span())))
+        };
+
+        let atom = choice((num, string_lit, bool_false, bool_true, var));
+
+        // ── when expression ──────────────────────────────────────────────
+        //
+        // `when cond { pat -> { body } ... }`
+        let when_branch =
+            expr.clone()
+                .then_ignore(just(Token::Arrow))
+                .then(expr.clone().repeated().collect::<Vec<_>>().nested_in(
+                    select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())),
+                ))
+                .map(|(cond, body)| (cond, body));
+
+        let when_expr = just(Token::When)
+            .ignore_then(expr.clone())
+            .then(
+                when_branch
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>()
+                    .nested_in(
+                        select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())),
+                    ),
+            )
+            .map(|(cond, branches)| Expr::When {
+                cond: Box::new(cond),
+                branches,
+            });
+
+        // ── base: atom or when ───────────────────────────────────────────
+        let base = choice((when_expr.spanned(), atom.spanned()));
+
+        // ── postfix operations ───────────────────────────────────────────
+        //
+        // Postfix is represented as a local enum.  We collect them with
+        // `repeated()` and fold left into the accumulator.
+
+        enum PostfixOp<'src> {
+            /// `(args)` — regular call
+            Call(Vec<Spanned<Expr<'src>>>),
+            /// `@method(args)` — call via @
+            AtCall(Spanned<Ident<'src>>, Vec<Spanned<Expr<'src>>>),
+            /// `@field` — access via @ (no call)
+            AtAccess(Spanned<Ident<'src>>),
+            /// `.{ fields }` — struct init
+            DotInit(Vec<Spanned<Expr<'src>>>),
+            /// `.field` — dot field access
+            DotAccess(Spanned<Ident<'src>>),
+        }
+
+        let call_op = expr
+            .clone()
+            .repeated()
+            .collect::<Vec<_>>()
+            .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+            .map(PostfixOp::Call);
+
+        let at_op = just(Token::At)
+            .ignore_then(ident_parser())
+            .then(
+                expr.clone()
+                    .repeated()
+                    .collect::<Vec<_>>()
+                    .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+                    .or_not(),
+            )
+            .map(|(method, args)| match args {
+                Some(args) => PostfixOp::AtCall(method, args),
+                None => PostfixOp::AtAccess(method),
+            });
+
+        let dot_op = just(Token::Dot).ignore_then(choice((
+            expr.clone()
+                .repeated()
+                .collect::<Vec<_>>()
+                .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())))
+                .map(PostfixOp::DotInit),
+            ident_parser().map(PostfixOp::DotAccess),
+        )));
+
+        let postfix = choice((call_op, at_op, dot_op));
+
+        // ── chain base + postfix, then apply pratt ───────────────────────
+        base.then(postfix.spanned().repeated().collect::<Vec<_>>())
+            .map(|(base_expr, ops)| {
+                ops.into_iter().fold(base_expr, |acc, op| {
+                    let span = acc.span;
+                    match op.inner {
+                        PostfixOp::Call(args) => Expr::Jump {
+                            ident: Box::new(acc),
+                            args,
+                        }
+                        .with_span(span),
+                        PostfixOp::AtCall(method, args) => Expr::MethodCall {
+                            receiver: Box::new(acc),
+                            method,
+                            args,
+                        }
+                        .with_span(span),
+                        PostfixOp::AtAccess(field) => Expr::AtAccess {
+                            receiver: Box::new(acc),
+                            field,
+                        }
+                        .with_span(span),
+                        PostfixOp::DotInit(fields) => Expr::StructInit {
+                            base: Box::new(acc),
+                            fields,
+                        }
+                        .with_span(span),
+                        PostfixOp::DotAccess(field) => Expr::DotAccess {
+                            receiver: Box::new(acc),
+                            field,
+                        }
+                        .with_span(span),
+                    }
+                })
+            })
+            .pratt((
+                infix(left(10), just(Token::Star), |x, _, y, e| {
+                    Expr::Mul(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(10), just(Token::Slash), |x, _, y, e| {
+                    Expr::Div(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(9), just(Token::Plus), |x, _, y, e| {
+                    Expr::Add(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(9), just(Token::Minus), |x, _, y, e| {
+                    Expr::Sub(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+            ))
+    })
+}
+
+// ─── field_decl ───────────────────────────────────────────────────────────────
+
+/// Parses a field declaration: `@ok.T`, `@.raw_box(T)`, `@.{ str }`
+fn field_decl<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Field<'src>>, Err<Rich<'t, Token<'src>>>> {
+    just(Token::At)
+        .ignore_then(ident_parser().or_not())
+        .then_ignore(just(Token::Dot))
+        .then(type_expr())
+        .map(|(label, ty)| Field::new(label, ty))
+        .spanned()
+}
+
+// ─── branch ───────────────────────────────────────────────────────────────────
+
+/// Parses a process branch: `[@label] pattern+ -> [ret type] { body }`
+fn branch<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Branch<'src>>, Err<Rich<'t, Token<'src>>>> {
+    just(Token::At)
+        .ignore_then(ident_parser())
+        .or_not()
+        .then(pattern().repeated().at_least(1).collect::<Vec<_>>())
         .then_ignore(just(Token::Arrow))
+        .then(just(Token::Ret).ignore_then(type_expr()).or_not())
         .then(
             expr()
                 .repeated()
                 .collect::<Vec<_>>()
                 .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span()))),
         )
-        .map(|(patterns, body)| Branch::new(patterns, body))
+        .map(|(((label, patterns), ret_ty), body)| Branch::new(label, patterns, ret_ty, body))
         .spanned()
 }
 
-pub fn process<'t, 'src: 't>() -> impl Parser<
-    't,
-    MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
-    Spanned<Machine<'src>>,
-    Err<Rich<'t, Token<'src>>>,
-> {
-    select_ref!(Token::Ident(n) => Ident::new(n))
+// ─── machine_item ─────────────────────────────────────────────────────────────
+
+/// Tries `field_decl` first (has `.` after `@label`), then falls back to `branch`.
+fn machine_item<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<MachineItem<'src>>, Err<Rich<'t, Token<'src>>>> {
+    choice((
+        field_decl()
+            .map(|f: Spanned<Field>| MachineItem::Field(f.inner))
+            .spanned(),
+        branch()
+            .map(|b: Spanned<Branch>| MachineItem::Branch(b.inner))
+            .spanned(),
+    ))
+}
+
+// ─── directive ────────────────────────────────────────────────────────────────
+
+/// Parses a built-in macro attribute: `@rt_st(...)`, `@ffi(...)`.
+/// Arguments are skipped (stored as raw tokens in the Parens/Brackets).
+fn directive<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Directive<'src>>, Err<Rich<'t, Token<'src>>>> {
+    just(Token::At)
+        .ignore_then(ident_parser())
+        // Consume optional args (Parens or CurlyBrackets) without parsing them
+        .then_ignore(
+            select_ref!(Token::Parens(_) => ())
+                .or(select_ref!(Token::CurlyBrackets(_) => ()))
+                .or_not(),
+        )
+        .map(Directive::new)
         .spanned()
+}
+
+// ─── machine ──────────────────────────────────────────────────────────────────
+
+/// Parses `[pub] ident[(generics)] is { item* }`
+pub fn machine<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Machine<'src>>, Err<Rich<'t, Token<'src>>>> {
+    just(Token::Pub)
+        .or_not()
+        .map(|p| p.is_some())
+        .then(ident_parser())
+        .then(
+            ident_parser()
+                .repeated()
+                .collect::<Vec<_>>()
+                .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+                .or_not()
+                .map(|g| g.unwrap_or_default()),
+        )
         .then_ignore(just(Token::Is))
         .then(
-            branch()
+            machine_item()
                 .repeated()
-                .at_least(1)
                 .collect::<Vec<_>>()
                 .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span()))),
         )
-        .map(|(ident, branches)| Machine::new(ident, branches))
+        .map(|(((vis, ident), generics), items)| Machine::new(vec![], vis, ident, generics, items))
         .spanned()
 }
 
-pub fn program<'t, 'src: 't>() -> impl Parser<
-    't,
-    MappedInput<'t, Token<'src>, SimpleSpan, &'t [Spanned<Token<'src>>]>,
-    Vec<Spanned<Machine<'src>>>,
-    Err<Rich<'t, Token<'src>>>,
-> {
-    process().repeated().at_least(1).collect()
+// ─── import ───────────────────────────────────────────────────────────────────
+
+fn import<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Expr<'src>>, Err<Rich<'t, Token<'src>>>> {
+    let single_import = select_ref!(Token::Ident(n) = e =>
+        Rc::new(RefCell::new(Import::Import(
+            Ident::new(n).with_span(e.span()),
+            None,
+        )))
+    );
+
+    let next_single = just(Token::Dot).ignore_then(single_import.clone().spanned());
+
+    // Multi-import: `{ a.b c.d }`
+    let multiimport = single_import
+        .clone()
+        .spanned()
+        .then(next_single.clone().repeated().collect::<Vec<_>>().map(
+            |v: Vec<Spanned<Rc<RefCell<Import<'src>>>>>| {
+                if v.is_empty() {
+                    return None;
+                }
+                let base = v[0].clone();
+                let mut curr = base.clone();
+                for import in v[1..].iter() {
+                    let next = curr.inner.borrow_mut().set_next(import.clone());
+                    curr = next;
+                }
+                Some(base)
+            },
+        ))
+        .repeated()
+        .collect::<Vec<_>>()
+        .spanned()
+        .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())))
+        .map(
+            |v: Spanned<
+                Vec<(
+                    Spanned<Rc<RefCell<Import<'src>>>>,
+                    Option<Spanned<Rc<RefCell<Import<'src>>>>>,
+                )>,
+            >| {
+                Rc::new(RefCell::new(Import::MultiImport(
+                    v.inner
+                        .into_iter()
+                        .map(|(head, tail)| {
+                            if let Some(tail) = tail {
+                                head.inner.borrow_mut().set_next(tail);
+                            }
+                            head
+                        })
+                        .collect(),
+                )))
+                .with_span(v.span)
+            },
+        );
+
+    let next = just(Token::Dot).ignore_then(multiimport.or(single_import.spanned()));
+
+    just(Token::Plus)
+        .ignore_then(single_import.spanned())
+        .then(next.repeated().collect::<Vec<_>>())
+        .map(|(head, tail): (Spanned<Rc<RefCell<Import<'src>>>>, _)| {
+            if let Some(base) = tail.first() {
+                let base = base.clone();
+                let mut curr = base.clone();
+                for import in tail[1..].iter() {
+                    let next = curr.inner.borrow_mut().set_next(import.clone());
+                    curr = next;
+                }
+                head.inner.borrow_mut().set_next(base);
+            }
+            Expr::Import(head)
+        })
+        .spanned()
 }
 
-#[cfg(test)]
-mod test {
+// ─── program ──────────────────────────────────────────────────────────────────
 
-    use chumsky::{Parser, input::Input, span::Spanned};
+/// Top-level parser.  Returns a flat list of items: imports, standalone
+/// directives (`Expr::Directive`), and machines (`Expr::Machine`).
+///
+/// Directives are parsed as standalone items because they may be separated
+/// from the machine they annotate by imports (e.g. in `io.lake`).
+/// Attaching directives to machines is left to a later semantic pass.
+pub fn program<'t, 'src: 't>()
+-> impl Parser<'t, TokenInput<'t, 'src>, Vec<Spanned<Expr<'src>>>, Err<Rich<'t, Token<'src>>>> {
+    let machine_item = machine().map(|m: Spanned<Machine>| {
+        let span = m.span;
+        Expr::Machine(m).with_span(span)
+    });
+
+    let directive_item = directive().map(|d: Spanned<Directive>| {
+        let span = d.span;
+        Expr::Directive(d).with_span(span)
+    });
+
+    choice((import(), directive_item, machine_item))
+        .repeated()
+        .collect::<Vec<_>>()
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use chumsky::{Parser, input::Input};
 
     use crate::{
         api::{
             ast::{Ident, Pattern, Type},
             expr::Expr,
         },
-        error_handle::parse_failure,
         lexer::lexer,
         parser::pattern,
     };
 
+    fn parse_pattern(src: &str) -> Result<chumsky::span::Spanned<Pattern<'_>>, String> {
+        let tokens = lexer()
+            .parse(src)
+            .into_result()
+            .map_err(|e| format!("lex error: {e:?}"))?;
+        pattern()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .map_err(|e| format!("parse error: {e:?}"))
+    }
+
     #[test]
-    fn parse_pattern_test() -> anyhow::Result<()> {
-        let input = "n i32.10";
-        match lexer().parse(input).into_result() {
-            Ok(tokens) => match pattern()
-                .parse(tokens[..].split_spanned((0..input.len()).into()))
-                .into_result()
-            {
-                Ok(ast) => assert_eq!(
-                    ast,
-                    Spanned {
-                        inner: Pattern::new(
-                            Spanned {
-                                inner: Ident::new("n"),
-                                span: (0..1).into()
-                            },
-                            Spanned {
-                                inner: Type::Type(Spanned {
-                                    inner: Ident::new("i32"),
-                                    span: (2..5).into()
-                                }),
-                                span: (2..5).into()
-                            },
-                            Some(Spanned {
-                                inner: Expr::Num("10"),
-                                span: (6..8).into()
-                            })
-                        ),
-                        span: (0..8).into()
-                    }
-                ),
-                Err(errs) => {
-                    parse_failure(errs, input, module_path!());
-                }
-            },
-            Err(errs) => parse_failure(errs, input, module_path!()),
-        }
-        Ok(())
+    fn parse_simple_pattern() {
+        let result = parse_pattern("n i32").expect("should parse");
+        assert_eq!(result.inner.ident.inner, Ident::new("n"));
+        assert!(matches!(result.inner.ty.inner, Type::Named(_)));
+        assert!(result.inner.default.is_none());
+    }
+
+    #[test]
+    fn parse_pattern_with_default() {
+        let result = parse_pattern("n i32.10").expect("should parse");
+        assert_eq!(result.inner.ident.inner, Ident::new("n"));
+        assert!(result.inner.default.is_some());
+    }
+
+    #[test]
+    fn parse_wildcard_pattern() {
+        let result = parse_pattern("_").expect("should parse");
+        assert!(result.inner.is_wildcard());
+    }
+
+    #[test]
+    fn parse_generic_type_pattern() {
+        let result = parse_pattern("ptr box(T)").expect("should parse");
+        assert_eq!(result.inner.ident.inner, Ident::new("ptr"));
+        assert!(matches!(result.inner.ty.inner, Type::Generic(_, _)));
+    }
+
+    #[test]
+    fn parse_string_default_pattern() {
+        let result = parse_pattern("n str.\"hello\"").expect("should parse");
+        assert!(
+            matches!(result.inner.default, Some(ref e) if matches!(e.inner, Expr::String(_, _)))
+        );
     }
 }
