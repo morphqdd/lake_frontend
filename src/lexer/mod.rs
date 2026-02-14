@@ -18,6 +18,8 @@ pub fn lexer<'src>()
                 "when" => Token::When,
                 "true" => Token::True,
                 "false" => Token::False,
+                "pub" => Token::Pub,
+                "ret" => Token::Ret,
                 s => Token::Ident(s),
             }),
             just("@").to(Token::At),

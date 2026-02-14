@@ -2,15 +2,21 @@ use std::path::Path;
 
 use chumsky::{Parser, input::Input, span::Spanned};
 
-use crate::{api::ast::Machine, error_handle::parse_failure, lexer::lexer, parser::program};
+use crate::{api::expr::Expr, error_handle::LakeErrors, lexer::lexer, parser::program};
 
-pub fn parse<'src, P: AsRef<Path>>(path: P, src: &'src str) -> Vec<Spanned<Machine<'src>>> {
+/// Parse a Lake source file.  Returns the AST on success or a collection of
+/// errors that can be displayed with [`LakeErrors::display`].
+pub fn parse<'src, P: AsRef<Path>>(
+    _path: P,
+    src: &'src str,
+) -> Result<Vec<Spanned<Expr<'src>>>, LakeErrors> {
     let tokens = lexer()
-        .parse(&src)
+        .parse(src)
         .into_result()
-        .unwrap_or_else(|errs| parse_failure(errs, &src, &path));
+        .map_err(LakeErrors::from_rich_vec)?;
+
     program()
         .parse(tokens[..].split_spanned((0..src.len()).into()))
         .into_result()
-        .unwrap_or_else(|errs| parse_failure(errs, &src, &path))
+        .map_err(LakeErrors::from_rich_vec)
 }

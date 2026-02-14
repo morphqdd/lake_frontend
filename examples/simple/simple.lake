@@ -1,3 +1,4 @@
++core.{ io.writer }
 +core.io.writer
 
 main is {
