@@ -537,7 +537,9 @@ mod tests {
         assert_eq!(result.inner.name.inner, Ident::new("rt_st"));
         assert_eq!(result.inner.args.len(), 1);
         assert!(matches!(result.inner.args[0].inner, Type::Named(_)));
-        let Type::Named(ref ident) = result.inner.args[0].inner else { panic!() };
+        let Type::Named(ref ident) = result.inner.args[0].inner else {
+            panic!()
+        };
         assert_eq!(ident.inner, Ident::new("raw_box"));
     }
 
@@ -548,7 +550,9 @@ mod tests {
         assert_eq!(result.inner.name.inner, Ident::new("rt"));
         assert_eq!(result.inner.args.len(), 3);
         assert!(matches!(result.inner.args[0].inner, Type::Named(_)));
-        let Type::Struct(ref fields) = result.inner.args[1].inner else { panic!() };
+        let Type::Struct(ref fields) = result.inner.args[1].inner else {
+            panic!()
+        };
         assert_eq!(fields.len(), 2);
         assert!(matches!(fields[0].inner, Type::Named(_)));
         assert!(matches!(fields[1].inner, Type::Named(_)));
@@ -565,10 +569,14 @@ mod tests {
         // first arg: Named("syscall")
         assert!(matches!(result.inner.args[0].inner, Type::Named(_)));
         // second arg: Struct with 7 fields
-        let Type::Struct(ref params) = result.inner.args[1].inner else { panic!() };
+        let Type::Struct(ref params) = result.inner.args[1].inner else {
+            panic!()
+        };
         assert_eq!(params.len(), 7);
         // third arg: Struct with 1 field
-        let Type::Struct(ref ret) = result.inner.args[2].inner else { panic!() };
+        let Type::Struct(ref ret) = result.inner.args[2].inner else {
+            panic!()
+        };
         assert_eq!(ret.len(), 1);
     }
 
@@ -578,11 +586,17 @@ mod tests {
         let result = parse_directive("@rt(len {raw_box} {usize})").expect("should parse");
         assert_eq!(result.inner.name.inner, Ident::new("rt"));
         assert_eq!(result.inner.args.len(), 3);
-        let Type::Named(ref name) = result.inner.args[0].inner else { panic!() };
+        let Type::Named(ref name) = result.inner.args[0].inner else {
+            panic!()
+        };
         assert_eq!(name.inner, Ident::new("len"));
-        let Type::Struct(ref a) = result.inner.args[1].inner else { panic!() };
+        let Type::Struct(ref a) = result.inner.args[1].inner else {
+            panic!()
+        };
         assert_eq!(a.len(), 1);
-        let Type::Struct(ref b) = result.inner.args[2].inner else { panic!() };
+        let Type::Struct(ref b) = result.inner.args[2].inner else {
+            panic!()
+        };
         assert_eq!(b.len(), 1);
     }
 }
