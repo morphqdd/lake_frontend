@@ -246,11 +246,12 @@ pub enum MachineItem<'src> {
 #[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
 pub struct Directive<'src> {
     pub name: Spanned<Ident<'src>>,
+    pub args: Vec<Spanned<Type<'src>>>,
 }
 
 impl<'src> Directive<'src> {
-    pub fn new(name: Spanned<Ident<'src>>) -> Self {
-        Self { name }
+    pub fn new(name: Spanned<Ident<'src>>, args: Vec<Spanned<Type<'src>>>) -> Self {
+        Self { name, args }
     }
 }
 
