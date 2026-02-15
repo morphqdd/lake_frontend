@@ -301,18 +301,20 @@ fn machine_item<'t, 'src: 't>()
 // ─── directive ────────────────────────────────────────────────────────────────
 
 /// Parses a built-in macro attribute: `@rt_st(...)`, `@ffi(...)`.
-/// Arguments are skipped (stored as raw tokens in the Parens/Brackets).
+/// Arguments inside the parens are parsed as a sequence of type expressions.
 fn directive<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Directive<'src>>, Err<Rich<'t, Token<'src>>>> {
     just(Token::At)
         .ignore_then(ident_parser())
-        // Consume optional args (Parens or CurlyBrackets) without parsing them
-        .then_ignore(
-            select_ref!(Token::Parens(_) => ())
-                .or(select_ref!(Token::CurlyBrackets(_) => ()))
-                .or_not(),
+        .then(
+            type_expr()
+                .repeated()
+                .collect::<Vec<_>>()
+                .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+                .or_not()
+                .map(|args| args.unwrap_or_default()),
         )
-        .map(Directive::new)
+        .map(|(name, args)| Directive::new(name, args))
         .spanned()
 }
 
@@ -453,7 +455,7 @@ mod tests {
 
     use crate::{
         api::{
-            ast::{Ident, Pattern, Type},
+            ast::{Directive, Ident, Pattern, Type},
             expr::Expr,
         },
         lexer::lexer,
@@ -466,6 +468,17 @@ mod tests {
             .into_result()
             .map_err(|e| format!("lex error: {e:?}"))?;
         pattern()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .map_err(|e| format!("parse error: {e:?}"))
+    }
+
+    fn parse_directive(src: &str) -> Result<chumsky::span::Spanned<Directive<'_>>, String> {
+        let tokens = lexer()
+            .parse(src)
+            .into_result()
+            .map_err(|e| format!("lex error: {e:?}"))?;
+        super::directive()
             .parse(tokens[..].split_spanned((0..src.len()).into()))
             .into_result()
             .map_err(|e| format!("parse error: {e:?}"))
@@ -505,5 +518,85 @@ mod tests {
         assert!(
             matches!(result.inner.default, Some(ref e) if matches!(e.inner, Expr::String(_, _)))
         );
+    }
+
+    // ── directive tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn directive_no_args() {
+        // `@rt_st` without parens — args must be empty
+        let result = parse_directive("@rt_st").expect("should parse");
+        assert_eq!(result.inner.name.inner, Ident::new("rt_st"));
+        assert!(result.inner.args.is_empty());
+    }
+
+    #[test]
+    fn directive_single_named_arg() {
+        // `@rt_st(raw_box)` — one Named type arg
+        let result = parse_directive("@rt_st(raw_box)").expect("should parse");
+        assert_eq!(result.inner.name.inner, Ident::new("rt_st"));
+        assert_eq!(result.inner.args.len(), 1);
+        assert!(matches!(result.inner.args[0].inner, Type::Named(_)));
+        let Type::Named(ref ident) = result.inner.args[0].inner else {
+            panic!()
+        };
+        assert_eq!(ident.inner, Ident::new("raw_box"));
+    }
+
+    #[test]
+    fn directive_named_and_struct_args() {
+        // `@rt(overflow {raw_box usize} {bool})` — Named + two Struct args
+        let result = parse_directive("@rt(overflow {raw_box usize} {bool})").expect("should parse");
+        assert_eq!(result.inner.name.inner, Ident::new("rt"));
+        assert_eq!(result.inner.args.len(), 3);
+        assert!(matches!(result.inner.args[0].inner, Type::Named(_)));
+        let Type::Struct(ref fields) = result.inner.args[1].inner else {
+            panic!()
+        };
+        assert_eq!(fields.len(), 2);
+        assert!(matches!(fields[0].inner, Type::Named(_)));
+        assert!(matches!(fields[1].inner, Type::Named(_)));
+        assert!(matches!(result.inner.args[2].inner, Type::Struct(_)));
+    }
+
+    #[test]
+    fn directive_ffi_full() {
+        // `@ffi(syscall { i64 i64 i64 i64 i64 i64 i64 } { i64 })`
+        let result = parse_directive("@ffi(syscall { i64 i64 i64 i64 i64 i64 i64 } { i64 })")
+            .expect("should parse");
+        assert_eq!(result.inner.name.inner, Ident::new("ffi"));
+        assert_eq!(result.inner.args.len(), 3);
+        // first arg: Named("syscall")
+        assert!(matches!(result.inner.args[0].inner, Type::Named(_)));
+        // second arg: Struct with 7 fields
+        let Type::Struct(ref params) = result.inner.args[1].inner else {
+            panic!()
+        };
+        assert_eq!(params.len(), 7);
+        // third arg: Struct with 1 field
+        let Type::Struct(ref ret) = result.inner.args[2].inner else {
+            panic!()
+        };
+        assert_eq!(ret.len(), 1);
+    }
+
+    #[test]
+    fn directive_len_two_struct_args() {
+        // `@rt(len {raw_box} {usize})` — Named + two single-element Structs
+        let result = parse_directive("@rt(len {raw_box} {usize})").expect("should parse");
+        assert_eq!(result.inner.name.inner, Ident::new("rt"));
+        assert_eq!(result.inner.args.len(), 3);
+        let Type::Named(ref name) = result.inner.args[0].inner else {
+            panic!()
+        };
+        assert_eq!(name.inner, Ident::new("len"));
+        let Type::Struct(ref a) = result.inner.args[1].inner else {
+            panic!()
+        };
+        assert_eq!(a.len(), 1);
+        let Type::Struct(ref b) = result.inner.args[2].inner else {
+            panic!()
+        };
+        assert_eq!(b.len(), 1);
     }
 }
