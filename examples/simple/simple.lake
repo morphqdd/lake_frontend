@@ -1,6 +1,12 @@
 +core.{ io.writer }
 +core.io.writer
 
+writer is {
+  _ -> {
+    self()
+  }
+}
+
 main is {
   @init _ -> {
     self@print_string()
