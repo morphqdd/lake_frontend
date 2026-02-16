@@ -9,4 +9,8 @@ main is {
   @print_string n str."some string" -> {
     writer(n)
   }
+  
+  n str."some string" -> {
+    writer(n)
+  }
 }

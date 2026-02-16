@@ -16,12 +16,9 @@ use crate::{
     resolver::is_unknown,
 };
 
-// ─── Branch signature ─────────────────────────────────────────────────────────
-
 /// The type-string of each non-default, non-wildcard parameter in a branch.
 #[derive(Debug, Clone)]
 struct BranchSig {
-    /// Human-readable type list, e.g. `["i64", "str"]`.
     param_types: Vec<String>,
 }
 
@@ -39,8 +36,6 @@ impl BranchSig {
     }
 }
 
-// ─── TypeChecker ─────────────────────────────────────────────────────────────
-
 /// Single-pass type checker.
 pub struct TypeChecker<'src> {
     /// All machine signatures collected in pass 1.
@@ -56,17 +51,15 @@ impl<'src> TypeChecker<'src> {
         }
     }
 
-    // ── Pass 1: collect machine signatures ───────────────────────────────────
-
-    fn collect_signatures(&mut self, program: &'src [chumsky::span::Spanned<Expr<'src>>]) {
+    fn collect_signatures(&mut self, program: Vec<chumsky::span::Spanned<Expr<'src>>>) {
         for item in program {
-            if let Expr::Machine(m) = &item.inner {
-                self.collect_machine_sig(m.inner.ident.inner.0, &m.inner);
+            if let Expr::Machine(m) = item.inner {
+                self.collect_machine_sig(m.inner.ident.inner.0, m.inner);
             }
         }
     }
 
-    fn collect_machine_sig(&mut self, name: &'src str, machine: &'src Machine<'src>) {
+    fn collect_machine_sig(&mut self, name: &'src str, machine: Machine<'src>) {
         let sigs = machine
             .items
             .iter()
@@ -81,14 +74,12 @@ impl<'src> TypeChecker<'src> {
         self.machines.insert(name, sigs);
     }
 
-    // ── Pass 2: check each machine ───────────────────────────────────────────
-
-    fn check_program(&mut self, program: &'src [chumsky::span::Spanned<Expr<'src>>]) {
+    fn check_program(&mut self, program: Vec<chumsky::span::Spanned<Expr<'src>>>) {
         for item in program {
-            if let Expr::Machine(m) = &item.inner {
+            if let Expr::Machine(m) = item.inner {
                 let machine_name = m.inner.ident.inner.0;
-                for machine_item in &m.inner.items {
-                    if let MachineItem::Branch(b) = &machine_item.inner {
+                for machine_item in m.inner.items {
+                    if let MachineItem::Branch(b) = machine_item.inner {
                         self.check_branch(machine_name, b);
                     }
                 }
@@ -96,35 +87,32 @@ impl<'src> TypeChecker<'src> {
         }
     }
 
-    fn check_branch(&mut self, machine_name: &'src str, branch: &'src Branch<'src>) {
-        // Build the local scope from non-wildcard, non-default patterns.
-        let mut scope: HashMap<&'src str, &'src Type<'src>> = HashMap::new();
-        for pat in &branch.patterns {
+    fn check_branch(&mut self, machine_name: &'src str, branch: Branch<'src>) {
+        let mut scope: HashMap<&'src str, Type<'src>> = HashMap::new();
+        for pat in branch.patterns {
             if !pat.inner.is_wildcard() {
-                scope.insert(pat.inner.ident.inner.0, &pat.inner.ty.inner);
+                scope.insert(pat.inner.ident.inner.0, pat.inner.ty.inner);
             }
         }
 
-        for expr in &branch.body {
-            self.check_expr(machine_name, &scope, &expr.inner, expr.span);
+        for expr in branch.body {
+            self.check_expr(machine_name, &scope, expr.inner, expr.span);
         }
     }
 
     fn check_expr(
         &mut self,
         machine_name: &'src str,
-        scope: &HashMap<&'src str, &'src Type<'src>>,
-        expr: &'src Expr<'src>,
+        scope: &HashMap<&'src str, Type<'src>>,
+        expr: Expr<'src>,
         span: SimpleSpan,
     ) {
         match expr {
-            // ── Variable reference ────────────────────────────────────────────
             Expr::Var(name, ty) => {
-                // `self` is a keyword; its type placeholder is intentional.
-                if *name == "self" {
+                if name == "self" {
                     return;
                 }
-                if is_unknown(ty) && !scope.contains_key(name) {
+                if is_unknown(&ty) && !scope.contains_key(name) {
                     self.errors.push(
                         LakeError::new(format!("undeclared variable `{name}`"), span)
                             .code("E001")
@@ -136,41 +124,34 @@ impl<'src> TypeChecker<'src> {
                 }
             }
 
-            // ── `let` binding ─────────────────────────────────────────────────
-            // The binding itself is always valid; check the default expression.
             Expr::Let {
                 default: Some(default),
                 ..
             } => {
-                self.check_expr(machine_name, scope, &default.inner, default.span);
+                self.check_expr(machine_name, scope, default.inner, default.span);
             }
 
-            // ── Call / spawn / self-transition ────────────────────────────────
             Expr::Jump { ident, args } => {
-                // Check argument expressions (not the callee itself).
-                for arg in args {
-                    self.check_expr(machine_name, scope, &arg.inner, arg.span);
+                for arg in args.clone() {
+                    self.check_expr(machine_name, scope, arg.inner, arg.span);
                 }
 
-                // `self(…)` — verify a matching branch exists.
-                if let Expr::Var("self", _) = &ident.inner {
+                if let Expr::Var("self", _) = ident.inner {
                     self.check_self_call(machine_name, args, span);
                 }
             }
 
-            // ── Arithmetic ────────────────────────────────────────────────────
             Expr::Add(l, r) | Expr::Sub(l, r) | Expr::Mul(l, r) | Expr::Div(l, r) => {
-                self.check_arith_operand(machine_name, scope, l);
-                self.check_arith_operand(machine_name, scope, r);
+                self.check_arith_operand(machine_name, scope, *l);
+                self.check_arith_operand(machine_name, scope, *r);
             }
 
-            // ── When ──────────────────────────────────────────────────────────
             Expr::When { cond, branches } => {
-                self.check_expr(machine_name, scope, &cond.inner, cond.span);
+                self.check_expr(machine_name, scope, cond.inner, cond.span);
                 for (pat, body) in branches {
-                    self.check_expr(machine_name, scope, &pat.inner, pat.span);
+                    self.check_expr(machine_name, scope, pat.inner, pat.span);
                     for e in body {
-                        self.check_expr(machine_name, scope, &e.inner, e.span);
+                        self.check_expr(machine_name, scope, e.inner, e.span);
                     }
                 }
             }
@@ -183,7 +164,7 @@ impl<'src> TypeChecker<'src> {
     fn check_self_call(
         &mut self,
         machine_name: &'src str,
-        args: &'src [chumsky::span::Spanned<Expr<'src>>],
+        args: Vec<chumsky::span::Spanned<Expr<'src>>>,
         call_span: SimpleSpan,
     ) {
         let arg_types: Vec<String> = args.iter().map(|a| expr_type_str(&a.inner)).collect();
@@ -229,8 +210,8 @@ impl<'src> TypeChecker<'src> {
     fn check_arith_operand(
         &mut self,
         machine_name: &'src str,
-        scope: &HashMap<&'src str, &'src Type<'src>>,
-        operand: &'src chumsky::span::Spanned<Expr<'src>>,
+        scope: &HashMap<&'src str, Type<'src>>,
+        operand: chumsky::span::Spanned<Expr<'src>>,
     ) {
         if expr_type_str(&operand.inner) == "{}" {
             self.errors.push(
@@ -241,7 +222,7 @@ impl<'src> TypeChecker<'src> {
             );
         }
         // Recurse to also check sub-expressions.
-        self.check_expr(machine_name, scope, &operand.inner, operand.span);
+        self.check_expr(machine_name, scope, operand.inner, operand.span);
     }
 }
 
@@ -273,19 +254,15 @@ fn expr_type_str(expr: &Expr<'_>) -> String {
     }
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-
 /// Type-check a **resolved** Lake program and return all diagnostics.
 ///
 /// Run [`crate::resolver::resolve`] on the AST before calling this.
-pub fn typecheck<'src>(program: &'src [chumsky::span::Spanned<Expr<'src>>]) -> LakeErrors {
+pub fn typecheck<'src>(program: Vec<chumsky::span::Spanned<Expr<'src>>>) -> LakeErrors {
     let mut checker = TypeChecker::new();
-    checker.collect_signatures(program);
+    checker.collect_signatures(program.clone());
     checker.check_program(program);
     LakeErrors::new(checker.errors)
 }
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -301,7 +278,7 @@ mod tests {
             .into_result()
             .expect("parse error");
         let resolved = resolve(ast);
-        typecheck(&resolved)
+        typecheck(resolved)
             .0
             .into_iter()
             .map(|e| e.message)
@@ -315,7 +292,7 @@ mod tests {
             .into_result()
             .expect("parse error");
         let resolved = resolve(ast);
-        typecheck(&resolved)
+        typecheck(resolved)
             .0
             .into_iter()
             .map(|e| e.code.unwrap_or_default())
