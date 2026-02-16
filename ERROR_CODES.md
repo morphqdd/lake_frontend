@@ -1,14 +1,37 @@
 # Lake Error Codes
 
-Errors are emitted by the three compiler passes in order: **parse** → **resolve** → **typecheck**.
+Errors are emitted by the four compiler passes in order: **lex → parse → resolve → typecheck**.
 Each diagnostic includes its code, a one-line description, an example that triggers it, and a suggested fix.
 
 ---
 
-## Parse errors (no code)
+## Lex errors
 
-Parse errors come directly from the chumsky parser and do not carry a Lake error code.
-They are displayed with full source context via ariadne.
+### L001 — Unexpected character
+
+An unexpected character was encountered during lexing.
+
+```lake
+counter is { n i64 -> { n + @n } }
+--                          ^ L001: unexpected character
+```
+
+**Fix:** remove or replace the unexpected character.
+
+---
+
+## Parse errors
+
+### P001 — Unexpected token
+
+A token appeared in a position where the parser did not expect it.
+
+```lake
+counter is { n i64 -> n }
+--                    ^ P001: expected `{`
+```
+
+**Fix:** correct the syntax.  Refer to the Lake language reference for valid constructs.
 
 ---
 

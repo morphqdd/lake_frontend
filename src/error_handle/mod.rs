@@ -182,6 +182,10 @@ impl LakeErrors {
         self.0.len()
     }
 
+    pub fn extend(&mut self, other: LakeErrors) {
+        self.0.extend(other.0);
+    }
+
     /// Display all diagnostics to stderr with source context.
     pub fn display<P: AsRef<Path>>(&self, src: &str, path: P) {
         for err in &self.0 {
@@ -191,6 +195,24 @@ impl LakeErrors {
 
     pub fn from_rich_vec<T: fmt::Display>(errs: Vec<Rich<T>>) -> Self {
         Self(errs.iter().map(LakeError::from_rich).collect())
+    }
+
+    /// Convert lexer errors into `LakeErrors`, tagging each with code `L001`.
+    pub fn from_lex_errs<T: fmt::Display>(errs: Vec<Rich<T>>) -> Self {
+        Self(
+            errs.iter()
+                .map(|e| LakeError::from_rich(e).code("L001"))
+                .collect(),
+        )
+    }
+
+    /// Convert parser errors into `LakeErrors`, tagging each with code `P001`.
+    pub fn from_parse_errs<T: fmt::Display>(errs: Vec<Rich<T>>) -> Self {
+        Self(
+            errs.iter()
+                .map(|e| LakeError::from_rich(e).code("P001"))
+                .collect(),
+        )
     }
 }
 
