@@ -13,3 +13,5 @@ pub mod error_handle;
 pub mod lexer;
 pub mod parser;
 pub mod prelude;
+pub mod resolver;
+pub mod typeck;
