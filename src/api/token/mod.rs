@@ -26,6 +26,7 @@ pub enum Token<'src> {
     True,
     Pub,
     Ret,
+    SelfKw,
 }
 
 impl<'src> Display for Token<'src> {
@@ -45,6 +46,7 @@ impl<'src> Display for Token<'src> {
             Token::True => write!(f, "true"),
             Token::Pub => write!(f, "pub"),
             Token::Ret => write!(f, "ret"),
+            Token::SelfKw => write!(f, "self"),
             Token::Slash => write!(f, "/"),
             Token::Parens(_) => write!(f, "( ... )"),
             Token::SquareBrackets(_) => write!(f, "[ ... ]"),

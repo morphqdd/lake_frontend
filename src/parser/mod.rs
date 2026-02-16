@@ -114,8 +114,10 @@ fn expr<'t, 'src: 't>()
             Token::Ident(n) = e =>
                 Expr::Var(n, Type::Named(Ident::new("{}").with_span(e.span())))
         };
+        let self_kw = just(Token::SelfKw)
+            .map_with(|_, e| Expr::Var("self", Type::Named(Ident::new("{}").with_span(e.span()))));
 
-        let atom = choice((num, string_lit, bool_false, bool_true, var));
+        let atom = choice((num, string_lit, bool_false, bool_true, self_kw, var));
 
         // ── when expression ──────────────────────────────────────────────
         //
@@ -598,5 +600,58 @@ mod tests {
             panic!()
         };
         assert_eq!(b.len(), 1);
+    }
+
+    // ── self keyword tests ────────────────────────────────────────────────────
+
+    /// Parse a full program string and pass the first body expression of the
+    /// first branch to `f`.  The callback owns the lifetime of the borrow so
+    /// we avoid returning a reference into a locally-owned `String`.
+    fn with_branch_expr<F>(src: &str, f: F)
+    where
+        F: for<'a> FnOnce(Expr<'a>),
+    {
+        let tokens = lexer().parse(src).into_result().expect("lex error");
+        let ast = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse error");
+        let Expr::Machine(m) = &ast[0].inner else {
+            panic!("expected Machine")
+        };
+        let crate::api::ast::MachineItem::Branch(b) = &m.inner.items[0].inner else {
+            panic!("expected Branch")
+        };
+        f(b.body[0].inner.clone());
+    }
+
+    #[test]
+    fn self_parses_as_var() {
+        with_branch_expr("m is { _ -> { self } }", |expr| {
+            assert!(matches!(expr, Expr::Var("self", _)));
+        });
+    }
+
+    #[test]
+    fn self_call_parses_as_jump() {
+        // `self(n)` → Jump { ident: Var("self"), args: [Var("n")] }
+        with_branch_expr("m is { _ -> { self(n) } }", |expr| {
+            let Expr::Jump { ident, args } = expr else {
+                panic!("expected Jump, got {expr:?}")
+            };
+            assert!(matches!(ident.inner, Expr::Var("self", _)));
+            assert_eq!(args.len(), 1);
+            assert!(matches!(args[0].inner, Expr::Var("n", _)));
+        });
+    }
+
+    #[test]
+    fn self_call_multi_args() {
+        with_branch_expr("m is { _ -> { self(a b) } }", |expr| {
+            let Expr::Jump { args, .. } = expr else {
+                panic!("expected Jump")
+            };
+            assert_eq!(args.len(), 2);
+        });
     }
 }

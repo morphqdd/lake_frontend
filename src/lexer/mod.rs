@@ -20,6 +20,7 @@ pub fn lexer<'src>()
                 "false" => Token::False,
                 "pub" => Token::Pub,
                 "ret" => Token::Ret,
+                "self" => Token::SelfKw,
                 s => Token::Ident(s),
             }),
             just("@").to(Token::At),
@@ -225,5 +226,22 @@ mod test {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn self_keyword_test() {
+        assert_eq!(
+            lexer().parse("self").into_result(),
+            Ok(vec![Spanned {
+                inner: Token::SelfKw,
+                span: SimpleSpan::new((), 0..4)
+            }])
+        );
+    }
+
+    #[test]
+    fn self_is_not_ident_test() {
+        let tokens = lexer().parse("self").into_result().expect("should lex");
+        assert!(!matches!(tokens[0].inner, Token::Ident(_)));
     }
 }
