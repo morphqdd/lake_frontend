@@ -1,6 +1,8 @@
 +core.{ io.writer }
 +core.io.writer
 
+@rt(rt_write)
+
 writer is {
   _ -> {
     self()
@@ -17,6 +19,6 @@ main is {
   }
   
   n str."some string" -> {
-    writer(n)
+    rt_write()
   }
 }
