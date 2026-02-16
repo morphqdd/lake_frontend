@@ -15,7 +15,10 @@ pub struct SecondaryLabel {
 
 impl SecondaryLabel {
     pub fn new(span: SimpleSpan, message: impl Into<String>) -> Self {
-        Self { span, message: message.into() }
+        Self {
+            span,
+            message: message.into(),
+        }
     }
 }
 
@@ -119,17 +122,14 @@ impl LakeError {
     pub fn display<P: AsRef<Path>>(&self, src: &str, path: P) {
         let fname: &'static str = path.as_ref().display().to_string().leak();
 
-        let mut builder =
-            Report::build(ReportKind::Error, (fname, self.span.into_range()))
-                .with_config(
-                    ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
-                )
-                .with_message(&self.message)
-                .with_label(
-                    Label::new((fname, self.span.into_range()))
-                        .with_message(&self.label)
-                        .with_color(Color::Red),
-                );
+        let mut builder = Report::build(ReportKind::Error, (fname, self.span.into_range()))
+            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+            .with_message(&self.message)
+            .with_label(
+                Label::new((fname, self.span.into_range()))
+                    .with_message(&self.label)
+                    .with_color(Color::Red),
+            );
 
         if let Some(code) = &self.code {
             builder = builder.with_code(code);

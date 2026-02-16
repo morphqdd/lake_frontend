@@ -138,10 +138,11 @@ impl<'src> TypeChecker<'src> {
 
             // ── `let` binding ─────────────────────────────────────────────────
             // The binding itself is always valid; check the default expression.
-            Expr::Let { default, .. } => {
-                if let Some(default) = default {
-                    self.check_expr(machine_name, scope, &default.inner, default.span);
-                }
+            Expr::Let {
+                default: Some(default),
+                ..
+            } => {
+                self.check_expr(machine_name, scope, &default.inner, default.span);
             }
 
             // ── Call / spawn / self-transition ────────────────────────────────
@@ -185,10 +186,7 @@ impl<'src> TypeChecker<'src> {
         args: &'src [chumsky::span::Spanned<Expr<'src>>],
         call_span: SimpleSpan,
     ) {
-        let arg_types: Vec<String> = args
-            .iter()
-            .map(|a| expr_type_str(&a.inner))
-            .collect();
+        let arg_types: Vec<String> = args.iter().map(|a| expr_type_str(&a.inner)).collect();
 
         let Some(sigs) = self.machines.get(machine_name) else {
             // Unknown machine — shouldn't happen if we're checking its own body.
@@ -211,9 +209,7 @@ impl<'src> TypeChecker<'src> {
 
             self.errors.push(
                 LakeError::with_label_msg(
-                    format!(
-                        "no branch of `{machine_name}` matches the call `self({call_sig})`"
-                    ),
+                    format!("no branch of `{machine_name}` matches the call `self({call_sig})`"),
                     call_span,
                     format!("no branch accepts ({call_sig})"),
                 )
@@ -238,13 +234,10 @@ impl<'src> TypeChecker<'src> {
     ) {
         if expr_type_str(&operand.inner) == "{}" {
             self.errors.push(
-                LakeError::new(
-                    "arithmetic on a value of unknown type",
-                    operand.span,
-                )
-                .code("E002")
-                .note("arithmetic requires operands of type `i64`")
-                .help("declare the variable in the branch parameters with a concrete type"),
+                LakeError::new("arithmetic on a value of unknown type", operand.span)
+                    .code("E002")
+                    .note("arithmetic requires operands of type `i64`")
+                    .help("declare the variable in the branch parameters with a concrete type"),
             );
         }
         // Recurse to also check sub-expressions.
@@ -285,9 +278,7 @@ fn expr_type_str(expr: &Expr<'_>) -> String {
 /// Type-check a **resolved** Lake program and return all diagnostics.
 ///
 /// Run [`crate::resolver::resolve`] on the AST before calling this.
-pub fn typecheck<'src>(
-    program: &'src [chumsky::span::Spanned<Expr<'src>>],
-) -> LakeErrors {
+pub fn typecheck<'src>(program: &'src [chumsky::span::Spanned<Expr<'src>>]) -> LakeErrors {
     let mut checker = TypeChecker::new();
     checker.collect_signatures(program);
     checker.check_program(program);
