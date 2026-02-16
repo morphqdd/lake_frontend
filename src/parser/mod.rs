@@ -95,11 +95,9 @@ pub fn pattern<'t, 'src: 't>()
         .spanned()
 }
 
-/// Parses a full expression with operator precedence and postfix chains.
 fn expr<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Expr<'src>>, Err<Rich<'t, Token<'src>>>> {
     recursive(|expr| {
-        // ── atoms ────────────────────────────────────────────────────────
         let num = select_ref! {
             Token::Num(n) = e =>
                 Expr::Num(n, Type::Named(Ident::new("i64").with_span(e.span())))
@@ -119,9 +117,6 @@ fn expr<'t, 'src: 't>()
 
         let atom = choice((num, string_lit, bool_false, bool_true, self_kw, var));
 
-        // ── when expression ──────────────────────────────────────────────
-        //
-        // `when cond { pat -> { body } ... }`
         let when_branch =
             expr.clone()
                 .then_ignore(just(Token::Arrow))
@@ -146,11 +141,8 @@ fn expr<'t, 'src: 't>()
                 branches,
             });
 
-        // ── base: atom or when ───────────────────────────────────────────
         let base = choice((when_expr.spanned(), atom.spanned()));
 
-        // ── postfix operations ───────────────────────────────────────────
-        //
         // Postfix is represented as a local enum.  We collect them with
         // `repeated()` and fold left into the accumulator.
 
@@ -199,7 +191,6 @@ fn expr<'t, 'src: 't>()
 
         let postfix = choice((call_op, at_op, dot_op));
 
-        // ── chain base + postfix, then apply pratt ───────────────────────
         base.then(postfix.spanned().repeated().collect::<Vec<_>>())
             .map(|(base_expr, ops)| {
                 ops.into_iter().fold(base_expr, |acc, op| {
@@ -251,8 +242,6 @@ fn expr<'t, 'src: 't>()
     })
 }
 
-// ─── field_decl ───────────────────────────────────────────────────────────────
-
 /// Parses a field declaration: `@ok.T`, `@.raw_box(T)`, `@.{ str }`
 fn field_decl<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Field<'src>>, Err<Rich<'t, Token<'src>>>> {
@@ -285,8 +274,6 @@ fn branch<'t, 'src: 't>()
         .spanned()
 }
 
-// ─── machine_item ─────────────────────────────────────────────────────────────
-
 /// Tries `field_decl` first (has `.` after `@label`), then falls back to `branch`.
 fn machine_item<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<MachineItem<'src>>, Err<Rich<'t, Token<'src>>>> {
@@ -299,8 +286,6 @@ fn machine_item<'t, 'src: 't>()
             .spanned(),
     ))
 }
-
-// ─── directive ────────────────────────────────────────────────────────────────
 
 /// Parses a built-in macro attribute: `@rt_st(...)`, `@ffi(...)`.
 /// Arguments inside the parens are parsed as a sequence of type expressions.
@@ -319,8 +304,6 @@ fn directive<'t, 'src: 't>()
         .map(|(name, args)| Directive::new(name, args))
         .spanned()
 }
-
-// ─── machine ──────────────────────────────────────────────────────────────────
 
 /// Parses `[pub] ident[(generics)] is { item* }`
 pub fn machine<'t, 'src: 't>()

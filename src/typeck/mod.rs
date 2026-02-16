@@ -75,19 +75,30 @@ impl<'src> TypeChecker<'src> {
     }
 
     fn check_program(&mut self, program: Vec<chumsky::span::Spanned<Expr<'src>>>) {
+        let mut global_scope: HashMap<&'src str, Machine<'src>> = HashMap::new();
+        for item in &program {
+            if let Expr::Machine(m) = &item.inner {
+                global_scope.insert(m.ident.inner.0, m.inner.clone());
+            }
+        }
         for item in program {
             if let Expr::Machine(m) = item.inner {
                 let machine_name = m.inner.ident.inner.0;
                 for machine_item in m.inner.items {
                     if let MachineItem::Branch(b) = machine_item.inner {
-                        self.check_branch(machine_name, b);
+                        self.check_branch(machine_name, b, &global_scope);
                     }
                 }
             }
         }
     }
 
-    fn check_branch(&mut self, machine_name: &'src str, branch: Branch<'src>) {
+    fn check_branch(
+        &mut self,
+        machine_name: &'src str,
+        branch: Branch<'src>,
+        global_scope: &HashMap<&'src str, Machine<'src>>,
+    ) {
         let mut scope: HashMap<&'src str, Type<'src>> = HashMap::new();
         for pat in branch.patterns {
             if !pat.inner.is_wildcard() {
@@ -96,7 +107,7 @@ impl<'src> TypeChecker<'src> {
         }
 
         for expr in branch.body {
-            self.check_expr(machine_name, &scope, expr.inner, expr.span);
+            self.check_expr(machine_name, &scope, global_scope, expr.inner, expr.span);
         }
     }
 
@@ -104,6 +115,7 @@ impl<'src> TypeChecker<'src> {
         &mut self,
         machine_name: &'src str,
         scope: &HashMap<&'src str, Type<'src>>,
+        global_scope: &HashMap<&'src str, Machine<'src>>,
         expr: Expr<'src>,
         span: SimpleSpan,
     ) {
@@ -128,12 +140,32 @@ impl<'src> TypeChecker<'src> {
                 default: Some(default),
                 ..
             } => {
-                self.check_expr(machine_name, scope, default.inner, default.span);
+                self.check_expr(
+                    machine_name,
+                    scope,
+                    global_scope,
+                    default.inner,
+                    default.span,
+                );
             }
 
             Expr::Jump { ident, args } => {
+                if let Expr::Var(ident, _) = ident.inner.clone()
+                    && !global_scope.contains_key(ident)
+                    && ident != "self"
+                {
+                    self.errors.push(
+                        LakeError::new(format!("undeclared machine `{ident}`"), span)
+                            .code("E004")
+                            .help(format!(
+                                "declare `{ident}` in the global scope, \
+                                 e.g. `{ident} is {{ .. }}`"
+                            )),
+                    );
+                }
+
                 for arg in args.clone() {
-                    self.check_expr(machine_name, scope, arg.inner, arg.span);
+                    self.check_expr(machine_name, scope, global_scope, arg.inner, arg.span);
                 }
 
                 if let Expr::Var("self", _) = ident.inner {
@@ -142,16 +174,16 @@ impl<'src> TypeChecker<'src> {
             }
 
             Expr::Add(l, r) | Expr::Sub(l, r) | Expr::Mul(l, r) | Expr::Div(l, r) => {
-                self.check_arith_operand(machine_name, scope, *l);
-                self.check_arith_operand(machine_name, scope, *r);
+                self.check_arith_operand(machine_name, scope, global_scope, *l);
+                self.check_arith_operand(machine_name, scope, global_scope, *r);
             }
 
             Expr::When { cond, branches } => {
-                self.check_expr(machine_name, scope, cond.inner, cond.span);
+                self.check_expr(machine_name, scope, global_scope, cond.inner, cond.span);
                 for (pat, body) in branches {
-                    self.check_expr(machine_name, scope, pat.inner, pat.span);
+                    self.check_expr(machine_name, scope, global_scope, pat.inner, pat.span);
                     for e in body {
-                        self.check_expr(machine_name, scope, e.inner, e.span);
+                        self.check_expr(machine_name, scope, global_scope, e.inner, e.span);
                     }
                 }
             }
@@ -211,6 +243,7 @@ impl<'src> TypeChecker<'src> {
         &mut self,
         machine_name: &'src str,
         scope: &HashMap<&'src str, Type<'src>>,
+        global_scope: &HashMap<&'src str, Machine<'src>>,
         operand: chumsky::span::Spanned<Expr<'src>>,
     ) {
         if expr_type_str(&operand.inner) == "{}" {
@@ -221,8 +254,14 @@ impl<'src> TypeChecker<'src> {
                     .help("declare the variable in the branch parameters with a concrete type"),
             );
         }
-        // Recurse to also check sub-expressions.
-        self.check_expr(machine_name, scope, operand.inner, operand.span);
+
+        self.check_expr(
+            machine_name,
+            scope,
+            global_scope,
+            operand.inner,
+            operand.span,
+        );
     }
 }
 
