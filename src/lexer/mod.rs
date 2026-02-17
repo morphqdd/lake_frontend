@@ -30,6 +30,11 @@ pub fn lexer<'src>()
             just("-").to(Token::Minus),
             just("*").to(Token::Star),
             just("/").to(Token::Slash),
+            just("<=").to(Token::LessEq),
+            just(">=").to(Token::GreaterEq),
+            just("==").to(Token::EqEq),
+            just("<").to(Token::Less),
+            just(">").to(Token::Greater),
             text::int(10)
                 .then(just('.').then(text::digits(10)).or_not())
                 .to_slice()

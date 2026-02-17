@@ -64,6 +64,13 @@ pub enum Expr<'src> {
     Add(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Sub(Box<Spanned<Self>>, Box<Spanned<Self>>),
 
+    // ── Comparisons ───────────────────────────────────────────────────────
+    Le(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    Ge(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    Eq(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    Lt(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    Gt(Box<Spanned<Self>>, Box<Spanned<Self>>),
+
     // ── Top-level items ───────────────────────────────────────────────────
     Import(Spanned<Rc<RefCell<Import<'src>>>>),
     Machine(Spanned<Machine<'src>>),

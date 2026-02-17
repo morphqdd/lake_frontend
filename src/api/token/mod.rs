@@ -18,6 +18,11 @@ pub enum Token<'src> {
     Minus,
     Star,
     Slash,
+    LessEq,
+    GreaterEq,
+    EqEq,
+    Less,
+    Greater,
 
     // Keywords
     Is,
@@ -48,6 +53,11 @@ impl<'src> Display for Token<'src> {
             Token::Ret => write!(f, "ret"),
             Token::SelfKw => write!(f, "self"),
             Token::Slash => write!(f, "/"),
+            Token::LessEq => write!(f, "<="),
+            Token::GreaterEq => write!(f, ">="),
+            Token::EqEq => write!(f, "=="),
+            Token::Less => write!(f, "<"),
+            Token::Greater => write!(f, ">"),
             Token::Parens(_) => write!(f, "( ... )"),
             Token::SquareBrackets(_) => write!(f, "[ ... ]"),
             Token::CurlyBrackets(_) => write!(f, "{{ ... }}"),
