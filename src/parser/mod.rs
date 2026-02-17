@@ -238,6 +238,21 @@ fn expr<'t, 'src: 't>()
                 infix(left(9), just(Token::Minus), |x, _, y, e| {
                     Expr::Sub(Box::new(x), Box::new(y)).with_span(e.span())
                 }),
+                infix(left(8), just(Token::LessEq), |x, _, y, e| {
+                    Expr::Le(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(8), just(Token::GreaterEq), |x, _, y, e| {
+                    Expr::Ge(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(8), just(Token::EqEq), |x, _, y, e| {
+                    Expr::Eq(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(8), just(Token::Less), |x, _, y, e| {
+                    Expr::Lt(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(8), just(Token::Greater), |x, _, y, e| {
+                    Expr::Gt(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
             ))
     })
 }
