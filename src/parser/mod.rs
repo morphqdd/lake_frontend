@@ -141,7 +141,67 @@ fn expr<'t, 'src: 't>()
                 branches,
             });
 
-        let base = choice((when_expr.spanned(), atom.spanned()));
+        // Inline pattern parser for wait handlers to avoid mutual recursion
+        // (pattern() calls top-level expr() which would recurse infinitely)
+        let wait_pattern = ident_parser()
+            .then(
+                type_expr()
+                    .then(just(Token::Dot).ignore_then(expr.clone()).or_not())
+                    .or_not(),
+            )
+            .map(|(ident, opt)| {
+                let (ty, default) = match opt {
+                    Some((ty, default)) => (ty, default),
+                    None => (Type::Unit.with_span(ident.span), None),
+                };
+                Pattern::new(ident, ty, default)
+            })
+            .spanned();
+
+        let wait_handler =
+            just(Token::At)
+                .ignore_then(ident_parser())
+                .or_not()
+                .then(wait_pattern.repeated().at_least(1).collect::<Vec<_>>())
+                .then_ignore(just(Token::Arrow))
+                .then(expr.clone().repeated().collect::<Vec<_>>().nested_in(
+                    select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())),
+                ))
+                .map(|((label, patterns), body)| Branch::new(label, patterns, None, body))
+                .spanned();
+
+        let wait_expr = just(Token::Wait)
+            .ignore_then(
+                wait_handler
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>()
+                    .nested_in(
+                        select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())),
+                    ),
+            )
+            .map(|handlers| Expr::Wait { handlers });
+
+        let let_expr = just(Token::Let)
+            .ignore_then(ident_parser())
+            .then(type_expr().boxed().or_not())
+            .then_ignore(just(Token::Eq))
+            .then(expr.clone())
+            .map(|((ident, ty), default)| {
+                let ty = ty.unwrap_or_else(|| Type::Unit.with_span(ident.span));
+                Expr::Let {
+                    ident,
+                    ty,
+                    default: Some(Box::new(default)),
+                }
+            });
+
+        let base = choice((
+            wait_expr.spanned().boxed(),
+            let_expr.spanned().boxed(),
+            when_expr.spanned(),
+            atom.spanned(),
+        ));
 
         // Postfix is represented as a local enum.  We collect them with
         // `repeated()` and fold left into the accumulator.
@@ -650,6 +710,96 @@ mod tests {
                 panic!("expected Jump")
             };
             assert_eq!(args.len(), 2);
+        });
+    }
+
+    // ── wait expression tests ───────────────────────────────────────────────
+
+    #[test]
+    fn wait_with_labeled_handler() {
+        with_branch_expr(
+            "m is { _ -> { wait { @ping n i64 -> { self(n) } } } }",
+            |expr| {
+                let Expr::Wait { handlers } = expr else {
+                    panic!("expected Wait, got {expr:?}")
+                };
+                assert_eq!(handlers.len(), 1);
+                assert_eq!(
+                    handlers[0].inner.label.as_ref().map(|l| l.inner.clone()),
+                    Some(Ident::new("ping"))
+                );
+                assert_eq!(handlers[0].inner.patterns.len(), 1);
+                assert_eq!(handlers[0].inner.body.len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn wait_with_multiple_handlers() {
+        with_branch_expr(
+            "m is { _ -> { wait { @inc n i64 -> { n } @get _ -> { self() } } } }",
+            |expr| {
+                let Expr::Wait { handlers } = expr else {
+                    panic!("expected Wait, got {expr:?}")
+                };
+                assert_eq!(handlers.len(), 2);
+                assert_eq!(
+                    handlers[0].inner.label.as_ref().map(|l| l.inner.clone()),
+                    Some(Ident::new("inc"))
+                );
+                assert_eq!(
+                    handlers[1].inner.label.as_ref().map(|l| l.inner.clone()),
+                    Some(Ident::new("get"))
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn wait_handler_without_label() {
+        with_branch_expr("m is { _ -> { wait { n i64 -> { n } } } }", |expr| {
+            let Expr::Wait { handlers } = expr else {
+                panic!("expected Wait, got {expr:?}")
+            };
+            assert_eq!(handlers.len(), 1);
+            assert!(handlers[0].inner.label.is_none());
+        });
+    }
+
+    // ── let = expression tests ──────────────────────────────────────────────
+
+    #[test]
+    fn let_with_type_and_expr() {
+        with_branch_expr("m is { _ -> { let x i64 = 42 } }", |expr| {
+            let Expr::Let { ident, ty, default } = expr else {
+                panic!("expected Let, got {expr:?}")
+            };
+            assert_eq!(ident.inner, Ident::new("x"));
+            assert!(matches!(ty.inner, Type::Named(_)));
+            assert!(default.is_some());
+            assert!(matches!(default.expect("expected default").inner, Expr::Num(_, _)));
+        });
+    }
+
+    #[test]
+    fn let_without_type() {
+        with_branch_expr("m is { _ -> { let x = 42 } }", |expr| {
+            let Expr::Let { ident, ty, default } = expr else {
+                panic!("expected Let, got {expr:?}")
+            };
+            assert_eq!(ident.inner, Ident::new("x"));
+            assert!(matches!(ty.inner, Type::Unit));
+            assert!(default.is_some());
+        });
+    }
+
+    #[test]
+    fn let_with_call_expr() {
+        with_branch_expr("m is { _ -> { let x = foo(42) } }", |expr| {
+            let Expr::Let { default, .. } = expr else {
+                panic!("expected Let, got {expr:?}")
+            };
+            assert!(matches!(default.expect("expected default").inner, Expr::Jump { .. }));
         });
     }
 }

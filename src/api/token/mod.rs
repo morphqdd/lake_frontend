@@ -24,6 +24,8 @@ pub enum Token<'src> {
     Less,
     Greater,
 
+    Eq,
+
     // Keywords
     Is,
     When,
@@ -32,6 +34,8 @@ pub enum Token<'src> {
     Pub,
     Ret,
     SelfKw,
+    Wait,
+    Let,
 }
 
 impl<'src> Display for Token<'src> {
@@ -62,6 +66,9 @@ impl<'src> Display for Token<'src> {
             Token::SquareBrackets(_) => write!(f, "[ ... ]"),
             Token::CurlyBrackets(_) => write!(f, "{{ ... }}"),
             Token::At => write!(f, "@"),
+            Token::Eq => write!(f, "="),
+            Token::Wait => write!(f, "wait"),
+            Token::Let => write!(f, "let"),
         }
     }
 }
