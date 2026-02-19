@@ -102,6 +102,17 @@ impl<'src> Resolver<'src> {
                 Expr::When { cond, branches }
             }
 
+            Expr::Wait { handlers } => {
+                let handlers = handlers
+                    .into_iter()
+                    .map(|h| {
+                        let span = h.span;
+                        self.resolve_branch(h.inner).with_span(span)
+                    })
+                    .collect();
+                Expr::Wait { handlers }
+            }
+
             other => other,
         };
         inner.with_span(span)
@@ -296,5 +307,28 @@ mod tests {
 
     fn is_unknown_ty(ty: &Type<'_>) -> bool {
         super::is_unknown(ty)
+    }
+
+    #[test]
+    fn resolves_var_in_wait_handler() {
+        // `n` from the outer branch pattern should be accessible inside wait handler body
+        let ast = parse_resolve("counter is { n i64 -> { wait { @inc amount i64 -> { n } } } }");
+        let Expr::Machine(m) = &ast[0].inner else {
+            panic!()
+        };
+        let MachineItem::Branch(b) = &m.inner.items[0].inner else {
+            panic!()
+        };
+        let Expr::Wait { handlers } = &b.body[0].inner else {
+            panic!("expected Wait")
+        };
+        // `n` inside handler body should be resolved to i64
+        let Expr::Var(_, ty) = &handlers[0].inner.body[0].inner else {
+            panic!("expected Var")
+        };
+        assert!(
+            matches!(ty, Type::Named(i) if i.inner == Ident::new("i64")),
+            "expected i64, got {ty:?}"
+        );
     }
 }

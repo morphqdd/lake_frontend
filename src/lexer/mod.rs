@@ -21,6 +21,8 @@ pub fn lexer<'src>()
                 "pub" => Token::Pub,
                 "ret" => Token::Ret,
                 "self" => Token::SelfKw,
+                "wait" => Token::Wait,
+                "let" => Token::Let,
                 s => Token::Ident(s),
             }),
             just("@").to(Token::At),
@@ -33,6 +35,7 @@ pub fn lexer<'src>()
             just("<=").to(Token::LessEq),
             just(">=").to(Token::GreaterEq),
             just("==").to(Token::EqEq),
+            just("=").to(Token::Eq),
             just("<").to(Token::Less),
             just(">").to(Token::Greater),
             text::int(10)
@@ -248,5 +251,30 @@ mod test {
     fn self_is_not_ident_test() {
         let tokens = lexer().parse("self").into_result().expect("should lex");
         assert!(!matches!(tokens[0].inner, Token::Ident(_)));
+    }
+
+    #[test]
+    fn wait_keyword_test() {
+        let tokens = lexer().parse("wait").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::Wait));
+    }
+
+    #[test]
+    fn let_keyword_test() {
+        let tokens = lexer().parse("let").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::Let));
+    }
+
+    #[test]
+    fn eq_token_test() {
+        let tokens = lexer().parse("=").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::Eq));
+    }
+
+    #[test]
+    fn eq_vs_eqeq_test() {
+        let tokens = lexer().parse("== =").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::EqEq));
+        assert!(matches!(tokens[1].inner, Token::Eq));
     }
 }

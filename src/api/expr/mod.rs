@@ -2,7 +2,7 @@ use std::{cell::RefCell, hash::Hash, rc::Rc};
 
 use chumsky::span::Spanned;
 
-use crate::api::ast::{Directive, Ident, Import, Machine, Type};
+use crate::api::ast::{Branch, Directive, Ident, Import, Machine, Type};
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum Expr<'src> {
@@ -56,6 +56,12 @@ pub enum Expr<'src> {
     When {
         cond: Box<Spanned<Self>>,
         branches: Vec<(Spanned<Self>, Vec<Spanned<Self>>)>,
+    },
+
+    // ── Process suspension ──────────────────────────────────────────────
+    /// `wait { @label pattern+ -> { body } ... }`
+    Wait {
+        handlers: Vec<Spanned<Branch<'src>>>,
     },
 
     // ── Arithmetic ────────────────────────────────────────────────────────

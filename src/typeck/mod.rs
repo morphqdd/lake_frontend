@@ -171,6 +171,21 @@ impl<'src> TypeChecker<'src> {
                 }
             }
 
+            Expr::Wait { handlers } => {
+                for handler in handlers {
+                    let mut handler_scope = scope.clone();
+                    for pat in &handler.inner.patterns {
+                        if !pat.inner.is_wildcard() {
+                            handler_scope
+                                .insert(pat.inner.ident.inner.0, pat.inner.ty.inner.clone());
+                        }
+                    }
+                    for e in &handler.inner.body {
+                        self.check_expr(machine_name, &handler_scope, e.inner.clone(), e.span);
+                    }
+                }
+            }
+
             _ => {}
         }
     }
