@@ -777,7 +777,10 @@ mod tests {
             assert_eq!(ident.inner, Ident::new("x"));
             assert!(matches!(ty.inner, Type::Named(_)));
             assert!(default.is_some());
-            assert!(matches!(default.expect("expected default").inner, Expr::Num(_, _)));
+            assert!(matches!(
+                default.expect("expected default").inner,
+                Expr::Num(_, _)
+            ));
         });
     }
 
@@ -799,7 +802,10 @@ mod tests {
             let Expr::Let { default, .. } = expr else {
                 panic!("expected Let, got {expr:?}")
             };
-            assert!(matches!(default.expect("expected default").inner, Expr::Jump { .. }));
+            assert!(matches!(
+                default.expect("expected default").inner,
+                Expr::Jump { .. }
+            ));
         });
     }
 }
