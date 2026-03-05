@@ -256,9 +256,20 @@ fn expr<'t, 'src: 't>()
                 ops.into_iter().fold(base_expr, |acc, op| {
                     let span = acc.span;
                     match op.inner {
-                        PostfixOp::Call(args) => Expr::Jump {
-                            ident: Box::new(acc),
-                            args,
+                        PostfixOp::Call(args) => {
+                            let Expr::Var(ident, ty) = acc.inner else {
+                                panic!("Parser bug")
+                            };
+                            Expr::Jump {
+                                ident: Box::new(
+                                    Expr::Var(
+                                        ident,
+                                        Type::Named(Ident::new("pid").with_span(span)),
+                                    )
+                                    .with_span(span),
+                                ),
+                                args,
+                            }
                         }
                         .with_span(span),
                         PostfixOp::AtCall(method, args) => Expr::MethodCall {
