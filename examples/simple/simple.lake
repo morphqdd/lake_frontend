@@ -4,6 +4,7 @@
 @rt(rt_write)
 
 writer is {
+  n str -> { }
   _ -> {
     self()
   }

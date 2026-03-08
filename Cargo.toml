@@ -6,7 +6,5 @@ edition = "2024"
 [dependencies]
 ariadne = { version = "0.6.0", features = ["auto-color"] }
 chumsky = { git="https://github.com/zesterer/chumsky.git", features = ["pratt"] }
-miette = {version = "7.6.0", features = ['fancy']}
-nom = "8.0.0"
 thiserror = "2.0.17"
-anyhow = "1"
+chrono = "0.4.44"

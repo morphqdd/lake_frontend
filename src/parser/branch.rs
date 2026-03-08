@@ -24,6 +24,7 @@ pub fn branch<'t, 'src: 't>()
         .then(
             expr()
                 .repeated()
+                .at_least(0)
                 .collect::<Vec<_>>()
                 .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span()))),
         )

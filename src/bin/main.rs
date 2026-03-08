@@ -1,4 +1,4 @@
-use std::{fs, path::Path, process};
+use std::{fs, path::Path, process, time};
 
 use lake_frontend::prelude::build_ast;
 
@@ -8,11 +8,38 @@ fn parse_file(path: &Path) {
         process::exit(1);
     });
     match build_ast(path, &src) {
-        Ok(ast) => {
-            println!("=== {} ===", path.display());
-            println!("{ast:?}\n");
+        Ok((tokens, ast)) => {
+            fs::write(
+                path.parent().unwrap().join(format!(
+                    "{}.{}.laketokens",
+                    chrono::prelude::Utc::now(),
+                    path.file_name().unwrap().to_str().unwrap()
+                )),
+                format!("{tokens:#?}"),
+            )
+            .unwrap();
+
+            fs::write(
+                path.parent().unwrap().join(format!(
+                    "{}.{}.lakeast",
+                    chrono::prelude::Utc::now(),
+                    path.file_name().unwrap().to_str().unwrap()
+                )),
+                format!("{ast:#?}"),
+            )
+            .unwrap();
         }
-        Err(errs) => {
+        Err((tokens, errs)) => {
+            fs::write(
+                path.parent().unwrap().join(format!(
+                    "{}.{}.laketokens",
+                    chrono::prelude::Utc::now(),
+                    path.file_name().unwrap().to_str().unwrap()
+                )),
+                format!("{tokens:#?}"),
+            )
+            .unwrap();
+
             errs.display(&src, path);
             process::exit(1);
         }
