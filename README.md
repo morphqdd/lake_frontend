@@ -1,8 +1,8 @@
 # Lake Frontend
 
-Compiler frontend for the **Lake** programming language — a language built around **machines**, **branches**, and **message-passing** semantics.
+Compiler frontend for the [Lake](https://morphqdd.github.io/lake-book/) programming language.
 
-Implements the full frontend pipeline: lexing, parsing, name resolution, and type checking.
+Implements: lexing, parsing, name resolution, and type checking.
 
 ## Pipeline
 
@@ -14,145 +14,100 @@ Implements the full frontend pipeline: lexing, parsing, name resolution, and typ
   → typeck    → diagnostics
 ```
 
-All stages produce structured errors rendered via [ariadne](https://github.com/zesterer/ariadne).
-
-## Language Overview
-
-Lake programs are composed of **machines** — named entities that define behavior through pattern-matched **branches**.
-
-```lake
-+core.{ io.writer }
-
-main is {
-  @init _ -> {
-    self@print_string()
-  }
-
-  @print_string n str."hello" -> {
-    writer(n)
-  }
-}
-```
+## What the Parser Handles
 
 ### Imports
 
 ```lake
-+core.io.writer              # simple import
++core.io.writer                              # simple
 +core.{ box.box result.result error.error }  # multi-import
+```
+
+### Directives
+
+```lake
+@rt(rt_write)
+@rt_st(raw_box)
+@ffi(syscall { i64 i64 i64 i64 i64 i64 i64 } { i64 })
 ```
 
 ### Machines
 
-Machines are the core abstraction — they hold data fields and branches.
-
 ```lake
-pub result(T) is {
-  @ok.T                      # data field
-  @err.error                 # data field
+pub box(T) is {             # visibility, generics
+  @ok.T                     # named data field
+  @.raw_box(T)              # anonymous data field
+  @.{ str }                 # anonymous struct field
 
-  @init _ -> { }             # branch
+  @len ptr box(T) -> ret usize { ... }  # labeled branch with ret type
+  n i64 -> { ... }                      # simple branch
+  _ -> { ... }                          # wildcard branch
 }
-```
-
-- `pub` — public visibility
-- `(T)` — generic type parameters
-- `@name.Type` — data field declaration
-- `@label pattern+ -> { body }` — branch with label
-
-### Branches
-
-```lake
-@label pattern+ -> [ret Type] { body }
-```
-
-- `@label` — optional label for targeted calls (`self@label(...)`)
-- `pattern+` — one or more parameters: `name Type[.default]` or `_` (wildcard)
-- `ret Type` — optional return type annotation
-- `{ body }` — branch body with expressions
-
-### Patterns
-
-```lake
-n i32                        # typed parameter
-n str."hello"                # with default value
-ptr box(T)                   # generic type
-_                            # wildcard (ignored)
 ```
 
 ### Expressions
 
 ```lake
-writer(n)                    # call (jump)
-self()                       # self-recursion
-self@print_string()          # labeled call (method)
-box@len(data_ptr)            # method call on receiver
+42                           # i64 literal
+"hello\n"                    # string literal
+true                         # boolean literal
+{}                           # unit literal
 
-let x i32 = 42               # let binding
+n                            # variable
+let x i64 = 42              # let binding
 
-2 * n + 1                    # arithmetic (+, -, *, /)
-n <= 10                      # comparison (<=, >=, ==, <, >)
+writer(n)                    # call
+self(n-1 acc+n)             # self-transition with args
+self@print_string()         # transition to a labeled branch
+box@len(data_ptr)           # spawn machine at a labeled branch
+point.{ 10 20 }             # struct initialization
+error.{ "overflow" }        # struct initialization
 
-point.{ 10 20 }              # struct initialization
-point.x                      # field access
+2 * n + 1                   # arithmetic (*, /, +, -)
+n <= 10                     # comparison (<=, >=, ==, <, >)
 
-when overflow(buf sz) {      # pattern matching
-  false -> { self(n + 1 data_ptr) }
-  true  -> { error.{ "overflow" } }
+when 0 == n {               # conditional
+  true  -> { ... }
+  false -> { ... }
 }
 
-wait {                       # process suspension
-  @ready _ -> { self() }
+wait {                      # process suspension
+  @ready _ -> { ... }
 }
 ```
 
-### Directives
-
-Compiler attributes placed before a machine definition:
+### Types
 
 ```lake
-@rt(rt_write)                             # runtime function binding
-@rt_st(raw_box)                           # runtime state
-@ffi(syscall { i64 i64 } { i64 })         # foreign function interface
+i64                          # named type
+box(T)                       # generic type
+{ str }                      # anonymous struct
+{}                           # unit type
 ```
 
 ## Building
-
-Requires Rust (edition 2024).
 
 ```sh
 cargo build
 ```
 
-## Running
+## API
 
-The binary compiles a set of example files from `examples/simple/`:
+```rust
+use lake_frontend::prelude::{parse, build_ast};
 
-```sh
-cargo run
-```
+// Lex + parse only
+let ast = parse(path, src)?;
 
-On success, it writes `.laketokens` and `.lakeast` dump files next to each source file.
-On error, it renders diagnostics to stderr and exits with code 1.
-
-Example error output:
-
-```
-[E003] Error: no branch of `writer` matches the call `self(i64 box(u8) {})`
-   ╭─[ examples/simple/core/io.lake:8:5 ]
-   │
- 8 │     self(1 data_ptr box@len(data_ptr))
-   │     ──┬─
-   │       ╰─── no branch accepts (i64 box(u8) {})
-   │
-   │ Help: add a branch whose parameter types match the argument types
-───╯
+// Full pipeline: lex + parse + resolve + typecheck
+let (tokens, ast) = build_ast(path, src)?;
 ```
 
 ## Project Structure
 
 ```
 src/
-├── lib.rs                    # crate root, lint rules
+├── lib.rs                    # crate root
 ├── bin/main.rs               # CLI entry point
 ├── api/
 │   ├── token/mod.rs          # Token enum
@@ -177,18 +132,6 @@ src/
 └── error_handle/mod.rs       # diagnostics via ariadne
 ```
 
-## API
-
-The crate exposes two entry points through `lake_frontend::prelude`:
-
-```rust
-// Parse only (lex + parse)
-fn parse(path, src) -> Result<Vec<Spanned<Expr>>, LakeErrors>
-
-// Full pipeline (lex + parse + resolve + typecheck)
-fn build_ast(path, src) -> Result<(tokens, ast), (tokens, errors)>
-```
-
 ## Error Codes
 
 | Code | Stage | Description |
@@ -205,15 +148,10 @@ fn build_ast(path, src) -> Result<(tokens, ast), (tokens, errors)>
 |-------|------|
 | [chumsky](https://github.com/zesterer/chumsky) (git, pratt) | Parser combinators |
 | [ariadne](https://crates.io/crates/ariadne) 0.6 | Error rendering |
-| [miette](https://crates.io/crates/miette) 7.6 | Diagnostics |
 | [thiserror](https://crates.io/crates/thiserror) 2.0 | Error derive macros |
-| [anyhow](https://crates.io/crates/anyhow) 1 | Error context |
 | [chrono](https://crates.io/crates/chrono) 0.4 | Timestamps for dump files |
 
-## Tests
+## See Also
 
-```sh
-cargo test
-```
-
-Covers lexer tokenization, resolver scoping, and type checker diagnostics.
+- [Lake Book](https://morphqdd.github.io/lake-book/) — language documentation
+- [lake-native-compiler](https://github.com/morphqdd/lake-native-compiler) — native compiler (Cranelift backend)
