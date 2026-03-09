@@ -60,19 +60,24 @@ pub fn lexer<'src>()
                 .clone()
                 .padded()
                 .repeated()
-                .collect()
+                .at_least(0)
+                .collect::<Vec<_>>()
+                .padded()
                 .delimited_by(just("("), just(")"))
                 .map(Token::Parens),
             token
                 .clone()
                 .padded()
                 .repeated()
-                .collect()
+                .at_least(0)
+                .collect::<Vec<_>>()
+                .padded()
                 .delimited_by(just("{"), just("}"))
                 .map(Token::CurlyBrackets),
             token
                 .padded()
                 .repeated()
+                .at_least(0)
                 .collect()
                 .delimited_by(just("[").padded(), just("]").padded())
                 .map(Token::SquareBrackets),

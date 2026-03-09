@@ -4,8 +4,6 @@ use ariadne::{Color, Label, Report, ReportKind, sources};
 use chumsky::{error::Rich, span::SimpleSpan};
 use thiserror::Error;
 
-// ─── Single labelled span ──────────────────────────────────────────────────────
-
 /// A secondary source span with an explanatory message (shown in yellow).
 #[derive(Debug, Clone)]
 pub struct SecondaryLabel {
@@ -21,8 +19,6 @@ impl SecondaryLabel {
         }
     }
 }
-
-// ─── Single compile-time diagnostic ───────────────────────────────────────────
 
 /// A compile-time error with a source span, optional error code, secondary
 /// labels, notes, and a help suggestion — rendered via `ariadne`.
@@ -45,8 +41,6 @@ pub struct LakeError {
 }
 
 impl LakeError {
-    // ── Constructors ──────────────────────────────────────────────────────────
-
     /// Create a new error at `span` with `message` used as both the report
     /// headline and the inline span label.
     pub fn new(message: impl Into<String>, span: SimpleSpan) -> Self {
@@ -79,8 +73,6 @@ impl LakeError {
         }
     }
 
-    // ── Builder methods ───────────────────────────────────────────────────────
-
     /// Attach an error code (e.g. `"E001"`).
     pub fn code(mut self, code: impl Into<String>) -> Self {
         self.code = Some(code.into());
@@ -105,8 +97,6 @@ impl LakeError {
         self
     }
 
-    // ── From chumsky ──────────────────────────────────────────────────────────
-
     /// Convert a chumsky `Rich` parse error into a `LakeError`.
     pub fn from_rich<T: fmt::Display>(err: &Rich<T>) -> Self {
         let mut e = Self::new(err.reason().to_string(), *err.span());
@@ -115,8 +105,6 @@ impl LakeError {
         }
         e
     }
-
-    // ── Display ───────────────────────────────────────────────────────────────
 
     /// Render this diagnostic to stderr with full source context.
     pub fn display<P: AsRef<Path>>(&self, src: &str, path: P) {
@@ -158,8 +146,6 @@ impl LakeError {
         }
     }
 }
-
-// ─── Error collection ─────────────────────────────────────────────────────────
 
 /// A collection of `LakeError`s from a single compilation unit.
 #[derive(Debug, Default)]
@@ -235,8 +221,6 @@ impl IntoIterator for LakeErrors {
         self.0.into_iter()
     }
 }
-
-// ─── Legacy helper (used by bin/main.rs) ──────────────────────────────────────
 
 /// Display errors and exit the process.  Only for use in binaries.
 pub fn parse_failure<P: AsRef<Path>>(errs: Vec<Rich<impl fmt::Display>>, src: &str, path: P) -> ! {
