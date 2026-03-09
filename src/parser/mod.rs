@@ -1,19 +1,14 @@
-use std::{cell::RefCell, rc::Rc};
-
 use chumsky::{
     IterParser, Parser,
     error::Rich,
     extra::Err,
-    input::{Input, MappedInput},
-    pratt::{infix, left},
-    prelude::{choice, just, recursive},
-    select_ref,
-    span::{SimpleSpan, SpanWrap, Spanned},
+    prelude::choice,
+    span::{SpanWrap, Spanned},
 };
 
 use crate::{
     api::{
-        ast::{Branch, Directive, Field, Ident, Import, Machine, MachineItem, Pattern, Type},
+        ast::{Directive, Machine},
         expr::Expr,
         token::Token,
     },

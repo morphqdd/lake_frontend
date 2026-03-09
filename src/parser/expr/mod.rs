@@ -182,7 +182,7 @@ pub fn expr<'t, 'src: 't>()
                     let span = acc.span;
                     match op.inner {
                         PostfixOp::Call(args) => {
-                            let Expr::Var(ident, ty) = acc.inner else {
+                            let Expr::Var(ident, _ty) = acc.inner else {
                                 panic!("Parser bug")
                             };
                             Expr::Jump {

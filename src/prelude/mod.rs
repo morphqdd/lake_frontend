@@ -32,6 +32,7 @@ pub fn parse<'src, P: AsRef<Path>>(
 /// Unlike [`parse`], this function continues past recoverable lex/parse errors
 /// and accumulates diagnostics from every stage before returning.  Use this as
 /// the single entry point for compilation.
+#[allow(clippy::type_complexity)]
 pub fn build_ast<'src, P: AsRef<Path>>(
     _path: P,
     src: &'src str,

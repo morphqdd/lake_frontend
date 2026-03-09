@@ -1,4 +1,4 @@
-use std::{fs, path::Path, process, time};
+use std::{fs, path::Path, process};
 
 use lake_frontend::prelude::build_ast;
 
