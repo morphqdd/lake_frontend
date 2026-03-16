@@ -36,6 +36,9 @@ pub enum Token<'src> {
     SelfKw,
     Wait,
     Let,
+
+    // Comments (filtered out after lexing)
+    Comment,
 }
 
 impl<'src> Display for Token<'src> {
@@ -69,6 +72,7 @@ impl<'src> Display for Token<'src> {
             Token::Eq => write!(f, "="),
             Token::Wait => write!(f, "wait"),
             Token::Let => write!(f, "let"),
+            Token::Comment => write!(f, "// ..."),
         }
     }
 }

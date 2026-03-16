@@ -13,6 +13,10 @@ pub fn lexer<'src>()
 -> impl Parser<'src, &'src str, Vec<Spanned<Token<'src>>>, extra::Err<Rich<'src, char>>> {
     recursive(|token| {
         choice((
+            // Parse comments as tokens (will be filtered later)
+            just("//")
+                .then(any().and_is(just('\n').not()).repeated())
+                .to(Token::Comment),
             text::ident().map(|s| match s {
                 "is" => Token::Is,
                 "when" => Token::When,
@@ -87,6 +91,12 @@ pub fn lexer<'src>()
     })
     .repeated()
     .collect()
+    .map(|tokens: Vec<Spanned<Token>>| {
+        // Filter out comments
+        tokens.into_iter()
+            .filter(|t| !matches!(t.inner, Token::Comment))
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -281,5 +291,44 @@ mod test {
         let tokens = lexer().parse("== =").into_result().expect("should lex");
         assert!(matches!(tokens[0].inner, Token::EqEq));
         assert!(matches!(tokens[1].inner, Token::Eq));
+    }
+
+    #[test]
+    fn comment_single_line_test() {
+        // Comments should be completely ignored
+        let tokens = lexer()
+            .parse("n i64 // this is a comment")
+            .into_result()
+            .expect("should lex");
+        assert_eq!(tokens.len(), 2); // only "n" and "i64"
+        assert!(matches!(tokens[0].inner, Token::Ident("n")));
+        assert!(matches!(tokens[1].inner, Token::Ident("i64")));
+    }
+
+    #[test]
+    fn comment_full_line_test() {
+        let tokens = lexer()
+            .parse("// comment line\nn i64")
+            .into_result()
+            .expect("should lex");
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(tokens[0].inner, Token::Ident("n")));
+        assert!(matches!(tokens[1].inner, Token::Ident("i64")));
+    }
+
+    #[test]
+    fn comment_multiple_test() {
+        let src = r#"
+// This is a counter
+counter is {
+  n i64 -> { // parameter
+    self(n-1) // recurse
+  }
+}
+"#;
+        let tokens = lexer().parse(src).into_result().expect("should lex");
+        // Should have: counter, is, {, n, i64, ->, {, self, (, n, -, 1, ), }, }
+        assert!(tokens.len() > 0);
+        assert!(matches!(tokens[0].inner, Token::Ident("counter")));
     }
 }
