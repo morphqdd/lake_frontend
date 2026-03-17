@@ -6,6 +6,7 @@ use crate::api::token::Token;
 use crate::{api::expr::Expr, error_handle::LakeErrors, lexer::lexer, parser::program};
 
 pub use crate::resolver::resolve;
+pub use crate::semantic::analyze;
 pub use crate::typeck::typecheck;
 
 /// Parse a Lake source file.  Returns the AST on success or a collection of
