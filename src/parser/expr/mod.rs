@@ -69,17 +69,10 @@ pub fn expr<'t, 'src: 't>()
         // Inline pattern parser for wait handlers to avoid mutual recursion
         // (pattern() calls top-level expr() which would recurse infinitely)
         let wait_pattern = ident_parser()
-            .then(
-                type_expr()
-                    .then(just(Token::Dot).ignore_then(expr.clone()).or_not())
-                    .or_not(),
-            )
-            .map(|(ident, opt)| {
-                let (ty, default) = match opt {
-                    Some((ty, default)) => (ty, default),
-                    None => (Type::Unit.with_span(ident.span), None),
-                };
-                Pattern::new(ident, ty, default)
+            .then(type_expr().or_not())
+            .map(|(ident, opt_ty)| {
+                let ty = opt_ty.unwrap_or_else(|| Type::Unit.with_span(ident.span));
+                Pattern::new(ident, ty)
             })
             .spanned();
 

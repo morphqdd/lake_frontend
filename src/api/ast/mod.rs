@@ -110,12 +110,15 @@ impl std::fmt::Display for Type<'_> {
     }
 }
 
-/// A branch parameter: `n i32`, `n str."hello"`, `_`
+/// A branch parameter: `n i32`, `_`, `0 i64`, `"hello" str`
 #[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
 pub struct Pattern<'src> {
     pub ident: Spanned<Ident<'src>>,
     pub ty: Spanned<Type<'src>>,
-    pub default: Option<Spanned<Expr<'src>>>,
+    /// True when the ident was parsed from a `Token::String` literal.
+    /// Needed because string content is indistinguishable from a normal ident
+    /// once quotes are stripped.
+    pub string_guard: bool,
 }
 
 impl<'src> Clean<Ident<'src>> for Pattern<'src> {
@@ -130,23 +133,37 @@ impl<'src> Clean<Type<'src>> for Pattern<'src> {
     }
 }
 
-impl<'src> Clean<Option<Expr<'src>>> for Pattern<'src> {
-    fn clean(&self) -> Option<Expr<'src>> {
-        self.default.clone().map(|x| x.inner.clone())
-    }
-}
-
 impl<'src> Pattern<'src> {
-    pub fn new(
-        ident: Spanned<Ident<'src>>,
-        ty: Spanned<Type<'src>>,
-        default: Option<Spanned<Expr<'src>>>,
-    ) -> Self {
-        Self { ident, ty, default }
+    pub fn new(ident: Spanned<Ident<'src>>, ty: Spanned<Type<'src>>) -> Self {
+        Self { ident, ty, string_guard: false }
+    }
+
+    pub fn new_string_guard(ident: Spanned<Ident<'src>>, ty: Spanned<Type<'src>>) -> Self {
+        Self { ident, ty, string_guard: true }
     }
 
     pub fn is_wildcard(&self) -> bool {
         self.ident.inner.0 == "_"
+    }
+
+    /// Returns true when the pattern is a literal guard (numeric or string).
+    pub fn is_literal_guard(&self) -> bool {
+        self.string_guard || self.ident.inner.0.parse::<i64>().is_ok()
+    }
+
+    /// Returns true when this is a string literal guard (e.g. `"hello" str`).
+    pub fn is_string_guard(&self) -> bool {
+        self.string_guard
+    }
+
+    /// Returns the i64 guard value if this is a numeric literal guard.
+    pub fn guard_i64(&self) -> Option<i64> {
+        if self.string_guard { None } else { self.ident.inner.0.parse().ok() }
+    }
+
+    /// Returns the string guard value if this is a string literal guard.
+    pub fn guard_str(&self) -> Option<&'src str> {
+        if self.string_guard { Some(self.ident.inner.0) } else { None }
     }
 }
 
@@ -155,7 +172,7 @@ impl<'a> From<&Pattern<'a>> for Expr<'a> {
         Expr::Let {
             ident: value.ident.clone(),
             ty: value.ty.clone(),
-            default: value.default.clone().map(Box::new),
+            default: None,
         }
     }
 }

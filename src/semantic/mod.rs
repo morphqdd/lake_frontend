@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use chumsky::span::{SimpleSpan, Spanned};
 
 use crate::api::{
-    ast::{Branch, Directive, Machine, MachineItem, Type},
+    ast::{Branch, Directive, Import, Machine, MachineItem, Type},
     expr::Expr,
 };
 
@@ -27,6 +27,14 @@ pub enum SymbolKind {
     LocalVariable,
     /// A runtime function imported via `@rt` directive
     RuntimeFunction,
+    /// A method call (receiver@method)
+    Method,
+    /// A field access (receiver@field or receiver.field)
+    Field,
+    /// A namespace/module
+    Namespace,
+    /// A type name
+    TypeName,
 }
 
 /// A symbol with its type and location information.
@@ -108,6 +116,79 @@ impl SemanticAnalyzer {
         self.scope_stack.pop();
     }
 
+    fn analyze_type(&mut self, ty: &Spanned<Type>) {
+        match &ty.inner {
+            Type::Named(ident) => {
+                // Add type name as a symbol (i64, pid, str, custom types)
+                self.add_symbol(Symbol {
+                    name: ident.inner.0.to_string(),
+                    kind: SymbolKind::TypeName,
+                    typ: "type".to_string(),
+                    span: ident.span,
+                });
+            }
+            Type::Generic(ident, args) => {
+                // Add the base type
+                self.add_symbol(Symbol {
+                    name: ident.inner.0.to_string(),
+                    kind: SymbolKind::TypeName,
+                    typ: "type".to_string(),
+                    span: ident.span,
+                });
+                // Recursively analyze type arguments
+                for arg in args {
+                    self.analyze_type(arg);
+                }
+            }
+            Type::Path(ident, rest) => {
+                // Add the namespace part
+                self.add_symbol(Symbol {
+                    name: ident.inner.0.to_string(),
+                    kind: SymbolKind::Namespace,
+                    typ: "namespace".to_string(),
+                    span: ident.span,
+                });
+                // Recursively analyze the rest of the path
+                let rest_type = Spanned {
+                    inner: *rest.inner.clone(),
+                    span: rest.span,
+                };
+                self.analyze_type(&rest_type);
+            }
+            Type::Struct(fields) => {
+                // Analyze each field type
+                for field in fields {
+                    self.analyze_type(field);
+                }
+            }
+            Type::Unit => {
+                // Unit type {} - nothing to highlight
+            }
+        }
+    }
+
+    fn lookup_variable_kind(&self, name: &str) -> SymbolKind {
+        // First, search in scope stack (parameters and local variables)
+        for scope in self.scope_stack.iter().rev() {
+            if let Some(symbol) = scope.get(name) {
+                return symbol.kind;
+            }
+        }
+
+        // Check if it's a runtime function
+        if self.info.runtime_functions.contains(&name.to_string()) {
+            return SymbolKind::RuntimeFunction;
+        }
+
+        // Check if it's a machine
+        if self.info.machines.contains_key(name) {
+            return SymbolKind::Machine;
+        }
+
+        // Default to local variable (might be from outer scope we haven't tracked)
+        SymbolKind::LocalVariable
+    }
+
     fn analyze_directive(&mut self, directive: &Spanned<Directive>) {
         // @rt(func_name) declares a runtime function
         let dir_name = directive.inner.name.inner.0;
@@ -125,6 +206,32 @@ impl SemanticAnalyzer {
                         typ: "runtime_function".to_string(),
                         span: ident.span,
                     });
+                }
+            }
+        }
+    }
+
+    fn analyze_import(&mut self, import_rc: &Spanned<std::rc::Rc<std::cell::RefCell<Import>>>) {
+        let import = import_rc.inner.borrow();
+        match &*import {
+            Import::Import(ident, next) => {
+                // Add each component of the import path as a namespace
+                self.add_symbol(Symbol {
+                    name: ident.inner.0.to_string(),
+                    kind: SymbolKind::Namespace,
+                    typ: "namespace".to_string(),
+                    span: ident.span,
+                });
+
+                // Recursively analyze the rest of the path
+                if let Some(next_import) = next {
+                    self.analyze_import(next_import);
+                }
+            }
+            Import::MultiImport(imports) => {
+                // For multi-imports like +core.{ box.box result.result }
+                for import_item in imports {
+                    self.analyze_import(import_item);
                 }
             }
         }
@@ -151,8 +258,7 @@ impl SemanticAnalyzer {
                 let sig = branch
                     .patterns
                     .iter()
-                    .filter(|p| !p.inner.is_wildcard())
-                    .filter(|p| p.inner.default.is_none()) // exclude defaults
+                    .filter(|p| !p.inner.is_wildcard() && !p.inner.is_literal_guard())
                     .map(|p| type_to_string(&p.inner.ty.inner))
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -186,6 +292,9 @@ impl SemanticAnalyzer {
                     span: ident.span,
                 });
             }
+
+            // Add the type name as a symbol
+            self.analyze_type(&pattern.inner.ty);
         }
 
         // Analyze expressions in the branch body
@@ -207,6 +316,9 @@ impl SemanticAnalyzer {
                     span: ident.span,
                 });
 
+                // Analyze the type annotation
+                self.analyze_type(ty);
+
                 // Analyze the default value expression
                 if let Some(default_expr) = default {
                     self.analyze_expr(default_expr);
@@ -217,6 +329,44 @@ impl SemanticAnalyzer {
                 self.analyze_expr(ident);
                 for arg in args {
                     self.analyze_expr(arg);
+                }
+            }
+
+            // Method calls - receiver@method(args)
+            Expr::MethodCall { receiver, method, args } => {
+                self.analyze_expr(receiver);
+
+                // Add method name as a symbol
+                self.add_symbol(Symbol {
+                    name: method.inner.0.to_string(),
+                    kind: SymbolKind::Method,
+                    typ: "method".to_string(),
+                    span: method.span,
+                });
+
+                for arg in args {
+                    self.analyze_expr(arg);
+                }
+            }
+
+            // Field access - receiver@field or receiver.field
+            Expr::AtAccess { receiver, field } | Expr::DotAccess { receiver, field } => {
+                self.analyze_expr(receiver);
+
+                // Add field name as a symbol
+                self.add_symbol(Symbol {
+                    name: field.inner.0.to_string(),
+                    kind: SymbolKind::Field,
+                    typ: "field".to_string(),
+                    span: field.span,
+                });
+            }
+
+            // Struct initialization - receiver.{ fields }
+            Expr::StructInit { base, fields } => {
+                self.analyze_expr(base);
+                for field in fields {
+                    self.analyze_expr(field);
                 }
             }
 
@@ -243,11 +393,40 @@ impl SemanticAnalyzer {
                 self.analyze_expr(r);
             }
 
-            // Terminals - no further analysis needed
-            Expr::Var(_, _) | Expr::Num(_, _) | Expr::String(_, _) | Expr::Bool(_) => {}
+            // Variable references - add to symbols for LSP
+            Expr::Var(name, ty) => {
+                // Skip "self" - it's a keyword, handled by tree-sitter
+                if *name != "self" {
+                    // Look up the variable in scope to determine its kind
+                    let kind = self.lookup_variable_kind(name);
+                    let typ = type_to_string(ty);
 
-            // Machine definitions at top level are handled separately
-            Expr::Machine(_) | Expr::Directive(_) => {}
+                    self.add_symbol(Symbol {
+                        name: name.to_string(),
+                        kind,
+                        typ,
+                        span: expr.span,
+                    });
+                }
+            }
+
+            // Other terminals
+            Expr::Num(_, _) | Expr::String(_, _) | Expr::Bool(_) => {}
+
+            // Import statements - +core.io.writer
+            Expr::Import(import) => {
+                self.analyze_import(import);
+            }
+
+            // Machine definitions can appear anywhere in the file
+            Expr::Machine(machine) => {
+                self.analyze_machine(machine);
+            }
+
+            // Directives can appear anywhere
+            Expr::Directive(directive) => {
+                self.analyze_directive(directive);
+            }
 
             // Other expressions - add as needed
             _ => {}
@@ -258,15 +437,88 @@ impl SemanticAnalyzer {
     pub fn analyze(program: &[Spanned<Expr>]) -> SemanticInfo {
         let mut analyzer = Self::new();
 
+        // First pass: collect all machine and runtime function definitions
+        // This allows forward references (calling a machine before it's defined)
+        analyzer.collect_definitions(program);
+
+        // Second pass: analyze all expressions now that we know all machines
         for expr in program {
-            match &expr.inner {
-                Expr::Directive(d) => analyzer.analyze_directive(d),
-                Expr::Machine(m) => analyzer.analyze_machine(m),
-                _ => {}
-            }
+            analyzer.analyze_expr(expr);
         }
 
         analyzer.info
+    }
+
+    /// First pass: collect machine names and runtime functions without analyzing bodies
+    fn collect_definitions(&mut self, program: &[Spanned<Expr>]) {
+        for expr in program {
+            self.collect_definitions_expr(expr);
+        }
+    }
+
+    fn collect_definitions_expr(&mut self, expr: &Spanned<Expr>) {
+        match &expr.inner {
+            Expr::Directive(directive) => {
+                // Collect runtime functions
+                let dir_name = directive.inner.name.inner.0;
+                if dir_name == "rt" {
+                    if let Some(arg_type) = directive.inner.args.first() {
+                        if let Type::Named(ident) = &arg_type.inner {
+                            let func_name = ident.inner.0.to_string();
+                            self.info.runtime_functions.push(func_name);
+                        }
+                    }
+                }
+            }
+            Expr::Machine(machine) => {
+                // Collect machine name
+                let machine_name = machine.inner.ident.inner.0.to_string();
+                if !self.info.machines.contains_key(&machine_name) {
+                    self.info.machines.insert(machine_name, Vec::new());
+                }
+            }
+            // Recursively search for nested machines/directives
+            Expr::Let { default, .. } => {
+                if let Some(default_expr) = default {
+                    self.collect_definitions_expr(default_expr);
+                }
+            }
+            Expr::Jump { ident, args } => {
+                self.collect_definitions_expr(ident);
+                for arg in args {
+                    self.collect_definitions_expr(arg);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                self.collect_definitions_expr(receiver);
+                for arg in args {
+                    self.collect_definitions_expr(arg);
+                }
+            }
+            Expr::AtAccess { receiver, .. } | Expr::DotAccess { receiver, .. } => {
+                self.collect_definitions_expr(receiver);
+            }
+            Expr::StructInit { base, fields } => {
+                self.collect_definitions_expr(base);
+                for field in fields {
+                    self.collect_definitions_expr(field);
+                }
+            }
+            Expr::When { cond, branches } => {
+                self.collect_definitions_expr(cond);
+                for (_, body) in branches {
+                    for expr in body {
+                        self.collect_definitions_expr(expr);
+                    }
+                }
+            }
+            Expr::Add(l, r) | Expr::Sub(l, r) | Expr::Mul(l, r) | Expr::Div(l, r)
+            | Expr::Eq(l, r) | Expr::Le(l, r) | Expr::Ge(l, r) | Expr::Lt(l, r) | Expr::Gt(l, r) => {
+                self.collect_definitions_expr(l);
+                self.collect_definitions_expr(r);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -335,8 +587,8 @@ counter is {
         // Should find counter machine
         assert!(info.machines.contains_key("counter"));
 
-        // Should have symbols for: rt_write, counter, n, x
-        assert_eq!(info.symbols.len(), 4);
+        // Symbols: rt_write, counter, n, i64 (param type), x, i64 (let type)
+        assert_eq!(info.symbols.len(), 6);
 
         // Check symbol kinds
         assert_eq!(
@@ -346,5 +598,6 @@ counter is {
         assert_eq!(info.symbols_by_kind(SymbolKind::Machine).len(), 1);
         assert_eq!(info.symbols_by_kind(SymbolKind::Parameter).len(), 1);
         assert_eq!(info.symbols_by_kind(SymbolKind::LocalVariable).len(), 1);
+        assert_eq!(info.symbols_by_kind(SymbolKind::TypeName).len(), 2);
     }
 }

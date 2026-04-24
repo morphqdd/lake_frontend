@@ -121,9 +121,9 @@ impl<'src> Resolver<'src> {
     fn resolve_branch(&mut self, branch: Branch<'src>) -> Branch<'src> {
         let saved = self.scope.clone();
 
-        // Bind all non-wildcard pattern variables into scope.
+        // Bind all non-wildcard, non-literal-guard pattern variables into scope.
         for pat in &branch.patterns {
-            if !pat.inner.is_wildcard() {
+            if !pat.inner.is_wildcard() && !pat.inner.is_literal_guard() {
                 self.bind(pat.inner.ident.inner.0, pat.inner.ty.inner.clone());
             }
         }

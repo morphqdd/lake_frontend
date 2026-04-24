@@ -259,12 +259,12 @@ impl<'src> TypeChecker<'src> {
     }
 }
 
-/// Build the signature of a branch from its non-default, non-wildcard patterns.
+/// Build the signature of a branch from its non-wildcard, non-guard patterns.
 fn branch_sig(branch: &Branch<'_>) -> BranchSig {
     let param_types = branch
         .patterns
         .iter()
-        .filter(|p| !p.inner.is_wildcard() && p.inner.default.is_none())
+        .filter(|p| !p.inner.is_wildcard() && !p.inner.is_literal_guard())
         .map(|p| p.inner.ty.inner.to_string())
         .collect();
     BranchSig { param_types }

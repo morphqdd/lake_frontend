@@ -86,14 +86,6 @@ mod tests {
         let result = parse_pattern("n i32").expect("should parse");
         assert_eq!(result.inner.ident.inner, Ident::new("n"));
         assert!(matches!(result.inner.ty.inner, Type::Named(_)));
-        assert!(result.inner.default.is_none());
-    }
-
-    #[test]
-    fn parse_pattern_with_default() {
-        let result = parse_pattern("n i32.10").expect("should parse");
-        assert_eq!(result.inner.ident.inner, Ident::new("n"));
-        assert!(result.inner.default.is_some());
     }
 
     #[test]
@@ -110,11 +102,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_string_default_pattern() {
-        let result = parse_pattern("n str.\"hello\"").expect("should parse");
-        assert!(
-            matches!(result.inner.default, Some(ref e) if matches!(e.inner, Expr::String(_, _)))
-        );
+    fn parse_numeric_literal_guard() {
+        let result = parse_pattern("0 i64").expect("should parse");
+        assert!(result.inner.is_literal_guard());
+        assert_eq!(result.inner.guard_i64(), Some(0));
+    }
+
+    #[test]
+    fn parse_string_literal_guard() {
+        let result = parse_pattern("\"hello\" str").expect("should parse");
+        assert!(result.inner.is_string_guard());
+        assert_eq!(result.inner.guard_str(), Some("hello"));
     }
 
     #[test]
