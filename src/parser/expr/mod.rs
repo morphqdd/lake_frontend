@@ -66,15 +66,29 @@ pub fn expr<'t, 'src: 't>()
                 branches,
             });
 
-        // Inline pattern parser for wait handlers to avoid mutual recursion
-        // (pattern() calls top-level expr() which would recurse infinitely)
-        let wait_pattern = ident_parser()
+        // Inline pattern parser for wait handlers (mirrors pattern.rs but avoids
+        // mutual recursion with top-level expr()).
+        let wait_pattern = {
+            let string_guard = select_ref!(
+                Token::String(n) = e => Ident::new(n).with_span(e.span()),
+            )
+            .then(type_expr())
+            .map(|(ident, ty)| Pattern::new_string_guard(ident, ty))
+            .spanned();
+
+            let normal = select_ref!(
+                Token::Ident(n) = e => Ident::new(n).with_span(e.span()),
+                Token::Num(n)   = e => Ident::new(n).with_span(e.span()),
+            )
             .then(type_expr().or_not())
             .map(|(ident, opt_ty)| {
                 let ty = opt_ty.unwrap_or_else(|| Type::Unit.with_span(ident.span));
                 Pattern::new(ident, ty)
             })
             .spanned();
+
+            string_guard.or(normal)
+        };
 
         let wait_handler =
             just(Token::At)
