@@ -12,9 +12,10 @@ use std::collections::HashMap;
 use chumsky::span::{SimpleSpan, Spanned};
 
 use crate::api::{
-    ast::{Branch, Directive, Import, Machine, MachineItem, Type},
+    ast::{Branch, Directive, Import, Item, Machine, Type},
     expr::Expr,
 };
+use crate::visit::{Visit, walk_expr};
 
 /// Kind of symbol in the Lake program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,8 +162,8 @@ impl SemanticAnalyzer {
                     self.analyze_type(field);
                 }
             }
-            Type::Unit => {
-                // Unit type {} - nothing to highlight
+            Type::Unit | Type::Unknown => {
+                // Unit `{}` and unresolved placeholder — nothing to highlight.
             }
         }
     }
@@ -237,51 +238,101 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn analyze_machine(&mut self, machine: &Spanned<Machine>) {
-        let machine_name = machine.inner.ident.inner.0.to_string();
-        let machine_span = machine.inner.ident.span;
-
-        // Add machine symbol
-        self.add_symbol(Symbol {
-            name: machine_name.clone(),
-            kind: SymbolKind::Machine,
-            typ: "machine".to_string(),
-            span: machine_span,
-        });
-
-        // Collect branch signatures
-        let mut branch_sigs = Vec::new();
-
-        for item in &machine.inner.items {
-            if let MachineItem::Branch(branch) = &item.inner {
-                // Build branch signature from patterns
-                let sig = branch
+    /// Build the displayable signature list for a machine (used for LSP
+    /// hover/autocomplete).  Filters wildcard and literal-guard patterns the
+    /// same way `typeck::branch_sig` does.
+    fn build_branch_signatures(machine: &Machine<'_>) -> Vec<String> {
+        let mut sigs = Vec::new();
+        for item in &machine.items {
+            if let crate::api::ast::MachineItem::Branch(b) = &item.inner {
+                let sig = b
                     .patterns
                     .iter()
                     .filter(|p| !p.inner.is_wildcard() && !p.inner.is_literal_guard())
                     .map(|p| type_to_string(&p.inner.ty.inner))
                     .collect::<Vec<_>>()
                     .join(" ");
-
-                branch_sigs.push(if sig.is_empty() {
-                    "_".to_string()
-                } else {
-                    sig
-                });
-
-                // Analyze the branch body
-                self.analyze_branch(branch);
+                sigs.push(if sig.is_empty() { "_".to_string() } else { sig });
             }
         }
-
-        self.info.machines.insert(machine_name, branch_sigs);
+        sigs
     }
 
-    fn analyze_branch(&mut self, branch: &Branch) {
-        // Each branch gets its own scope
+    /// Analyze a complete Lake program and return semantic information.
+    pub fn analyze(program: &[Spanned<Item>]) -> SemanticInfo {
+        let mut analyzer = Self::new();
+
+        // First pass: collect all machine and runtime function definitions
+        // This allows forward references (calling a machine before it's defined)
+        analyzer.collect_definitions(program);
+
+        // Second pass: walk every item, building the symbol stream.
+        analyzer.visit_program(program);
+
+        analyzer.info
+    }
+
+    /// First pass: collect machine names and runtime functions without
+    /// recursing into bodies.  Top-level constructs are flat `Item`s so the
+    /// walk is a single linear scan.
+    fn collect_definitions(&mut self, program: &[Spanned<Item>]) {
+        for item in program {
+            match &item.inner {
+                Item::Directive(directive) => {
+                    let dir_name = directive.inner.name.inner.0;
+                    if dir_name == "rt" {
+                        if let Some(arg_type) = directive.inner.args.first() {
+                            if let Type::Named(ident) = &arg_type.inner {
+                                let func_name = ident.inner.0.to_string();
+                                self.info.runtime_functions.push(func_name);
+                            }
+                        }
+                    }
+                }
+                Item::Machine(machine) => {
+                    let machine_name = machine.inner.ident.inner.0.to_string();
+                    if !self.info.machines.contains_key(&machine_name) {
+                        self.info.machines.insert(machine_name, Vec::new());
+                    }
+                }
+                Item::Import(_) => {}
+            }
+        }
+    }
+}
+
+impl<'src> Visit<'src> for SemanticAnalyzer {
+    fn visit_item(&mut self, item: &Spanned<Item<'src>>) {
+        match &item.inner {
+            Item::Import(import) => self.analyze_import(import),
+            Item::Directive(directive) => self.analyze_directive(directive),
+            Item::Machine(machine) => self.visit_machine(machine),
+        }
+    }
+
+    fn visit_machine(&mut self, machine: &Spanned<Machine<'src>>) {
+        let name = machine.inner.ident.inner.0.to_string();
+        let span = machine.inner.ident.span;
+
+        self.add_symbol(Symbol {
+            name: name.clone(),
+            kind: SymbolKind::Machine,
+            typ: "machine".to_string(),
+            span,
+        });
+
+        self.info
+            .machines
+            .insert(name, Self::build_branch_signatures(&machine.inner));
+
+        // Recurse into branches via the default walk.
+        crate::visit::walk_machine(self, machine);
+    }
+
+    fn visit_branch(&mut self, branch: &Branch<'src>) {
+        // Each branch has its own scope.
         self.push_scope();
 
-        // Add parameters to scope
         for pattern in &branch.patterns {
             let ident = &pattern.inner.ident;
             if ident.inner.0 != "_" {
@@ -292,68 +343,33 @@ impl SemanticAnalyzer {
                     span: ident.span,
                 });
             }
-
-            // Add the type name as a symbol
             self.analyze_type(&pattern.inner.ty);
         }
 
-        // Analyze expressions in the branch body
-        for expr in &branch.body {
-            self.analyze_expr(expr);
-        }
-
+        crate::visit::walk_branch(self, branch);
         self.pop_scope();
     }
 
-    fn analyze_expr(&mut self, expr: &Spanned<Expr>) {
+    fn visit_expr(&mut self, expr: &Spanned<Expr<'src>>) {
         match &expr.inner {
-            Expr::Let { ident, ty, default } => {
-                // Add let binding to scope
+            Expr::Let { ident, ty, default: _ } => {
                 self.add_symbol(Symbol {
                     name: ident.inner.0.to_string(),
                     kind: SymbolKind::LocalVariable,
                     typ: type_to_string(&ty.inner),
                     span: ident.span,
                 });
-
-                // Analyze the type annotation
                 self.analyze_type(ty);
-
-                // Analyze the default value expression
-                if let Some(default_expr) = default {
-                    self.analyze_expr(default_expr);
-                }
             }
-
-            Expr::Jump { ident, args } => {
-                self.analyze_expr(ident);
-                for arg in args {
-                    self.analyze_expr(arg);
-                }
-            }
-
-            // Method calls - receiver@method(args)
-            Expr::MethodCall { receiver, method, args } => {
-                self.analyze_expr(receiver);
-
-                // Add method name as a symbol
+            Expr::MethodCall { method, .. } => {
                 self.add_symbol(Symbol {
                     name: method.inner.0.to_string(),
                     kind: SymbolKind::Method,
                     typ: "method".to_string(),
                     span: method.span,
                 });
-
-                for arg in args {
-                    self.analyze_expr(arg);
-                }
             }
-
-            // Field access - receiver@field or receiver.field
-            Expr::AtAccess { receiver, field } | Expr::DotAccess { receiver, field } => {
-                self.analyze_expr(receiver);
-
-                // Add field name as a symbol
+            Expr::AtAccess { field, .. } | Expr::DotAccess { field, .. } => {
                 self.add_symbol(Symbol {
                     name: field.inner.0.to_string(),
                     kind: SymbolKind::Field,
@@ -361,164 +377,21 @@ impl SemanticAnalyzer {
                     span: field.span,
                 });
             }
-
-            // Struct initialization - receiver.{ fields }
-            Expr::StructInit { base, fields } => {
-                self.analyze_expr(base);
-                for field in fields {
-                    self.analyze_expr(field);
-                }
-            }
-
-            Expr::When { cond, branches } => {
-                self.analyze_expr(cond);
-                for (_, body) in branches {
-                    for expr in body {
-                        self.analyze_expr(expr);
-                    }
-                }
-            }
-
-            Expr::Wait { handlers } => {
-                for handler in handlers {
-                    // Each wait handler is a Branch
-                    self.analyze_branch(&handler.inner);
-                }
-            }
-
-            // Recursive expressions
-            Expr::Add(l, r) | Expr::Sub(l, r) | Expr::Mul(l, r) | Expr::Div(l, r)
-            | Expr::Eq(l, r) | Expr::Le(l, r) | Expr::Ge(l, r) | Expr::Lt(l, r) | Expr::Gt(l, r) => {
-                self.analyze_expr(l);
-                self.analyze_expr(r);
-            }
-
-            // Variable references - add to symbols for LSP
             Expr::Var(name, ty) => {
-                // Skip "self" - it's a keyword, handled by tree-sitter
                 if *name != "self" {
-                    // Look up the variable in scope to determine its kind
                     let kind = self.lookup_variable_kind(name);
-                    let typ = type_to_string(ty);
-
                     self.add_symbol(Symbol {
                         name: name.to_string(),
                         kind,
-                        typ,
+                        typ: type_to_string(ty),
                         span: expr.span,
                     });
                 }
             }
-
-            // Other terminals
-            Expr::Num(_, _) | Expr::String(_, _) | Expr::Bool(_) => {}
-
-            // Import statements - +core.io.writer
-            Expr::Import(import) => {
-                self.analyze_import(import);
-            }
-
-            // Machine definitions can appear anywhere in the file
-            Expr::Machine(machine) => {
-                self.analyze_machine(machine);
-            }
-
-            // Directives can appear anywhere
-            Expr::Directive(directive) => {
-                self.analyze_directive(directive);
-            }
-
-            // Other expressions - add as needed
             _ => {}
         }
-    }
-
-    /// Analyze a complete Lake program and return semantic information.
-    pub fn analyze(program: &[Spanned<Expr>]) -> SemanticInfo {
-        let mut analyzer = Self::new();
-
-        // First pass: collect all machine and runtime function definitions
-        // This allows forward references (calling a machine before it's defined)
-        analyzer.collect_definitions(program);
-
-        // Second pass: analyze all expressions now that we know all machines
-        for expr in program {
-            analyzer.analyze_expr(expr);
-        }
-
-        analyzer.info
-    }
-
-    /// First pass: collect machine names and runtime functions without analyzing bodies
-    fn collect_definitions(&mut self, program: &[Spanned<Expr>]) {
-        for expr in program {
-            self.collect_definitions_expr(expr);
-        }
-    }
-
-    fn collect_definitions_expr(&mut self, expr: &Spanned<Expr>) {
-        match &expr.inner {
-            Expr::Directive(directive) => {
-                // Collect runtime functions
-                let dir_name = directive.inner.name.inner.0;
-                if dir_name == "rt" {
-                    if let Some(arg_type) = directive.inner.args.first() {
-                        if let Type::Named(ident) = &arg_type.inner {
-                            let func_name = ident.inner.0.to_string();
-                            self.info.runtime_functions.push(func_name);
-                        }
-                    }
-                }
-            }
-            Expr::Machine(machine) => {
-                // Collect machine name
-                let machine_name = machine.inner.ident.inner.0.to_string();
-                if !self.info.machines.contains_key(&machine_name) {
-                    self.info.machines.insert(machine_name, Vec::new());
-                }
-            }
-            // Recursively search for nested machines/directives
-            Expr::Let { default, .. } => {
-                if let Some(default_expr) = default {
-                    self.collect_definitions_expr(default_expr);
-                }
-            }
-            Expr::Jump { ident, args } => {
-                self.collect_definitions_expr(ident);
-                for arg in args {
-                    self.collect_definitions_expr(arg);
-                }
-            }
-            Expr::MethodCall { receiver, args, .. } => {
-                self.collect_definitions_expr(receiver);
-                for arg in args {
-                    self.collect_definitions_expr(arg);
-                }
-            }
-            Expr::AtAccess { receiver, .. } | Expr::DotAccess { receiver, .. } => {
-                self.collect_definitions_expr(receiver);
-            }
-            Expr::StructInit { base, fields } => {
-                self.collect_definitions_expr(base);
-                for field in fields {
-                    self.collect_definitions_expr(field);
-                }
-            }
-            Expr::When { cond, branches } => {
-                self.collect_definitions_expr(cond);
-                for (_, body) in branches {
-                    for expr in body {
-                        self.collect_definitions_expr(expr);
-                    }
-                }
-            }
-            Expr::Add(l, r) | Expr::Sub(l, r) | Expr::Mul(l, r) | Expr::Div(l, r)
-            | Expr::Eq(l, r) | Expr::Le(l, r) | Expr::Ge(l, r) | Expr::Lt(l, r) | Expr::Gt(l, r) => {
-                self.collect_definitions_expr(l);
-                self.collect_definitions_expr(r);
-            }
-            _ => {}
-        }
+        // Recurse into children regardless of variant.
+        walk_expr(self, expr);
     }
 }
 
@@ -544,6 +417,7 @@ fn type_to_string(ty: &Type) -> String {
             format!("{}:{}", ident.inner.0, type_to_string(&rest.inner))
         }
         Type::Unit => "unit".to_string(),
+        Type::Unknown => "?".to_string(),
         Type::Struct(fields) => {
             let fields_str = fields
                 .iter()
@@ -556,7 +430,7 @@ fn type_to_string(ty: &Type) -> String {
 }
 
 /// Convenience function: analyze a Lake program and return semantic information.
-pub fn analyze<'src>(program: &[Spanned<Expr<'src>>]) -> SemanticInfo {
+pub fn analyze<'src>(program: &[Spanned<Item<'src>>]) -> SemanticInfo {
     SemanticAnalyzer::analyze(program)
 }
 

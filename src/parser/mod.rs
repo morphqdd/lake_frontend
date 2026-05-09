@@ -8,8 +8,7 @@ use chumsky::{
 
 use crate::{
     api::{
-        ast::{Directive, Machine},
-        expr::Expr,
+        ast::{Directive, Item, Machine},
         token::Token,
     },
     parser::{directive::directive, helpers::TokenInput, import::import, machine::machine},
@@ -23,25 +22,30 @@ mod import;
 mod machine;
 mod pattern;
 
-/// Top-level parser.  Returns a flat list of items: imports, standalone
-/// directives (`Expr::Directive`), and machines (`Expr::Machine`).
+/// Top-level parser.  Returns a flat list of `Item`s: imports, standalone
+/// directives, and machines.
 ///
 /// Directives are parsed as standalone items because they may be separated
 /// from the machine they annotate by imports (e.g. in `io.lake`).
 /// Attaching directives to machines is left to a later semantic pass.
 pub fn program<'t, 'src: 't>()
--> impl Parser<'t, TokenInput<'t, 'src>, Vec<Spanned<Expr<'src>>>, Err<Rich<'t, Token<'src>>>> {
+-> impl Parser<'t, TokenInput<'t, 'src>, Vec<Spanned<Item<'src>>>, Err<Rich<'t, Token<'src>>>> {
     let machine_item = machine().map(|m: Spanned<Machine>| {
         let span = m.span;
-        Expr::Machine(m).with_span(span)
+        Item::Machine(m).with_span(span)
     });
 
     let directive_item = directive().map(|d: Spanned<Directive>| {
         let span = d.span;
-        Expr::Directive(d).with_span(span)
+        Item::Directive(d).with_span(span)
     });
 
-    choice((import(), directive_item, machine_item))
+    let import_item = import().map(|i| {
+        let span = i.span;
+        Item::Import(i).with_span(span)
+    });
+
+    choice((import_item, directive_item, machine_item))
         .repeated()
         .collect::<Vec<_>>()
 }
@@ -52,7 +56,7 @@ mod tests {
 
     use crate::{
         api::{
-            ast::{Directive, Ident, Pattern, Type},
+            ast::{Directive, Ident, Item, Pattern, Type},
             expr::Expr,
         },
         lexer::lexer,
@@ -205,7 +209,7 @@ mod tests {
             .parse(tokens[..].split_spanned((0..src.len()).into()))
             .into_result()
             .expect("parse error");
-        let Expr::Machine(m) = &ast[0].inner else {
+        let Item::Machine(m) = &ast[0].inner else {
             panic!("expected Machine")
         };
         let crate::api::ast::MachineItem::Branch(b) = &m.inner.items[0].inner else {

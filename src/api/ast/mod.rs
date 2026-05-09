@@ -39,6 +39,10 @@ pub enum Type<'src> {
     Unit,
     /// Anonymous struct: `{ str }`, `{ i64 usize }`
     Struct(Vec<Spanned<Type<'src>>>),
+    /// Placeholder used by the parser for variable-reference types that the
+    /// resolver has not yet filled in.  Distinct from [`Type::Unit`], which
+    /// represents an explicit `{}` in source.
+    Unknown,
 }
 
 impl<'src> Clean<Ident<'src>> for Type<'src> {
@@ -96,6 +100,7 @@ impl std::fmt::Display for Type<'_> {
             }
             Type::Path(ident, next) => write!(f, "{}:{}", ident.inner, next.inner),
             Type::Unit => write!(f, "{{}}"),
+            Type::Unknown => write!(f, "?"),
             Type::Struct(fields) => {
                 write!(f, "{{ ")?;
                 for (i, field) in fields.iter().enumerate() {
@@ -110,15 +115,28 @@ impl std::fmt::Display for Type<'_> {
     }
 }
 
+/// What a [`Pattern`] *means*.  Computed once at construction time so
+/// downstream passes never have to re-parse the ident string.
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub enum PatternKind<'src> {
+    /// `n i32` — a regular variable binding.
+    Var,
+    /// `_` — wildcard parameter.
+    Wildcard,
+    /// `0 i64`, `42 i64` — numeric literal guard.
+    NumGuard(i64),
+    /// `"hello" str` — string literal guard.  Carries the raw (unquoted)
+    /// content; needed because string content is indistinguishable from a
+    /// normal ident once the surrounding quotes are stripped.
+    StrGuard(&'src str),
+}
+
 /// A branch parameter: `n i32`, `_`, `0 i64`, `"hello" str`
 #[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
 pub struct Pattern<'src> {
     pub ident: Spanned<Ident<'src>>,
     pub ty: Spanned<Type<'src>>,
-    /// True when the ident was parsed from a `Token::String` literal.
-    /// Needed because string content is indistinguishable from a normal ident
-    /// once quotes are stripped.
-    pub string_guard: bool,
+    pub kind: PatternKind<'src>,
 }
 
 impl<'src> Clean<Ident<'src>> for Pattern<'src> {
@@ -134,36 +152,61 @@ impl<'src> Clean<Type<'src>> for Pattern<'src> {
 }
 
 impl<'src> Pattern<'src> {
+    /// Build a pattern from an ident token.  Auto-detects wildcard `_` and
+    /// numeric literal guards by inspecting `ident.inner.0` once; the result
+    /// is cached in `kind`.
     pub fn new(ident: Spanned<Ident<'src>>, ty: Spanned<Type<'src>>) -> Self {
-        Self { ident, ty, string_guard: false }
+        let kind = if ident.inner.0 == "_" {
+            PatternKind::Wildcard
+        } else if let Ok(n) = ident.inner.0.parse::<i64>() {
+            PatternKind::NumGuard(n)
+        } else {
+            PatternKind::Var
+        };
+        Self { ident, ty, kind }
     }
 
+    /// Build a string-literal guard pattern (the parser uses this when the
+    /// pattern came from a `Token::String`).
     pub fn new_string_guard(ident: Spanned<Ident<'src>>, ty: Spanned<Type<'src>>) -> Self {
-        Self { ident, ty, string_guard: true }
+        let s = ident.inner.0;
+        Self {
+            ident,
+            ty,
+            kind: PatternKind::StrGuard(s),
+        }
     }
 
     pub fn is_wildcard(&self) -> bool {
-        self.ident.inner.0 == "_"
+        matches!(self.kind, PatternKind::Wildcard)
     }
 
     /// Returns true when the pattern is a literal guard (numeric or string).
     pub fn is_literal_guard(&self) -> bool {
-        self.string_guard || self.ident.inner.0.parse::<i64>().is_ok()
+        matches!(self.kind, PatternKind::NumGuard(_) | PatternKind::StrGuard(_))
     }
 
     /// Returns true when this is a string literal guard (e.g. `"hello" str`).
     pub fn is_string_guard(&self) -> bool {
-        self.string_guard
+        matches!(self.kind, PatternKind::StrGuard(_))
     }
 
     /// Returns the i64 guard value if this is a numeric literal guard.
     pub fn guard_i64(&self) -> Option<i64> {
-        if self.string_guard { None } else { self.ident.inner.0.parse().ok() }
+        if let PatternKind::NumGuard(n) = self.kind {
+            Some(n)
+        } else {
+            None
+        }
     }
 
     /// Returns the string guard value if this is a string literal guard.
     pub fn guard_str(&self) -> Option<&'src str> {
-        if self.string_guard { Some(self.ident.inner.0) } else { None }
+        if let PatternKind::StrGuard(s) = self.kind {
+            Some(s)
+        } else {
+            None
+        }
     }
 }
 
@@ -269,6 +312,24 @@ pub struct Directive<'src> {
 impl<'src> Directive<'src> {
     pub fn new(name: Spanned<Ident<'src>>, args: Vec<Spanned<Type<'src>>>) -> Self {
         Self { name, args }
+    }
+}
+
+/// A top-level item in a Lake program.  These constructs only appear at the
+/// program root, never as values inside an expression body.
+#[derive(Debug, PartialEq, PartialOrd, Clone)]
+pub enum Item<'src> {
+    /// `+core.io.writer` or `+core.{ a b }`
+    Import(Spanned<Rc<RefCell<Import<'src>>>>),
+    /// `@rt(name)` / `@ffi(...)` — built-in macro attribute
+    Directive(Spanned<Directive<'src>>),
+    /// `[pub] name [(generics)] is { ... }` — process / function definition
+    Machine(Spanned<Machine<'src>>),
+}
+
+impl Hash for Item<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
     }
 }
 

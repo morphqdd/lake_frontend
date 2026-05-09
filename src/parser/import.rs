@@ -13,7 +13,6 @@ use chumsky::{
 use crate::{
     api::{
         ast::{Ident, Import},
-        expr::Expr,
         token::Token,
     },
     parser::helpers::TokenInput,
@@ -27,7 +26,8 @@ type SpannedImport<'src> = Spanned<
 >;
 
 pub fn import<'t, 'src: 't>()
--> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Expr<'src>>, Err<Rich<'t, Token<'src>>>> {
+-> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Rc<RefCell<Import<'src>>>>, Err<Rich<'t, Token<'src>>>>
+{
     let single_import = select_ref!(Token::Ident(n) = e =>
         Rc::new(RefCell::new(Import::Import(
             Ident::new(n).with_span(e.span()),
@@ -88,7 +88,6 @@ pub fn import<'t, 'src: 't>()
                 }
                 head.inner.borrow_mut().set_next(base);
             }
-            Expr::Import(head)
+            head
         })
-        .spanned()
 }

@@ -3,7 +3,7 @@ use chumsky::{
     error::Rich,
     extra::Err,
     input::Input,
-    pratt::{infix, left},
+    pratt::{infix, left, prefix},
     prelude::{choice, just, recursive},
     select_ref,
     span::{SpanWrap, Spanned},
@@ -34,11 +34,10 @@ pub fn expr<'t, 'src: 't>()
         let bool_false = just(Token::False).to(Expr::Bool(false));
         let bool_true = just(Token::True).to(Expr::Bool(true));
         let var = select_ref! {
-            Token::Ident(n) = e =>
-                Expr::Var(n, Type::Named(Ident::new("{}").with_span(e.span())))
+            Token::Ident(n) = _e => Expr::Var(n, Type::Unknown)
         };
         let self_kw = just(Token::SelfKw)
-            .map_with(|_, e| Expr::Var("self", Type::Named(Ident::new("{}").with_span(e.span()))));
+            .map_with(|_, _e| Expr::Var("self", Type::Unknown));
 
         let atom = choice((num, string_lit, bool_false, bool_true, self_kw, var));
 
@@ -229,6 +228,11 @@ pub fn expr<'t, 'src: 't>()
                 })
             })
             .pratt((
+                // Prefix unary minus.  Bind tighter than `*` so `-3 * 2`
+                // parses as `(-3) * 2` rather than `-(3 * 2)`.
+                prefix(11, just(Token::Minus), |_, x: Spanned<Expr<'src>>, e| {
+                    Expr::Neg(Box::new(x)).with_span(e.span())
+                }),
                 infix(left(10), just(Token::Star), |x, _, y, e| {
                     Expr::Mul(Box::new(x), Box::new(y)).with_span(e.span())
                 }),

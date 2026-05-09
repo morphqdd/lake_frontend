@@ -9,7 +9,7 @@ use chumsky::span::SimpleSpan;
 
 use crate::{
     api::{
-        ast::{Branch, Directive, Machine, MachineItem, Type},
+        ast::{Branch, Directive, Item, Machine, MachineItem, Type},
         expr::Expr,
     },
     error_handle::{LakeError, LakeErrors},
@@ -53,16 +53,16 @@ impl<'src> TypeChecker<'src> {
         }
     }
 
-    fn collect_signatures(&mut self, program: Vec<chumsky::span::Spanned<Expr<'src>>>) {
+    fn collect_signatures(&mut self, program: Vec<chumsky::span::Spanned<Item<'src>>>) {
         for item in program {
             match item.inner {
-                Expr::Machine(m) => {
+                Item::Machine(m) => {
                     self.collect_machine_sig(m.inner.ident.inner.0, m.inner);
                 }
-                Expr::Directive(d) => {
+                Item::Directive(d) => {
                     self.directives.insert(d.name.0, d.inner.clone());
                 }
-                _ => continue,
+                Item::Import(_) => continue,
             }
         }
     }
@@ -82,9 +82,9 @@ impl<'src> TypeChecker<'src> {
         self.machines.insert(name, sigs);
     }
 
-    fn check_program(&mut self, program: Vec<chumsky::span::Spanned<Expr<'src>>>) {
+    fn check_program(&mut self, program: Vec<chumsky::span::Spanned<Item<'src>>>) {
         for item in program {
-            if let Expr::Machine(m) = item.inner {
+            if let Item::Machine(m) = item.inner {
                 let machine_name = m.inner.ident.inner.0;
                 for machine_item in m.inner.items {
                     if let MachineItem::Branch(b) = machine_item.inner {
@@ -159,6 +159,10 @@ impl<'src> TypeChecker<'src> {
             Expr::Add(l, r) | Expr::Sub(l, r) | Expr::Mul(l, r) | Expr::Div(l, r) => {
                 self.check_arith_operand(machine_name, scope, *l);
                 self.check_arith_operand(machine_name, scope, *r);
+            }
+
+            Expr::Neg(inner) => {
+                self.check_arith_operand(machine_name, scope, *inner);
             }
 
             Expr::When { cond, branches } => {
@@ -239,14 +243,14 @@ impl<'src> TypeChecker<'src> {
         }
     }
 
-    /// Check that an arithmetic operand has a known (non-`{}`) type.
+    /// Check that an arithmetic operand has a known type.
     fn check_arith_operand(
         &mut self,
         machine_name: &'src str,
         scope: &HashMap<&'src str, Type<'src>>,
         operand: chumsky::span::Spanned<Expr<'src>>,
     ) {
-        if expr_type_str(&operand.inner) == "{}" {
+        if operand_type_unknown(&operand.inner) {
             self.errors.push(
                 LakeError::new("arithmetic on a value of unknown type", operand.span)
                     .code("E002")
@@ -259,12 +263,29 @@ impl<'src> TypeChecker<'src> {
     }
 }
 
-/// Build the signature of a branch from its non-wildcard, non-guard patterns.
+/// True when the operand's effective type cannot be determined, i.e. it is
+/// `Type::Unknown` or recurses into an unknown leaf.
+fn operand_type_unknown(expr: &Expr<'_>) -> bool {
+    match expr {
+        Expr::Var(_, ty) | Expr::Num(_, ty) | Expr::String(_, ty) => is_unknown(ty),
+        Expr::Add(l, _) | Expr::Sub(l, _) | Expr::Mul(l, _) | Expr::Div(l, _) => {
+            operand_type_unknown(&l.inner)
+        }
+        Expr::Neg(inner) => operand_type_unknown(&inner.inner),
+        _ => false,
+    }
+}
+
+/// Build the signature of a branch.  Wildcards (`_`) contribute nothing — they
+/// match anything, by any number — but literal guards (e.g. `0 i64`) DO carry
+/// a type and must be present in the signature, otherwise a branch that only
+/// has guard patterns appears to take no arguments and every call is reported
+/// as `E003` (no matching branch).
 fn branch_sig(branch: &Branch<'_>) -> BranchSig {
     let param_types = branch
         .patterns
         .iter()
-        .filter(|p| !p.inner.is_wildcard() && !p.inner.is_literal_guard())
+        .filter(|p| !p.inner.is_wildcard())
         .map(|p| p.inner.ty.inner.to_string())
         .collect();
     BranchSig { param_types }
@@ -281,6 +302,7 @@ fn expr_type_str(expr: &Expr<'_>) -> String {
         Expr::Add(l, _) | Expr::Sub(l, _) | Expr::Mul(l, _) | Expr::Div(l, _) => {
             expr_type_str(&l.inner)
         }
+        Expr::Neg(inner) => expr_type_str(&inner.inner),
         _ => "{}".to_string(),
     }
 }
@@ -288,7 +310,7 @@ fn expr_type_str(expr: &Expr<'_>) -> String {
 /// Type-check a **resolved** Lake program and return all diagnostics.
 ///
 /// Run [`crate::resolver::resolve`] on the AST before calling this.
-pub fn typecheck<'src>(program: Vec<chumsky::span::Spanned<Expr<'src>>>) -> LakeErrors {
+pub fn typecheck<'src>(program: Vec<chumsky::span::Spanned<Item<'src>>>) -> LakeErrors {
     let mut checker = TypeChecker::new();
     checker.collect_signatures(program.clone());
     checker.check_program(program);

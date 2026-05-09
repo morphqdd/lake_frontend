@@ -1,8 +1,8 @@
-use std::{cell::RefCell, hash::Hash, rc::Rc};
+use std::hash::Hash;
 
 use chumsky::span::Spanned;
 
-use crate::api::ast::{Branch, Directive, Ident, Import, Machine, Type};
+use crate::api::ast::{Branch, Ident, Type};
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum Expr<'src> {
@@ -69,6 +69,8 @@ pub enum Expr<'src> {
     Div(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Add(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Sub(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    /// Unary numeric negation: `-x` or `-7`.
+    Neg(Box<Spanned<Self>>),
 
     // ── Comparisons ───────────────────────────────────────────────────────
     Le(Box<Spanned<Self>>, Box<Spanned<Self>>),
@@ -77,10 +79,6 @@ pub enum Expr<'src> {
     Lt(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Gt(Box<Spanned<Self>>, Box<Spanned<Self>>),
 
-    // ── Top-level items ───────────────────────────────────────────────────
-    Import(Spanned<Rc<RefCell<Import<'src>>>>),
-    Machine(Spanned<Machine<'src>>),
-    Directive(Spanned<Directive<'src>>),
 }
 
 impl Hash for Expr<'_> {

@@ -2,21 +2,23 @@ use std::path::Path;
 
 use chumsky::{Parser, input::Input, span::Spanned};
 
+use crate::api::ast::Item;
 use crate::api::token::Token;
-use crate::{api::expr::Expr, error_handle::LakeErrors, lexer::lexer, parser::program};
+use crate::{error_handle::LakeErrors, lexer::lexer, parser::program};
 
 pub use crate::resolver::resolve;
 pub use crate::semantic::analyze;
 pub use crate::typeck::typecheck;
 
-/// Parse a Lake source file.  Returns the AST on success or a collection of
-/// errors that can be displayed with [`LakeErrors::display`].
+/// Parse a Lake source file.  Returns the AST (a flat list of top-level
+/// items) on success or a collection of errors that can be displayed with
+/// [`LakeErrors::display`].
 ///
 /// Lex errors are tagged `L001`; parse errors are tagged `P001`.
 pub fn parse<'src, P: AsRef<Path>>(
     _path: P,
     src: &'src str,
-) -> Result<Vec<Spanned<Expr<'src>>>, LakeErrors> {
+) -> Result<Vec<Spanned<Item<'src>>>, LakeErrors> {
     let tokens = lexer()
         .parse(src)
         .into_result()
@@ -38,7 +40,7 @@ pub fn build_ast<'src, P: AsRef<Path>>(
     _path: P,
     src: &'src str,
 ) -> Result<
-    (Vec<Spanned<Token<'src>>>, Vec<Spanned<Expr<'src>>>),
+    (Vec<Spanned<Token<'src>>>, Vec<Spanned<Item<'src>>>),
     (Vec<Spanned<Token<'src>>>, LakeErrors),
 > {
     let mut all_errors = LakeErrors::default();

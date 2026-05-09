@@ -16,3 +16,4 @@ pub mod prelude;
 pub mod resolver;
 pub mod semantic;
 pub mod typeck;
+pub mod visit;

@@ -3,19 +3,15 @@ use std::collections::HashMap;
 use chumsky::span::{SpanWrap, Spanned};
 
 use crate::api::{
-    ast::{Branch, Machine, MachineItem, Type},
+    ast::{Branch, Item, Machine, MachineItem, Type},
     expr::Expr,
 };
 
-/// Sentinel emitted by the parser for an unresolved variable reference type.
-const UNKNOWN_TY: &str = "{}";
-
+/// True when the parser emitted a placeholder type that the resolver needs to
+/// fill in.  `Type::Unit` (`{}` in source) is *not* unknown — it is a legitimate
+/// concrete type.
 pub(crate) fn is_unknown(ty: &Type<'_>) -> bool {
-    match ty {
-        Type::Unit => true,
-        Type::Named(ident) => ident.inner.0 == UNKNOWN_TY,
-        _ => false,
-    }
+    matches!(ty, Type::Unknown)
 }
 
 /// Walks a parsed Lake AST and fills in `{}` placeholder types on variable
@@ -88,6 +84,7 @@ impl<'src> Resolver<'src> {
                 Box::new(self.resolve_expr(*l)),
                 Box::new(self.resolve_expr(*r)),
             ),
+            Expr::Neg(inner) => Expr::Neg(Box::new(self.resolve_expr(*inner))),
 
             Expr::When { cond, branches } => {
                 let cond = Box::new(self.resolve_expr(*cond));
@@ -162,15 +159,15 @@ impl<'src> Resolver<'src> {
     }
 
     /// Resolve types in a complete parsed program.
-    pub fn resolve(&mut self, program: Vec<Spanned<Expr<'src>>>) -> Vec<Spanned<Expr<'src>>> {
+    pub fn resolve(&mut self, program: Vec<Spanned<Item<'src>>>) -> Vec<Spanned<Item<'src>>> {
         program
             .into_iter()
-            .map(|expr| {
-                let span = expr.span;
-                match expr.inner {
-                    Expr::Machine(m) => {
+            .map(|item| {
+                let span = item.span;
+                match item.inner {
+                    Item::Machine(m) => {
                         let machine_span = m.span;
-                        Expr::Machine(self.resolve_machine(m.inner).with_span(machine_span))
+                        Item::Machine(self.resolve_machine(m.inner).with_span(machine_span))
                             .with_span(span)
                     }
                     other => other.with_span(span),
@@ -181,7 +178,7 @@ impl<'src> Resolver<'src> {
 }
 
 /// Convenience wrapper: resolve types in a parsed Lake program.
-pub fn resolve<'src>(program: Vec<Spanned<Expr<'src>>>) -> Vec<Spanned<Expr<'src>>> {
+pub fn resolve<'src>(program: Vec<Spanned<Item<'src>>>) -> Vec<Spanned<Item<'src>>> {
     Resolver::new().resolve(program)
 }
 
@@ -192,14 +189,14 @@ mod tests {
     use super::resolve;
     use crate::{
         api::{
-            ast::{Ident, MachineItem, Type},
+            ast::{Ident, Item, MachineItem, Type},
             expr::Expr,
         },
         lexer::lexer,
         parser::program,
     };
 
-    fn parse_resolve(src: &str) -> Vec<chumsky::span::Spanned<Expr<'_>>> {
+    fn parse_resolve(src: &str) -> Vec<chumsky::span::Spanned<Item<'_>>> {
         let tokens = lexer().parse(src).into_result().expect("lex error");
         let ast = program()
             .parse(tokens[..].split_spanned((0..src.len()).into()))
@@ -210,7 +207,7 @@ mod tests {
 
     fn first_branch_body(src: &str) -> Vec<Expr<'_>> {
         let ast = parse_resolve(src);
-        let Expr::Machine(m) = &ast[0].inner else {
+        let Item::Machine(m) = &ast[0].inner else {
             panic!("expected Machine")
         };
         let MachineItem::Branch(b) = &m.inner.items[0].inner else {
@@ -280,7 +277,7 @@ mod tests {
         // `n` is in scope for the first branch but not the second.
         let src = "counter is { n i64 -> { n } _ -> { n } }";
         let ast = parse_resolve(src);
-        let Expr::Machine(m) = &ast[0].inner else {
+        let Item::Machine(m) = &ast[0].inner else {
             panic!()
         };
         // first branch: n should be i64
@@ -313,7 +310,7 @@ mod tests {
     fn resolves_var_in_wait_handler() {
         // `n` from the outer branch pattern should be accessible inside wait handler body
         let ast = parse_resolve("counter is { n i64 -> { wait { @inc amount i64 -> { n } } } }");
-        let Expr::Machine(m) = &ast[0].inner else {
+        let Item::Machine(m) = &ast[0].inner else {
             panic!()
         };
         let MachineItem::Branch(b) = &m.inner.items[0].inner else {
