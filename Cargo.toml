@@ -8,3 +8,6 @@ ariadne = { version = "0.6.0", features = ["auto-color"] }
 chumsky = { git="https://github.com/zesterer/chumsky.git", features = ["pratt"] }
 thiserror = "2.0.17"
 chrono = "0.4.44"
+
+[dev-dependencies]
+tempfile = "3"
