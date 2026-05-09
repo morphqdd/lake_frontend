@@ -42,6 +42,118 @@ use crate::lexer::lexer;
 use crate::parser::program;
 use crate::registry::ModulePath;
 
+// ── search paths ────────────────────────────────────────────────────────────
+
+/// Where the loader looks for a module file when resolving an `+import`
+/// directive.  Lookup order, first match wins:
+///
+///   1. **Project root** — entry file's parent directory.  Set by
+///      [`ProgramSources::load`] after construction; tests using
+///      [`ProgramSources::load_with_search`] may override.
+///   2. **Per-library `<NAME>_PATH` env var** — when the import path's
+///      first segment is `<name>`, the env var `<NAME_UPPER>_PATH` (if
+///      set) is treated as a root, and the FIRST segment is consumed by
+///      the env-var name.  Example: with `STD_PATH=/opt/lake/std` set,
+///      `+std.io.println` resolves to `/opt/lake/std/io.lake`.
+///   3. **`LAKE_PATH`** — colon-separated list of fallback root
+///      directories.  Each entry is tried with the FULL module path:
+///      `+std.io.println` → `<entry>/std/io.lake`.
+///
+/// Search paths are read from the process environment by
+/// [`SearchPaths::from_env`]; tests pass [`SearchPaths::default`] and
+/// populate fields manually.
+#[derive(Debug, Clone, Default)]
+pub struct SearchPaths {
+    /// Project root.  Always tried first.  Set by `load` after the
+    /// caller passes the entry file path.
+    pub project_root: Option<PathBuf>,
+    /// Per-library overrides keyed by the lowercased first import
+    /// segment.  Looked up via uppercase `<NAME>_PATH` env vars.
+    pub lib_roots: HashMap<String, PathBuf>,
+    /// Generic fallback list (`LAKE_PATH`).  Tried after `lib_roots`,
+    /// in declaration order.
+    pub lake_paths: Vec<PathBuf>,
+}
+
+impl SearchPaths {
+    /// Read `LAKE_PATH` and any matching `<NAME>_PATH` vars from the
+    /// process environment.  Project root is left unset — callers fill
+    /// it from the entry file's parent directory.
+    pub fn from_env() -> Self {
+        let mut sp = Self::default();
+        if let Ok(raw) = std::env::var("LAKE_PATH") {
+            for part in raw.split(':').filter(|p| !p.is_empty()) {
+                sp.lake_paths.push(PathBuf::from(part));
+            }
+        }
+        // Scan all env vars for `<NAME>_PATH` with NAME uppercase ASCII.
+        // We can't know in advance which library names a program will
+        // import, so we collect every `*_PATH` that fits the convention.
+        for (key, value) in std::env::vars() {
+            if let Some(prefix) = key.strip_suffix("_PATH") {
+                if prefix == "LAKE" {
+                    continue; // already handled above
+                }
+                if !prefix.is_empty()
+                    && prefix.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                {
+                    sp.lib_roots
+                        .insert(prefix.to_ascii_lowercase(), PathBuf::from(value));
+                }
+            }
+        }
+        sp
+    }
+
+    /// Try each registered root in order, returning the first existing
+    /// `.lake` file that resolves the given module path.  Returns
+    /// `None` (and the list of attempted candidates for diagnostics) if
+    /// nothing matches.
+    pub fn resolve(&self, module: &ModulePath) -> ResolveOutcome {
+        let mut tried = Vec::new();
+        if let Some(root) = &self.project_root {
+            let candidate = root.join(module.to_filesystem());
+            if candidate.is_file() {
+                return ResolveOutcome::Found(candidate);
+            }
+            tried.push(candidate);
+        }
+        // Per-lib root: first segment names the library, env var holds
+        // the directory the library's tree starts at.  The first
+        // segment is *consumed* by the var name — module path
+        // `std.io.println` under `STD_PATH=/x` resolves to `/x/io.lake`,
+        // not `/x/std/io.lake`.
+        if let Some(first) = module.0.first() {
+            if let Some(root) = self.lib_roots.get(first) {
+                let rest = ModulePath(module.0.iter().skip(1).cloned().collect());
+                if !rest.0.is_empty() {
+                    let candidate = root.join(rest.to_filesystem());
+                    if candidate.is_file() {
+                        return ResolveOutcome::Found(candidate);
+                    }
+                    tried.push(candidate);
+                }
+            }
+        }
+        for root in &self.lake_paths {
+            let candidate = root.join(module.to_filesystem());
+            if candidate.is_file() {
+                return ResolveOutcome::Found(candidate);
+            }
+            tried.push(candidate);
+        }
+        ResolveOutcome::NotFound { tried }
+    }
+}
+
+/// Outcome of a module-path resolution attempt.  `NotFound` carries the
+/// list of locations tried so diagnostics can show the user where the
+/// loader looked.
+pub enum ResolveOutcome {
+    Found(PathBuf),
+    NotFound { tried: Vec<PathBuf> },
+}
+
 // ── owned sources ──────────────────────────────────────────────────────────
 
 /// One file that has been read from disk.  Once a `LoadedFile` lands in
@@ -67,14 +179,28 @@ pub struct ProgramSources {
 impl ProgramSources {
     /// Load the entry file plus everything it transitively imports.
     /// `entry_path` may be relative or absolute; its **parent directory**
-    /// becomes the project root used for resolving `+core.io.writer`-style
-    /// imports to filesystem paths.
+    /// becomes the first search root for resolving `+core.io.writer`-style
+    /// imports.  Additional roots come from environment variables — see
+    /// [`SearchPaths::from_env`] for the full lookup order.
     pub fn load<P: AsRef<Path>>(entry_path: P) -> Result<Self, LakeErrors> {
+        Self::load_with_search(entry_path, SearchPaths::from_env())
+    }
+
+    /// Like [`Self::load`] but with an explicit [`SearchPaths`] — useful
+    /// for tests that want deterministic resolution without poking the
+    /// process environment.
+    pub fn load_with_search<P: AsRef<Path>>(
+        entry_path: P,
+        mut search: SearchPaths,
+    ) -> Result<Self, LakeErrors> {
         let entry_path = entry_path.as_ref().to_path_buf();
         let project_root = entry_path
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
+        // Project root is always the first place we look — prepend so it
+        // beats env vars on collision (familiar Cargo/Rust behaviour).
+        search.project_root = Some(project_root);
 
         let mut sources = ProgramSources::default();
         let mut in_progress: HashSet<ModulePath> = HashSet::new();
@@ -82,7 +208,7 @@ impl ProgramSources {
         sources.load_recursive(
             ModulePath::root(),
             entry_path,
-            &project_root,
+            &search,
             &mut in_progress,
         )?;
         Ok(sources)
@@ -138,7 +264,7 @@ impl ProgramSources {
         &mut self,
         module_path: ModulePath,
         source_path: PathBuf,
-        project_root: &Path,
+        search: &SearchPaths,
         in_progress: &mut HashSet<ModulePath>,
     ) -> Result<(), LakeErrors> {
         // Order matters: check in_progress BEFORE loaded.  A module is in
@@ -191,9 +317,13 @@ impl ProgramSources {
         };
 
         for sub in imports {
-            let sub_path = resolve_module_file(&sub, project_root)
-                .ok_or_else(|| LakeErrors::new(vec![module_not_found(&sub, project_root)]))?;
-            self.load_recursive(sub, sub_path, project_root, in_progress)?;
+            let sub_path = match search.resolve(&sub) {
+                ResolveOutcome::Found(p) => p,
+                ResolveOutcome::NotFound { tried } => {
+                    return Err(LakeErrors::new(vec![module_not_found(&sub, &tried)]));
+                }
+            };
+            self.load_recursive(sub, sub_path, search, in_progress)?;
         }
 
         // Mark loaded ONLY after every dependency finished — see the
@@ -305,18 +435,6 @@ fn collect_from_import(
     }
 }
 
-/// Resolve a [`ModulePath`] to an absolute filesystem path inside
-/// `project_root`.  Currently only the project root is searched; richer
-/// search paths land with #29.
-fn resolve_module_file(module: &ModulePath, project_root: &Path) -> Option<PathBuf> {
-    let candidate = project_root.join(module.to_filesystem());
-    if candidate.is_file() {
-        Some(candidate)
-    } else {
-        None
-    }
-}
-
 // ── error helpers ──────────────────────────────────────────────────────────
 
 fn cycle_error(path: &ModulePath) -> LakeError {
@@ -329,17 +447,26 @@ fn cycle_error(path: &ModulePath) -> LakeError {
     .help("break the cycle by removing one of the import edges")
 }
 
-fn module_not_found(module: &ModulePath, project_root: &Path) -> LakeError {
+fn module_not_found(module: &ModulePath, tried: &[PathBuf]) -> LakeError {
+    let tried_list = if tried.is_empty() {
+        "(no search paths configured)".to_string()
+    } else {
+        tried
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     LakeError::new(
         format!(
-            "module `{}` not found (looked for `{}` under `{}`)",
+            "module `{}` not found (looked for `{}`)",
             module.display(),
             module.to_filesystem().display(),
-            project_root.display()
         ),
         (0..0).into(),
     )
     .code("M002")
+    .note(format!("tried:\n{tried_list}"))
     .help(
         "create the missing file, or set LAKE_PATH / <name>_PATH to point at the directory \
          containing the library",
@@ -442,6 +569,83 @@ mod tests {
             .filter(|f| f.module_path.display() == "core.io")
             .count();
         assert_eq!(count, 1, "core.io should be loaded once");
+    }
+
+    #[test]
+    fn search_paths_per_lib_root_consumes_first_segment() {
+        let dir = TempDir::new().unwrap();
+        // STD_PATH points at <dir>/lake-std; module `std.io` resolves to
+        // `<dir>/lake-std/io.lake` (the `std` segment is consumed by the
+        // env var name).
+        write_file(&dir, "lake-std/io.lake", "pub println is { s str -> { } }");
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "+std.io.println\nmain is { _ -> { } }",
+        );
+        let mut search = SearchPaths::default();
+        search.lib_roots.insert(
+            "std".to_string(),
+            dir.path().join("lake-std"),
+        );
+        let sources = ProgramSources::load_with_search(&main, search).expect("loads");
+        assert!(
+            sources
+                .files()
+                .iter()
+                .any(|f| f.module_path.display() == "std.io"),
+            "should find std.io via lib root"
+        );
+    }
+
+    #[test]
+    fn search_paths_lake_path_keeps_full_path() {
+        let dir = TempDir::new().unwrap();
+        // LAKE_PATH points at a generic search root; full module path
+        // including the first segment is appended.
+        write_file(
+            &dir,
+            "extra/std/io.lake",
+            "pub println is { s str -> { } }",
+        );
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "+std.io.println\nmain is { _ -> { } }",
+        );
+        let mut search = SearchPaths::default();
+        search.lake_paths.push(dir.path().join("extra"));
+        let sources = ProgramSources::load_with_search(&main, search).expect("loads");
+        assert!(
+            sources
+                .files()
+                .iter()
+                .any(|f| f.module_path.display() == "std.io"),
+            "should find std.io via LAKE_PATH"
+        );
+    }
+
+    #[test]
+    fn search_paths_project_root_wins_over_env() {
+        let dir = TempDir::new().unwrap();
+        // Both project root and LAKE_PATH have a `std/io.lake`; the
+        // project-root version wins.
+        write_file(&dir, "std/io.lake", "pub LOCAL is { _ -> { } }");
+        write_file(
+            &dir,
+            "extra/std/io.lake",
+            "pub REMOTE is { _ -> { } }",
+        );
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "+std.io.LOCAL\nmain is { _ -> { } }",
+        );
+        let mut search = SearchPaths::default();
+        search.lake_paths.push(dir.path().join("extra"));
+        // Looking for `LOCAL` — only present in the project-root copy.
+        let result = ProgramSources::load_with_search(&main, search);
+        assert!(result.is_ok(), "project root copy should resolve");
     }
 
     #[test]
