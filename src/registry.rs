@@ -264,6 +264,28 @@ impl<'src> ProgramRegistry<'src> {
         None
     }
 
+    /// Resolve a bare name against a specific module's scope, without
+    /// mutating `self.current`.  Same lookup chain as
+    /// [`Self::resolve_bare`], but the caller picks which module's scope
+    /// to use — convenient for multi-pass walks that visit multiple
+    /// modules through an immutable registry borrow.
+    pub fn resolve_bare_in(&self, current: ModuleId, name: &str) -> Option<Resolution<'_>> {
+        if let Some(sig) = self.rt_fns.get(name) {
+            return Some(Resolution::Rt(sig));
+        }
+        let cur = self.module(current);
+        if let Some(m) = cur.machines.get(name) {
+            return Some(Resolution::Machine(m));
+        }
+        if let Some(sig) = cur.ffi_fns.get(name) {
+            return Some(Resolution::Ffi(sig));
+        }
+        if let Some(binding) = cur.imports.get(name) {
+            return self.resolve_in_module(binding.target_module, &binding.target_item);
+        }
+        None
+    }
+
     /// Resolve `name` in a specific module.  Used by inline qualified paths
     /// (`core:io:writer`) and to follow import bindings.  Skips imports of
     /// the target module — those are private to that module.

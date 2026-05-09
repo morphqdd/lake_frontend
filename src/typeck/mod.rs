@@ -1,93 +1,50 @@
 //! Type checker for Lake.
 //!
-//! Runs on the **resolved** AST (after [`crate::resolver::resolve`]) and emits
-//! [`LakeError`]s. For the full list of error codes see `ERROR_CODES.md`.
+//! Runs on the **resolved** AST (after [`crate::resolver::resolve_program`]) and
+//! emits [`LakeError`]s. For the full list of error codes see `ERROR_CODES.md`.
+//!
+//! Signature lookup is delegated to [`ProgramRegistry`]: rt fns, machines,
+//! ffi declarations and import bindings all flow through one entry point so
+//! the checker doesn't maintain its own parallel symbol tables.
 
 use std::collections::HashMap;
 
-use chumsky::span::SimpleSpan;
+use chumsky::span::{SimpleSpan, Spanned};
 
 use crate::{
     api::{
-        ast::{Branch, Directive, Item, Machine, MachineItem, Type},
+        ast::{Branch, Item, MachineItem, Type},
         expr::Expr,
     },
     error_handle::{LakeError, LakeErrors},
+    loader::ParsedProgram,
+    registry::{ModuleId, ModulePath, ProgramRegistry, Resolution, Signature},
     resolver::is_unknown,
 };
 
-/// The type-string of each non-default, non-wildcard parameter in a branch.
-#[derive(Debug, Clone)]
-struct BranchSig {
-    param_types: Vec<String>,
-}
-
-impl BranchSig {
-    fn matches_arg_types(&self, arg_types: &[String]) -> bool {
-        self.param_types == arg_types
-    }
-
-    fn display(&self) -> String {
-        if self.param_types.is_empty() {
-            "_".to_string()
-        } else {
-            self.param_types.join(" ")
-        }
-    }
-}
-
-/// Single-pass type checker.
-pub struct TypeChecker<'src> {
-    /// All machine signatures collected in pass 1.
-    machines: HashMap<&'src str, Vec<BranchSig>>,
-    directives: HashMap<&'src str, Directive<'src>>,
+/// Single-module type checker.  Borrows the program registry — every
+/// signature lookup goes through there.
+pub struct TypeChecker<'src, 'r> {
+    registry: &'r ProgramRegistry<'src>,
+    current_module: ModuleId,
     errors: Vec<LakeError>,
 }
 
-impl<'src> TypeChecker<'src> {
-    fn new() -> Self {
+impl<'src, 'r> TypeChecker<'src, 'r> {
+    pub fn new(registry: &'r ProgramRegistry<'src>, current_module: ModuleId) -> Self {
         Self {
-            machines: HashMap::new(),
-            directives: HashMap::new(),
-            errors: vec![],
+            registry,
+            current_module,
+            errors: Vec::new(),
         }
     }
 
-    fn collect_signatures(&mut self, program: Vec<chumsky::span::Spanned<Item<'src>>>) {
-        for item in program {
-            match item.inner {
-                Item::Machine(m) => {
-                    self.collect_machine_sig(m.inner.ident.inner.0, m.inner);
-                }
-                Item::Directive(d) => {
-                    self.directives.insert(d.name.0, d.inner.clone());
-                }
-                Item::Import(_) => continue,
-            }
-        }
-    }
-
-    fn collect_machine_sig(&mut self, name: &'src str, machine: Machine<'src>) {
-        let sigs = machine
-            .items
-            .iter()
-            .filter_map(|item| {
-                if let MachineItem::Branch(b) = &item.inner {
-                    Some(branch_sig(b))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        self.machines.insert(name, sigs);
-    }
-
-    fn check_program(&mut self, program: Vec<chumsky::span::Spanned<Item<'src>>>) {
-        for item in program {
-            if let Item::Machine(m) = item.inner {
+    pub fn check_module(&mut self, items: &[Spanned<Item<'src>>]) {
+        for item in items {
+            if let Item::Machine(m) = &item.inner {
                 let machine_name = m.inner.ident.inner.0;
-                for machine_item in m.inner.items {
-                    if let MachineItem::Branch(b) = machine_item.inner {
+                for machine_item in &m.inner.items {
+                    if let MachineItem::Branch(b) = &machine_item.inner {
                         self.check_branch(machine_name, b);
                     }
                 }
@@ -95,16 +52,29 @@ impl<'src> TypeChecker<'src> {
         }
     }
 
-    fn check_branch(&mut self, machine_name: &'src str, branch: Branch<'src>) {
+    pub fn into_errors(self) -> Vec<LakeError> {
+        self.errors
+    }
+
+    fn check_branch(&mut self, machine_name: &'src str, branch: &Branch<'src>) {
         let mut scope: HashMap<&'src str, Type<'src>> = HashMap::new();
-        for pat in branch.patterns {
+        for pat in &branch.patterns {
             if !pat.inner.is_wildcard() {
-                scope.insert(pat.inner.ident.inner.0, pat.inner.ty.inner);
+                scope.insert(pat.inner.ident.inner.0, pat.inner.ty.inner.clone());
             }
         }
-
-        for expr in branch.body {
-            self.check_expr(machine_name, &scope, expr.inner, expr.span);
+        // Pre-seed the scope with every `let` binding in the branch body.
+        // Without this `p(msg)` after `let p pid = ...` is incorrectly
+        // reported as an unknown callable on the second pass through the
+        // body (we walk top-down and the binding hasn't been recorded yet
+        // when the call is encountered downstream).  This is also what
+        // matches the resolver's behaviour, which already filled the
+        // post-let types on every Var reference.
+        for expr in &branch.body {
+            collect_let_bindings(&expr.inner, &mut scope);
+        }
+        for expr in &branch.body {
+            self.check_expr(machine_name, &scope, &expr.inner, expr.span);
         }
     }
 
@@ -112,7 +82,7 @@ impl<'src> TypeChecker<'src> {
         &mut self,
         machine_name: &'src str,
         scope: &HashMap<&'src str, Type<'src>>,
-        expr: Expr<'src>,
+        expr: &Expr<'src>,
         span: SimpleSpan,
     ) {
         match expr {
@@ -120,10 +90,16 @@ impl<'src> TypeChecker<'src> {
                 // `self` is a keyword (always in scope) and `_` is the
                 // wildcard pattern (legal as a `when` arm and as a branch
                 // parameter; never refers to an actual binding).
-                if name == "self" || name == "_" {
+                if *name == "self" || *name == "_" {
                     return;
                 }
-                if is_unknown(&ty) && !scope.contains_key(name) {
+                // First check local scope; if not bound and the resolver
+                // left the type unknown, the name escapes scope.
+                if scope.contains_key(name) {
+                    return;
+                }
+                if is_unknown(ty) && self.registry.resolve_bare_in(self.current_module, name).is_none()
+                {
                     self.errors.push(
                         LakeError::new(format!("undeclared variable `{name}`"), span)
                             .code("E001")
@@ -139,41 +115,31 @@ impl<'src> TypeChecker<'src> {
                 default: Some(default),
                 ..
             } => {
-                self.check_expr(machine_name, scope, default.inner, default.span);
+                self.check_expr(machine_name, scope, &default.inner, default.span);
             }
 
             Expr::Jump { ident, args } => {
-                for arg in args.clone() {
-                    self.check_expr(machine_name, scope, arg.inner, arg.span);
+                for arg in args {
+                    self.check_expr(machine_name, scope, &arg.inner, arg.span);
                 }
-
-                if let Expr::Var("self", _) = ident.inner.clone() {
-                    self.check_call(machine_name, args.clone(), span, true);
-                }
-
-                if let Expr::Var(ident, _) = ident.inner {
-                    if self.directives.contains_key(ident) {
-                        return;
-                    }
-                    self.check_call(ident, args, span, false);
-                }
+                self.check_jump(machine_name, scope, ident, args, span);
             }
 
             Expr::Add(l, r) | Expr::Sub(l, r) | Expr::Mul(l, r) | Expr::Div(l, r) => {
-                self.check_arith_operand(machine_name, scope, *l);
-                self.check_arith_operand(machine_name, scope, *r);
+                self.check_arith_operand(machine_name, scope, l);
+                self.check_arith_operand(machine_name, scope, r);
             }
 
             Expr::Neg(inner) => {
-                self.check_arith_operand(machine_name, scope, *inner);
+                self.check_arith_operand(machine_name, scope, inner);
             }
 
             Expr::When { cond, branches } => {
-                self.check_expr(machine_name, scope, cond.inner, cond.span);
+                self.check_expr(machine_name, scope, &cond.inner, cond.span);
                 for (pat, body) in branches {
-                    self.check_expr(machine_name, scope, pat.inner, pat.span);
+                    self.check_expr(machine_name, scope, &pat.inner, pat.span);
                     for e in body {
-                        self.check_expr(machine_name, scope, e.inner, e.span);
+                        self.check_expr(machine_name, scope, &e.inner, e.span);
                     }
                 }
             }
@@ -188,7 +154,7 @@ impl<'src> TypeChecker<'src> {
                         }
                     }
                     for e in &handler.inner.body {
-                        self.check_expr(machine_name, &handler_scope, e.inner.clone(), e.span);
+                        self.check_expr(machine_name, &handler_scope, &e.inner, e.span);
                     }
                 }
             }
@@ -197,52 +163,149 @@ impl<'src> TypeChecker<'src> {
         }
     }
 
-    fn check_call(
+    /// Validate a `Jump { ident, args }`.  Splits the work by callee shape:
+    /// `self()`, bare-name calls (rt / machine / ffi / import), and inline
+    /// module-qualified `core:io:writer(...)`.
+    fn check_jump(
         &mut self,
         machine_name: &'src str,
-        args: Vec<chumsky::span::Spanned<Expr<'src>>>,
+        scope: &HashMap<&'src str, Type<'src>>,
+        ident: &Spanned<Expr<'src>>,
+        args: &[Spanned<Expr<'src>>],
+        call_span: SimpleSpan,
+    ) {
+        let arg_types: Vec<String> = args.iter().map(|a| self.expr_type_str(&a.inner)).collect();
+
+        match &ident.inner {
+            Expr::Var("self", _) => {
+                // `self(...)` validates against the *enclosing* machine's
+                // branches.
+                self.validate_machine_call(machine_name, &arg_types, call_span, true);
+            }
+            Expr::Var(callee_name, _) => {
+                // A name bound in the local scope is either a regular
+                // value or a `pid`.  pid-typed vars are *message sends*
+                // (`po(msg)` → push to po's mailbox), not function calls;
+                // arity / typing for those is dynamic at the runtime
+                // level and out of this pass's reach, so we skip them.
+                if scope.contains_key(callee_name) {
+                    return;
+                }
+                let resolution = self.registry.resolve_bare_in(self.current_module, callee_name);
+                self.validate_resolution(callee_name, resolution, &arg_types, call_span);
+            }
+            Expr::Path(segments) => {
+                if segments.len() < 2 {
+                    return;
+                }
+                let module_segs: Vec<String> = segments[..segments.len() - 1]
+                    .iter()
+                    .map(|s| s.inner.0.to_string())
+                    .collect();
+                let item_name = segments.last().expect("len >= 2").inner.0;
+                let display_path = segments
+                    .iter()
+                    .map(|s| s.inner.0)
+                    .collect::<Vec<_>>()
+                    .join(":");
+                let module_path = ModulePath(module_segs);
+                let Some(target_id) = self.registry.module_id_for_path(&module_path) else {
+                    self.errors.push(
+                        LakeError::new(
+                            format!("unknown module `{}`", module_path.display()),
+                            call_span,
+                        )
+                        .code("M005"),
+                    );
+                    return;
+                };
+                let resolution = self.registry.resolve_in_module(target_id, item_name);
+                self.validate_resolution(&display_path, resolution, &arg_types, call_span);
+            }
+            _ => {
+                // Other callee shapes (DotAccess, MethodCall, …) — not
+                // type-checked by this pass.
+            }
+        }
+    }
+
+    fn validate_resolution(
+        &mut self,
+        display_name: &str,
+        resolution: Option<Resolution<'_>>,
+        arg_types: &[String],
+        call_span: SimpleSpan,
+    ) {
+        match resolution {
+            Some(Resolution::Rt(sig)) | Some(Resolution::Ffi(sig)) => {
+                if !sig_matches_args(sig, arg_types) {
+                    self.errors.push(no_match_error(
+                        display_name,
+                        std::slice::from_ref(sig),
+                        arg_types,
+                        call_span,
+                        false,
+                    ));
+                }
+            }
+            Some(Resolution::Machine(m)) => {
+                let any_match = m.branches.iter().any(|b| sig_matches_args(b, arg_types));
+                if !any_match {
+                    self.errors.push(no_match_error(
+                        display_name,
+                        &m.branches,
+                        arg_types,
+                        call_span,
+                        false,
+                    ));
+                }
+            }
+            None => {
+                // Unknown name — surface as an explicit "no such callable"
+                // error.  Cheaper than waiting for codegen to fail.
+                self.errors.push(
+                    LakeError::new(
+                        format!("no callable named `{display_name}` in scope"),
+                        call_span,
+                    )
+                    .code("E004")
+                    .help(
+                        "declare it as `@rt(name)`, `@ffi(name { params } { ret })`, \
+                         a machine, or import it from another module",
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Validate a self-call against the current machine's branches.  Falls
+    /// through silently if the machine isn't registered (only happens when
+    /// the program failed to populate the registry — earlier errors will
+    /// have been reported).
+    fn validate_machine_call(
+        &mut self,
+        machine_name: &str,
+        arg_types: &[String],
         call_span: SimpleSpan,
         is_self: bool,
     ) {
-        let arg_types: Vec<String> = args.iter().map(|a| expr_type_str(&a.inner)).collect();
-
-        let Some(sigs) = self.machines.get(machine_name) else {
+        let Some(entry) = self.registry.module(self.current_module).machines.get(machine_name)
+        else {
             return;
         };
-
-        let matches = sigs.iter().any(|s| s.matches_arg_types(&arg_types));
-        if !matches {
-            let branch_list = sigs
-                .iter()
-                .map(|s| format!("`{}`", s.display()))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            let call_sig = if arg_types.is_empty() {
-                "_".to_string()
-            } else {
-                arg_types.join(" ")
-            };
-
-            let callee = if is_self { "self" } else { machine_name };
-
-            self.errors.push(
-                LakeError::with_label_msg(
-                    format!(
-                        "no branch of `{machine_name}` matches the call `{callee}({call_sig})`"
-                    ),
-                    call_span,
-                    format!("no branch accepts ({call_sig})"),
-                )
-                .code("E003")
-                .note(format!(
-                    "available branch signatures for `{machine_name}`: {branch_list}"
-                ))
-                .help(
-                    "add a branch whose parameter types match the argument types, \
-                     or fix the argument types",
-                ),
-            );
+        let any_match = entry
+            .branches
+            .iter()
+            .any(|b| sig_matches_args(b, arg_types));
+        if !any_match {
+            let display = if is_self { "self" } else { machine_name };
+            self.errors.push(no_match_error(
+                machine_name,
+                &entry.branches,
+                arg_types,
+                call_span,
+                is_self,
+            ).label_callee(display));
         }
     }
 
@@ -251,7 +314,7 @@ impl<'src> TypeChecker<'src> {
         &mut self,
         machine_name: &'src str,
         scope: &HashMap<&'src str, Type<'src>>,
-        operand: chumsky::span::Spanned<Expr<'src>>,
+        operand: &Spanned<Expr<'src>>,
     ) {
         if operand_type_unknown(&operand.inner) {
             self.errors.push(
@@ -261,8 +324,179 @@ impl<'src> TypeChecker<'src> {
                     .help("declare the variable in the branch parameters with a concrete type"),
             );
         }
+        self.check_expr(machine_name, scope, &operand.inner, operand.span);
+    }
 
-        self.check_expr(machine_name, scope, operand.inner, operand.span);
+    /// Type-display for an expression used as a call argument.  `"?"` means
+    /// the resolver / inferer hasn't decided.
+    fn expr_type_str(&self, expr: &Expr<'_>) -> String {
+        match expr {
+            Expr::Var(_, ty) => ty.to_string(),
+            Expr::Num(_, ty) => ty.to_string(),
+            Expr::String(_, ty) => ty.to_string(),
+            Expr::Bool(_) => "bool".to_string(),
+            Expr::Add(l, _) | Expr::Sub(l, _) | Expr::Mul(l, _) | Expr::Div(l, _) => {
+                self.expr_type_str(&l.inner)
+            }
+            Expr::Neg(inner) => self.expr_type_str(&inner.inner),
+            Expr::Eq(_, _)
+            | Expr::Le(_, _)
+            | Expr::Ge(_, _)
+            | Expr::Lt(_, _)
+            | Expr::Gt(_, _) => "i64".to_string(),
+            Expr::Jump { ident, .. } => match &ident.inner {
+                Expr::Var(name, _) => self
+                    .registry
+                    .resolve_bare_in(self.current_module, name)
+                    .map(|r| r.return_type().to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                Expr::Path(segments) if segments.len() >= 2 => {
+                    let module_segs: Vec<String> = segments[..segments.len() - 1]
+                        .iter()
+                        .map(|s| s.inner.0.to_string())
+                        .collect();
+                    let item = segments.last().expect("len >= 2").inner.0;
+                    self.registry
+                        .module_id_for_path(&ModulePath(module_segs))
+                        .and_then(|id| self.registry.resolve_in_module(id, item))
+                        .map(|r| r.return_type().to_string())
+                        .unwrap_or_else(|| "?".to_string())
+                }
+                _ => "?".to_string(),
+            },
+            _ => "?".to_string(),
+        }
+    }
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+fn sig_matches_args(sig: &Signature, args: &[String]) -> bool {
+    sig.params == args
+}
+
+fn display_sig(sig: &Signature) -> String {
+    if sig.params.is_empty() {
+        "_".to_string()
+    } else {
+        sig.params.join(" ")
+    }
+}
+
+fn no_match_error(
+    machine_name: &str,
+    sigs: &[Signature],
+    arg_types: &[String],
+    call_span: SimpleSpan,
+    _is_self: bool,
+) -> LakeError {
+    let branch_list = sigs
+        .iter()
+        .map(|s| format!("`{}`", display_sig(s)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let call_sig = if arg_types.is_empty() {
+        "_".to_string()
+    } else {
+        arg_types.join(" ")
+    };
+
+    LakeError::with_label_msg(
+        format!("no branch of `{machine_name}` matches the call `{machine_name}({call_sig})`"),
+        call_span,
+        format!("no branch accepts ({call_sig})"),
+    )
+    .code("E003")
+    .note(format!(
+        "available branch signatures for `{machine_name}`: {branch_list}"
+    ))
+    .help(
+        "add a branch whose parameter types match the argument types, \
+         or fix the argument types",
+    )
+}
+
+trait LakeErrorExt {
+    fn label_callee(self, callee: &str) -> LakeError;
+}
+
+impl LakeErrorExt for LakeError {
+    /// Replace the headline's machine name with `callee` (e.g. swap to
+    /// `self` for self-calls).  Cheaper than threading a flag through
+    /// `no_match_error` parameters.
+    fn label_callee(mut self, callee: &str) -> Self {
+        if callee != "self" {
+            return self;
+        }
+        // Replace "matches the call `name(...)`" → "matches the call `self(...)`"
+        let original = std::mem::take(&mut self.message);
+        if let Some(start) = original.find("matches the call `") {
+            let prefix_end = start + "matches the call `".len();
+            if let Some(paren) = original[prefix_end..].find('(') {
+                let absolute_paren = prefix_end + paren;
+                let mut new_msg = String::with_capacity(original.len());
+                new_msg.push_str(&original[..prefix_end]);
+                new_msg.push_str(callee);
+                new_msg.push_str(&original[absolute_paren..]);
+                self.message = new_msg;
+                return self;
+            }
+        }
+        self.message = original;
+        self
+    }
+}
+
+/// Walk an expression tree and add every `let`-introduced binding to
+/// `scope`.  Recurses into bodies of when arms / wait handlers so a
+/// `let` nested inside a control-flow construct is still visible to a
+/// later sibling expression.
+fn collect_let_bindings<'src>(
+    expr: &Expr<'src>,
+    scope: &mut HashMap<&'src str, Type<'src>>,
+) {
+    match expr {
+        Expr::Let { ident, ty, default } => {
+            scope.insert(ident.inner.0, ty.inner.clone());
+            if let Some(d) = default {
+                collect_let_bindings(&d.inner, scope);
+            }
+        }
+        Expr::Jump { ident, args } => {
+            collect_let_bindings(&ident.inner, scope);
+            for a in args {
+                collect_let_bindings(&a.inner, scope);
+            }
+        }
+        Expr::Add(l, r)
+        | Expr::Sub(l, r)
+        | Expr::Mul(l, r)
+        | Expr::Div(l, r)
+        | Expr::Eq(l, r)
+        | Expr::Le(l, r)
+        | Expr::Ge(l, r)
+        | Expr::Lt(l, r)
+        | Expr::Gt(l, r) => {
+            collect_let_bindings(&l.inner, scope);
+            collect_let_bindings(&r.inner, scope);
+        }
+        Expr::Neg(inner) => collect_let_bindings(&inner.inner, scope),
+        Expr::When { cond, branches } => {
+            collect_let_bindings(&cond.inner, scope);
+            for (_, body) in branches {
+                for e in body {
+                    collect_let_bindings(&e.inner, scope);
+                }
+            }
+        }
+        Expr::Wait { handlers } => {
+            for h in handlers {
+                for e in &h.inner.body {
+                    collect_let_bindings(&e.inner, scope);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -279,77 +513,96 @@ fn operand_type_unknown(expr: &Expr<'_>) -> bool {
     }
 }
 
-/// Build the signature of a branch.  Wildcards (`_`) contribute nothing — they
-/// match anything, by any number — but literal guards (e.g. `0 i64`) DO carry
-/// a type and must be present in the signature, otherwise a branch that only
-/// has guard patterns appears to take no arguments and every call is reported
-/// as `E003` (no matching branch).
-fn branch_sig(branch: &Branch<'_>) -> BranchSig {
-    let param_types = branch
-        .patterns
-        .iter()
-        .filter(|p| !p.inner.is_wildcard())
-        .map(|p| p.inner.ty.inner.to_string())
-        .collect();
-    BranchSig { param_types }
-}
+// ── public entry points ────────────────────────────────────────────────────
 
-/// Return the display type string for an expression used as a call argument.
-/// `"{}"` means "unknown / unresolved".
-fn expr_type_str(expr: &Expr<'_>) -> String {
-    match expr {
-        Expr::Var(_, ty) => ty.to_string(),
-        Expr::Num(_, ty) => ty.to_string(),
-        Expr::String(_, ty) => ty.to_string(),
-        Expr::Bool(_) => "bool".to_string(),
-        Expr::Add(l, _) | Expr::Sub(l, _) | Expr::Mul(l, _) | Expr::Div(l, _) => {
-            expr_type_str(&l.inner)
-        }
-        Expr::Neg(inner) => expr_type_str(&inner.inner),
-        _ => "{}".to_string(),
+/// Run the type checker over a single-file Lake program.  Used by callers
+/// that didn't construct a [`ProgramRegistry`] (mostly tests / older
+/// integrations); a fresh registry is built and discarded.
+pub fn typecheck<'src>(program: Vec<Spanned<Item<'src>>>) -> LakeErrors {
+    let parsed = ParsedProgram {
+        modules: vec![crate::loader::ParsedModule {
+            module_path: ModulePath::root(),
+            source_path: std::path::PathBuf::from("<inline>"),
+            ast: program,
+        }],
+    };
+    let mut reg: ProgramRegistry<'src> = ProgramRegistry::with_rt();
+    if let Err(errs) = reg.populate_from(&parsed) {
+        return errs;
     }
+    let mut all = Vec::new();
+    for m in &parsed.modules {
+        let id = reg.module_id_for_path(&m.module_path).expect("populated");
+        let mut checker = TypeChecker::new(&reg, id);
+        checker.check_module(&m.ast);
+        all.extend(checker.into_errors());
+    }
+    LakeErrors::new(all)
 }
 
-/// Type-check a **resolved** Lake program and return all diagnostics.
-///
-/// Run [`crate::resolver::resolve`] on the AST before calling this.
-pub fn typecheck<'src>(program: Vec<chumsky::span::Spanned<Item<'src>>>) -> LakeErrors {
-    let mut checker = TypeChecker::new();
-    checker.collect_signatures(program.clone());
-    checker.check_program(program);
-    LakeErrors::new(checker.errors)
+/// Multi-module entry point: typecheck every module of a [`ParsedProgram`]
+/// against a populated [`ProgramRegistry`].  All diagnostics are
+/// accumulated into a single [`LakeErrors`].
+pub fn typecheck_program<'src>(
+    program: &ParsedProgram<'src>,
+    registry: &ProgramRegistry<'src>,
+) -> LakeErrors {
+    let mut all = Vec::new();
+    for module in &program.modules {
+        let id = registry
+            .module_id_for_path(&module.module_path)
+            .expect("registry must be populated before typecheck");
+        let mut checker = TypeChecker::new(registry, id);
+        checker.check_module(&module.ast);
+        all.extend(checker.into_errors());
+    }
+    LakeErrors::new(all)
 }
 
 #[cfg(test)]
 mod tests {
     use chumsky::{Parser, input::Input};
 
-    use super::typecheck;
-    use crate::{lexer::lexer, parser::program, resolver::resolve};
+    use super::{typecheck_program, ParsedProgram};
+    use crate::{
+        lexer::lexer,
+        parser::program,
+        registry::{ModulePath, ProgramRegistry},
+        resolver::resolve_program,
+    };
 
-    fn check(src: &str) -> Vec<String> {
+    /// Run the full pipeline (parse → populate → resolve_program → typecheck)
+    /// on a single-file source, returning every diagnostic message.
+    fn run_pipeline(src: &str) -> Vec<crate::error_handle::LakeError> {
         let tokens = lexer().parse(src).into_result().expect("lex error");
         let ast = program()
             .parse(tokens[..].split_spanned((0..src.len()).into()))
             .into_result()
             .expect("parse error");
-        let resolved = resolve(ast);
-        typecheck(resolved)
-            .0
+
+        let parsed = ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("<inline>"),
+                ast,
+            }],
+        };
+
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&parsed).expect("populate");
+        let resolved = resolve_program(parsed, &mut reg);
+        typecheck_program(&resolved, &reg).0
+    }
+
+    fn check(src: &str) -> Vec<String> {
+        run_pipeline(src)
             .into_iter()
             .map(|e| e.message)
             .collect()
     }
 
     fn check_codes(src: &str) -> Vec<String> {
-        let tokens = lexer().parse(src).into_result().expect("lex error");
-        let ast = program()
-            .parse(tokens[..].split_spanned((0..src.len()).into()))
-            .into_result()
-            .expect("parse error");
-        let resolved = resolve(ast);
-        typecheck(resolved)
-            .0
+        run_pipeline(src)
             .into_iter()
             .map(|e| e.code.unwrap_or_default())
             .collect()
@@ -422,5 +675,35 @@ mod tests {
     fn e003_code_is_set() {
         let codes = check_codes("counter is { n i64 -> { self() } }");
         assert!(codes.iter().any(|c| c == "E003"), "codes: {codes:?}");
+    }
+
+    // ── E004: unknown callable ────────────────────────────────────────────────
+
+    #[test]
+    fn e004_unknown_callable() {
+        let codes = check_codes("main is { _ -> { not_a_thing(1) } }");
+        assert!(
+            codes.iter().any(|c| c == "E004"),
+            "expected E004, got {codes:?}"
+        );
+    }
+
+    // ── rt fn return-type lookup ──────────────────────────────────────────────
+
+    #[test]
+    fn rt_return_type_is_known() {
+        // `rt_listen_tcp(80)` returns i64 per the registry.  `let s = ...`
+        // should therefore type s as i64; calling `f(s)` against a
+        // single-i64-branch machine should typecheck.
+        let src = r#"
+            @rt(rt_listen_tcp)
+            f is { x i64 -> { } }
+            main is { _ -> {
+              let s = rt_listen_tcp(80)
+              f(s)
+            } }
+        "#;
+        let errs = check(src);
+        assert!(errs.is_empty(), "unexpected: {errs:?}");
     }
 }
