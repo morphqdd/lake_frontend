@@ -33,9 +33,34 @@ pub fn expr<'t, 'src: 't>()
         };
         let bool_false = just(Token::False).to(Expr::Bool(false));
         let bool_true = just(Token::True).to(Expr::Bool(true));
+        // A bare ident becomes `Expr::Var`; an ident followed by one or
+        // more `:ident` segments becomes `Expr::Path` (module-qualified
+        // value).  Single-segment paths collapse to `Var` so the rest of
+        // the pipeline (resolver, typeck, codegen) can continue treating
+        // bare names as before.
         let var = select_ref! {
-            Token::Ident(n) = _e => Expr::Var(n, Type::Unknown)
-        };
+            Token::Ident(n) = e => Ident::new(n).with_span(e.span())
+        }
+        .then(
+            just(Token::Colon)
+                .ignore_then(select_ref! {
+                    Token::Ident(n) = e => Ident::new(n).with_span(e.span())
+                })
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .map(
+            |(head, tail): (Spanned<Ident<'src>>, Vec<Spanned<Ident<'src>>>)| {
+                if tail.is_empty() {
+                    Expr::Var(head.inner.0, Type::Unknown)
+                } else {
+                    let mut segments = Vec::with_capacity(tail.len() + 1);
+                    segments.push(head);
+                    segments.extend(tail);
+                    Expr::Path(segments)
+                }
+            },
+        );
         let self_kw = just(Token::SelfKw)
             .map_with(|_, _e| Expr::Var("self", Type::Unknown));
 
@@ -188,17 +213,25 @@ pub fn expr<'t, 'src: 't>()
                     let span = acc.span;
                     match op.inner {
                         PostfixOp::Call(args) => {
-                            let Expr::Var(ident, _ty) = acc.inner else {
-                                panic!("Parser bug")
+                            // Callee can be either a bare ident (Var) or a
+                            // module-qualified path (Path).  In the Var case
+                            // we tag the callee with `pid` so downstream
+                            // hashing treats it as a process spawn target;
+                            // in the Path case we keep the path as-is and
+                            // let the resolver follow the module chain.
+                            let callee = match acc.inner {
+                                Expr::Var(ident, _ty) => Expr::Var(
+                                    ident,
+                                    Type::Named(Ident::new("pid").with_span(span)),
+                                )
+                                .with_span(span),
+                                Expr::Path(_) => acc,
+                                other => panic!(
+                                    "call applied to non-callable expression: {other:?}"
+                                ),
                             };
                             Expr::Jump {
-                                ident: Box::new(
-                                    Expr::Var(
-                                        ident,
-                                        Type::Named(Ident::new("pid").with_span(span)),
-                                    )
-                                    .with_span(span),
-                                ),
+                                ident: Box::new(callee),
                                 args,
                             }
                         }

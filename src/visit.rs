@@ -121,6 +121,11 @@ pub fn walk_expr<'src, V: Visit<'src> + ?Sized>(v: &mut V, expr: &Spanned<Expr<'
             v.visit_expr(r);
         }
         Expr::Neg(inner) => v.visit_expr(inner),
-        Expr::Var(_, _) | Expr::Num(_, _) | Expr::String(_, _) | Expr::Bool(_) | Expr::Unit => {}
+        Expr::Var(_, _)
+        | Expr::Path(_)
+        | Expr::Num(_, _)
+        | Expr::String(_, _)
+        | Expr::Bool(_)
+        | Expr::Unit => {}
     }
 }

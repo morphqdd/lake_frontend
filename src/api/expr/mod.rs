@@ -15,6 +15,10 @@ pub enum Expr<'src> {
 
     // ── Variables & paths ─────────────────────────────────────────────────
     Var(&'src str, Type<'src>),
+    /// Module-qualified value: `core:io:writer`.  Always at least two
+    /// segments (a single ident is `Var`).  Used as a callee in `Jump` for
+    /// inline cross-module calls without a prior `+import`.
+    Path(Vec<Spanned<Ident<'src>>>),
 
     // ── Binding ───────────────────────────────────────────────────────────
     Let {

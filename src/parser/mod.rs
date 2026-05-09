@@ -219,6 +219,38 @@ mod tests {
     }
 
     #[test]
+    fn module_path_parses_as_path_expr() {
+        with_branch_expr("m is { _ -> { core:io:writer } }", |expr| {
+            let Expr::Path(segments) = expr else {
+                panic!("expected Path, got {expr:?}")
+            };
+            assert_eq!(segments.len(), 3);
+            assert_eq!(segments[0].inner, Ident::new("core"));
+            assert_eq!(segments[1].inner, Ident::new("io"));
+            assert_eq!(segments[2].inner, Ident::new("writer"));
+        });
+    }
+
+    #[test]
+    fn module_path_call_wraps_in_jump() {
+        with_branch_expr("m is { _ -> { core:io:writer(42) } }", |expr| {
+            let Expr::Jump { ident, args } = expr else {
+                panic!("expected Jump, got {expr:?}")
+            };
+            assert!(matches!(ident.inner, Expr::Path(_)));
+            assert_eq!(args.len(), 1);
+        });
+    }
+
+    #[test]
+    fn single_ident_is_var_not_path() {
+        // No colons — bare ident should still be Var, not a single-segment Path.
+        with_branch_expr("m is { _ -> { writer } }", |expr| {
+            assert!(matches!(expr, Expr::Var("writer", _)));
+        });
+    }
+
+    #[test]
     fn self_parses_as_var() {
         with_branch_expr("m is { _ -> { self } }", |expr| {
             assert!(matches!(expr, Expr::Var("self", _)));
