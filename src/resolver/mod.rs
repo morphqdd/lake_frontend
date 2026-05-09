@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
-use chumsky::span::{SpanWrap, Spanned};
+use chumsky::span::{SimpleSpan, SpanWrap, Spanned};
 
 use crate::api::{
-    ast::{Branch, Item, Machine, MachineItem, Type},
+    ast::{Branch, Ident, Item, Machine, MachineItem, Type},
     expr::Expr,
 };
+use crate::loader::ParsedProgram;
+use crate::registry::{ModuleId, ModulePath, ProgramRegistry};
 
 /// True when the parser emitted a placeholder type that the resolver needs to
 /// fill in.  `Type::Unit` (`{}` in source) is *not* unknown — it is a legitimate
@@ -20,20 +22,45 @@ pub(crate) fn is_unknown(ty: &Type<'_>) -> bool {
 ///
 /// Each `Branch` gets its own scope that is discarded after the branch body is
 /// processed, so variable bindings do not leak across branches.
-pub struct Resolver<'src> {
+///
+/// The optional `registry` enables let-RHS inference: when a `let` lacks a
+/// type annotation, the resolver looks at the right-hand side and consults
+/// the registry for call return types (rt fns / machines / ffi).
+pub struct Resolver<'src, 'r> {
     scope: HashMap<&'src str, Type<'src>>,
+    registry: Option<&'r ProgramRegistry<'src>>,
+    /// Module currently being resolved.  Used to disambiguate bare-name
+    /// calls in let-RHS inference.  `ModuleId::ROOT` for single-file
+    /// compilation.
+    current_module: ModuleId,
 }
 
-impl Default for Resolver<'_> {
+impl Default for Resolver<'_, '_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'src> Resolver<'src> {
+impl<'src, 'r> Resolver<'src, 'r> {
     pub fn new() -> Self {
         Self {
             scope: HashMap::new(),
+            registry: None,
+            current_module: ModuleId::ROOT,
+        }
+    }
+
+    /// Build a registry-aware resolver pinned to a specific module.  Used
+    /// by the multi-module pipeline so let-RHS inference can look up
+    /// imported names in the right scope.
+    pub fn with_registry(
+        registry: &'r ProgramRegistry<'src>,
+        current_module: ModuleId,
+    ) -> Self {
+        Self {
+            scope: HashMap::new(),
+            registry: Some(registry),
+            current_module,
         }
     }
 
@@ -49,17 +76,130 @@ impl<'src> Resolver<'src> {
         }
     }
 
+    /// Infer the static type of an already-resolved expression.  Returns
+    /// [`Type::Unknown`] when the inference engine has nothing to say —
+    /// callers should treat that as "user must annotate" rather than
+    /// "compatible with anything".
+    fn infer_expr_type(&self, expr: &Expr<'src>, span: SimpleSpan) -> Type<'src> {
+        match expr {
+            Expr::Num(_, _) => static_named("i64", span),
+            Expr::String(_, _) => static_named("str", span),
+            Expr::Bool(_) => static_named("bool", span),
+            Expr::Unit => Type::Unit,
+            Expr::Var(name, ty) => {
+                if !is_unknown(ty) {
+                    ty.clone()
+                } else if let Some(t) = self.scope.get(name) {
+                    t.clone()
+                } else {
+                    Type::Unknown
+                }
+            }
+            // Arithmetic, negation, and comparisons all evaluate to i64.
+            Expr::Add(_, _)
+            | Expr::Sub(_, _)
+            | Expr::Mul(_, _)
+            | Expr::Div(_, _)
+            | Expr::Neg(_)
+            | Expr::Eq(_, _)
+            | Expr::Le(_, _)
+            | Expr::Ge(_, _)
+            | Expr::Lt(_, _)
+            | Expr::Gt(_, _) => static_named("i64", span),
+            Expr::Jump { ident, .. } => self.infer_jump_return(&ident.inner, span),
+            // Higher-order shapes (let, when, wait, method-call, …) don't
+            // have a defined "value" yet — leave them unresolved.
+            _ => Type::Unknown,
+        }
+    }
+
+    fn infer_jump_return(&self, callee: &Expr<'src>, span: SimpleSpan) -> Type<'src> {
+        let Some(reg) = self.registry else {
+            return Type::Unknown;
+        };
+        match callee {
+            Expr::Var(name, _ty) => {
+                // Bare-name lookup uses whatever module is currently being
+                // resolved.  We can't borrow `reg` and rebuild current
+                // mutably; resolve_bare consults `reg.current` so swap
+                // current temporarily isn't an option here.  Instead use
+                // `resolve_in_module` for the local module manually + fall
+                // back to rt.
+                if let Some(sig) = reg.rt_fns.get(*name) {
+                    return type_from_str(&sig.ret, span);
+                }
+                if let Some(r) =
+                    reg.resolve_in_module(self.current_module, name)
+                {
+                    return type_from_str(r.return_type(), span);
+                }
+                // Imported alias: walk the current module's import table.
+                let scope = reg.module(self.current_module);
+                if let Some(binding) = scope.imports.get(*name) {
+                    if let Some(r) = reg.resolve_in_module(
+                        binding.target_module,
+                        &binding.target_item,
+                    ) {
+                        return type_from_str(r.return_type(), span);
+                    }
+                }
+                Type::Unknown
+            }
+            Expr::Path(segments) => {
+                if segments.len() < 2 {
+                    return Type::Unknown;
+                }
+                let module_segs: Vec<String> = segments[..segments.len() - 1]
+                    .iter()
+                    .map(|s| s.inner.0.to_string())
+                    .collect();
+                let item = segments.last().expect("len >= 2").inner.0;
+                let module_path = ModulePath(module_segs);
+                let Some(target_id) = reg.module_id_for_path(&module_path) else {
+                    return Type::Unknown;
+                };
+                reg.resolve_in_module(target_id, item)
+                    .map(|r| type_from_str(r.return_type(), span))
+                    .unwrap_or(Type::Unknown)
+            }
+            _ => Type::Unknown,
+        }
+    }
+
     fn resolve_expr(&mut self, expr: Spanned<Expr<'src>>) -> Spanned<Expr<'src>> {
         let span = expr.span;
         let inner = match expr.inner {
             Expr::Var(name, ty) => Expr::Var(name, self.resolve_var_ty(name, ty)),
 
             Expr::Let { ident, ty, default } => {
-                // Bind before resolving the default so the variable is in scope
-                // (handles patterns with defaults that reference earlier bindings).
+                // Pre-bind so the default can reference the binding (matches
+                // existing semantics).
                 self.bind(ident.inner.0, ty.inner.clone());
                 let default = default.map(|d| Box::new(self.resolve_expr(*d)));
-                Expr::Let { ident, ty, default }
+
+                // If the user did not write an annotation, infer the type
+                // from the default's resolved expression.  Registry-aware
+                // inference covers literals, arithmetic, and call returns.
+                let final_ty_inner = if is_unknown(&ty.inner) {
+                    if let Some(d) = &default {
+                        self.infer_expr_type(&d.inner, d.span)
+                    } else {
+                        ty.inner.clone()
+                    }
+                } else {
+                    ty.inner.clone()
+                };
+
+                // Re-bind under the inferred type so subsequent expressions
+                // in this scope see the right type.
+                self.bind(ident.inner.0, final_ty_inner.clone());
+
+                let final_ty = final_ty_inner.with_span(ty.span);
+                Expr::Let {
+                    ident,
+                    ty: final_ty,
+                    default,
+                }
             }
 
             Expr::Jump { ident, args } => {
@@ -177,9 +317,67 @@ impl<'src> Resolver<'src> {
     }
 }
 
-/// Convenience wrapper: resolve types in a parsed Lake program.
+/// Convenience wrapper: resolve types in a single-file Lake program.  Used
+/// by callers that don't construct a [`ProgramRegistry`] (mostly tests).
 pub fn resolve<'src>(program: Vec<Spanned<Item<'src>>>) -> Vec<Spanned<Item<'src>>> {
     Resolver::new().resolve(program)
+}
+
+/// Resolve every module of a multi-file program in registry-aware mode.
+///
+/// Each module is processed under its own [`Resolver`], which consults the
+/// registry for let-RHS inference (call return types, alias bindings).
+/// The registry is mutated only insofar as `current_module` is bumped per
+/// iteration; machine / ffi / import entries remain unchanged.
+pub fn resolve_program<'src>(
+    mut program: ParsedProgram<'src>,
+    registry: &mut ProgramRegistry<'src>,
+) -> ParsedProgram<'src> {
+    let modules = std::mem::take(&mut program.modules);
+    let mut resolved_modules = Vec::with_capacity(modules.len());
+
+    for module in modules {
+        let id = registry
+            .module_id_for_path(&module.module_path)
+            .expect("populate_from must run before resolve_program");
+        registry.set_current(id);
+
+        let mut resolver = Resolver::with_registry(registry, id);
+        let resolved_ast = resolver.resolve(module.ast);
+
+        resolved_modules.push(crate::loader::ParsedModule {
+            module_path: module.module_path,
+            source_path: module.source_path,
+            ast: resolved_ast,
+        });
+    }
+
+    program.modules = resolved_modules;
+    program
+}
+
+// ── inference helpers ──────────────────────────────────────────────────────
+
+/// Build a `Type::Named` from a `&'static` name plus a span.  Used by the
+/// inference engine where the type's textual identifier is fixed at compile
+/// time (e.g. `"i64"` from arithmetic).
+fn static_named<'src>(name: &'static str, span: SimpleSpan) -> Type<'src> {
+    Type::Named(Ident::new(name).with_span(span))
+}
+
+/// Render a registry-supplied return-type string into a [`Type`].  Only the
+/// small set of types Lake currently exposes through call signatures
+/// (i64 / str / bool / pid / unit) round-trip; richer return types stay
+/// unresolved so the caller can fall back to "user must annotate".
+fn type_from_str<'src>(s: &str, span: SimpleSpan) -> Type<'src> {
+    match s {
+        "i64" => static_named("i64", span),
+        "str" => static_named("str", span),
+        "bool" => static_named("bool", span),
+        "pid" => static_named("pid", span),
+        "{}" => Type::Unit,
+        _ => Type::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +502,124 @@ mod tests {
 
     fn is_unknown_ty(ty: &Type<'_>) -> bool {
         super::is_unknown(ty)
+    }
+
+    fn parsed_module(src: &str) -> crate::loader::ParsedModule<'_> {
+        use crate::lexer::lexer;
+        use crate::parser::program;
+        let tokens = lexer().parse(src).into_result().expect("lex");
+        let ast = program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse");
+        crate::loader::ParsedModule {
+            module_path: crate::registry::ModulePath::root(),
+            source_path: std::path::PathBuf::from("main.lake"),
+            ast,
+        }
+    }
+
+    /// Resolve `src` and return the first branch body of the LAST machine
+    /// declared (most tests put the assertion target last for readability).
+    fn resolve_with_reg(src: &str) -> Vec<Expr<'_>> {
+        let module = parsed_module(src);
+        let program = crate::loader::ParsedProgram { modules: vec![module] };
+        let mut reg: crate::registry::ProgramRegistry<'_> =
+            crate::registry::ProgramRegistry::with_rt();
+        reg.populate_from(&program).expect("populate");
+        let resolved = super::resolve_program(program, &mut reg);
+        let m = resolved.root();
+        let machine = m
+            .ast
+            .iter()
+            .filter_map(|it| match &it.inner {
+                Item::Machine(m) => Some(m),
+                _ => None,
+            })
+            .last()
+            .expect("at least one machine");
+        let MachineItem::Branch(b) = &machine.inner.items[0].inner else {
+            panic!()
+        };
+        b.body.iter().map(|e| e.inner.clone()).collect()
+    }
+
+    #[test]
+    fn infers_let_type_from_int_literal() {
+        let body = resolve_with_reg("m is { _ -> { let n = 42 } }");
+        let Expr::Let { ty, .. } = &body[0] else {
+            panic!()
+        };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("i64")),
+            "got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn infers_let_type_from_string_literal() {
+        let body = resolve_with_reg("m is { _ -> { let s = \"hi\" } }");
+        let Expr::Let { ty, .. } = &body[0] else { panic!() };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("str")),
+            "got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn infers_let_type_from_bool_compare() {
+        let body = resolve_with_reg("m is { n i64 -> { let b = 0 == n } }");
+        let Expr::Let { ty, .. } = &body[0] else { panic!() };
+        // Comparisons always evaluate to i64 (0 / 1).
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("i64")),
+            "got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn infers_let_type_from_arith() {
+        let body = resolve_with_reg("m is { n i64 -> { let r = n - n / 3 * 3 } }");
+        let Expr::Let { ty, .. } = &body[0] else { panic!() };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("i64")),
+            "got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn infers_let_type_from_rt_call() {
+        let body = resolve_with_reg(
+            "@rt(rt_listen_tcp)\nm is { _ -> { let s = rt_listen_tcp(8080) } }",
+        );
+        // `rt_listen_tcp` returns i64 per the static rt registry.
+        let Expr::Let { ty, .. } = &body[0] else { panic!() };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("i64")),
+            "got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn infers_let_type_from_machine_call_as_pid() {
+        let body = resolve_with_reg(
+            "worker is { n i64 -> { } }\nm is { _ -> { let p = worker(5) } }",
+        );
+        let Expr::Let { ty, .. } = &body[0] else { panic!() };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("pid")),
+            "got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_annotation_is_preserved() {
+        let body = resolve_with_reg("m is { _ -> { let s str = \"hi\" } }");
+        let Expr::Let { ty, .. } = &body[0] else { panic!() };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("str")),
+            "got {ty:?}"
+        );
     }
 
     #[test]

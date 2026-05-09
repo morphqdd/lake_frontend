@@ -144,7 +144,10 @@ pub fn expr<'t, 'src: 't>()
             .then_ignore(just(Token::Eq))
             .then(expr.clone())
             .map(|((ident, ty), default)| {
-                let ty = ty.unwrap_or_else(|| Type::Unit.with_span(ident.span));
+                // Missing annotation parses as `Type::Unknown` so the
+                // resolver knows to infer from the right-hand side.  An
+                // explicit `{}` in source still produces `Type::Unit`.
+                let ty = ty.unwrap_or_else(|| Type::Unknown.with_span(ident.span));
                 Expr::Let {
                     ident,
                     ty,

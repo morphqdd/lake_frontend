@@ -451,7 +451,9 @@ mod tests {
                 panic!("expected Let, got {expr:?}")
             };
             assert_eq!(ident.inner, Ident::new("x"));
-            assert!(matches!(ty.inner, Type::Unit));
+            // Missing annotation now parses as `Type::Unknown` (was `Unit`)
+            // so the resolver can fill it in from the RHS.
+            assert!(matches!(ty.inner, Type::Unknown));
             assert!(default.is_some());
         });
     }
