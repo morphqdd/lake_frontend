@@ -144,7 +144,11 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
                 }
             }
 
-            Expr::Wait { handlers } => {
+            Expr::Wait { handlers, filter } => {
+                // Filter pids must be in scope; check them first.
+                for f in filter {
+                    self.check_expr(machine_name, scope, &f.inner, f.span);
+                }
                 for handler in handlers {
                     let mut handler_scope = scope.clone();
                     for pat in &handler.inner.patterns {
@@ -489,7 +493,7 @@ fn collect_let_bindings<'src>(
                 }
             }
         }
-        Expr::Wait { handlers } => {
+        Expr::Wait { handlers, .. } => {
             for h in handlers {
                 for e in &h.inner.body {
                     collect_let_bindings(&e.inner, scope);

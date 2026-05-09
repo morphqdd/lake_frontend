@@ -382,7 +382,7 @@ mod tests {
         with_branch_expr(
             "m is { _ -> { wait { @ping n i64 -> { self(n) } } } }",
             |expr| {
-                let Expr::Wait { handlers } = expr else {
+                let Expr::Wait { handlers, .. } = expr else {
                     panic!("expected Wait, got {expr:?}")
                 };
                 assert_eq!(handlers.len(), 1);
@@ -401,7 +401,7 @@ mod tests {
         with_branch_expr(
             "m is { _ -> { wait { @inc n i64 -> { n } @get _ -> { self() } } } }",
             |expr| {
-                let Expr::Wait { handlers } = expr else {
+                let Expr::Wait { handlers, .. } = expr else {
                     panic!("expected Wait, got {expr:?}")
                 };
                 assert_eq!(handlers.len(), 2);
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn wait_handler_without_label() {
         with_branch_expr("m is { _ -> { wait { n i64 -> { n } } } }", |expr| {
-            let Expr::Wait { handlers } = expr else {
+            let Expr::Wait { handlers, .. } = expr else {
                 panic!("expected Wait, got {expr:?}")
             };
             assert_eq!(handlers.len(), 1);

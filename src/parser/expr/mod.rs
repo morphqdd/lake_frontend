@@ -61,8 +61,17 @@ pub fn expr<'t, 'src: 't>()
                 }
             },
         );
-        let self_kw = just(Token::SelfKw)
-            .map_with(|_, _e| Expr::Var("self", Type::Unknown));
+        // Bare `self` evaluates to the current actor's own pid — used as a
+        // value (e.g. as an argument to other actors so they can send back).
+        // `self(args)` continues to mean "state transition into this
+        // machine"; the postfix-call pratt branch handles that case by
+        // wrapping `self` in a Jump.
+        let self_kw = just(Token::SelfKw).map_with(|_, e| {
+            Expr::Var(
+                "self",
+                Type::Named(Ident::new("pid").with_span(e.span())),
+            )
+        });
 
         let atom = choice((num, string_lit, bool_false, bool_true, self_kw, var));
 
@@ -126,8 +135,16 @@ pub fn expr<'t, 'src: 't>()
                 .map(|((label, patterns), body)| Branch::new(label, patterns, None, body))
                 .spanned();
 
+        // Sender-pid filter list — zero or more expressions between
+        // `wait` and the handler block.  Each filter expression is
+        // expected to evaluate to a pid; the runtime accepts a message
+        // only when its first arg matches one of these pids.
+        //
+        // No surrounding brackets — the handler block's `{` ends the
+        // filter list.
         let wait_expr = just(Token::Wait)
-            .ignore_then(
+            .ignore_then(expr.clone().repeated().collect::<Vec<_>>())
+            .then(
                 wait_handler
                     .repeated()
                     .at_least(1)
@@ -136,7 +153,7 @@ pub fn expr<'t, 'src: 't>()
                         select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())),
                     ),
             )
-            .map(|handlers| Expr::Wait { handlers });
+            .map(|(filter, handlers)| Expr::Wait { handlers, filter });
 
         let let_expr = just(Token::Let)
             .ignore_then(ident_parser())
@@ -155,7 +172,15 @@ pub fn expr<'t, 'src: 't>()
                 }
             });
 
+        // `ret <expr>` — early return from a ret-typed branch.  The
+        // entire trailing expression is consumed greedily so
+        // `ret n + 1` parses as `Ret(Add(n, 1))`.
+        let ret_expr = just(Token::Ret)
+            .ignore_then(expr.clone())
+            .map(|inner| Expr::Ret(Box::new(inner)));
+
         let base = choice((
+            ret_expr.spanned().boxed(),
             wait_expr.spanned().boxed(),
             let_expr.spanned().boxed(),
             when_expr.spanned(),

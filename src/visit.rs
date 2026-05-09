@@ -103,7 +103,10 @@ pub fn walk_expr<'src, V: Visit<'src> + ?Sized>(v: &mut V, expr: &Spanned<Expr<'
                 }
             }
         }
-        Expr::Wait { handlers } => {
+        Expr::Wait { handlers, filter } => {
+            for f in filter {
+                v.visit_expr(f);
+            }
             for h in handlers {
                 v.visit_branch(&h.inner);
             }
@@ -120,7 +123,7 @@ pub fn walk_expr<'src, V: Visit<'src> + ?Sized>(v: &mut V, expr: &Spanned<Expr<'
             v.visit_expr(l);
             v.visit_expr(r);
         }
-        Expr::Neg(inner) => v.visit_expr(inner),
+        Expr::Neg(inner) | Expr::Ret(inner) => v.visit_expr(inner),
         Expr::Var(_, _)
         | Expr::Path(_)
         | Expr::Num(_, _)

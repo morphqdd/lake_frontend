@@ -63,10 +63,28 @@ pub enum Expr<'src> {
     },
 
     // ── Process suspension ──────────────────────────────────────────────
-    /// `wait { @label pattern+ -> { body } ... }`
+    /// `wait <pid_expr>* { @label pattern+ -> { body } ... }`
+    ///
+    /// `filter` is a list of expressions that evaluate to pids; when
+    /// non-empty, the first argument of every received message must be
+    /// a pid found in `filter` (OR logic) for any handler to fire.  An
+    /// empty `filter` means "accept any sender" (current default
+    /// behaviour).
+    ///
+    /// Used by the `ret`-machine lowering to make synchronous calls
+    /// race-free: the caller filters on the spawned process's pid so a
+    /// concurrent message from a different sender can't be mistaken for
+    /// the awaited reply.
     Wait {
         handlers: Vec<Spanned<Branch<'src>>>,
+        filter: Vec<Spanned<Self>>,
     },
+
+    /// `ret <expr>` — early return from a `-> ret <type>` branch.
+    /// Lowered to a call to the implicit `__caller` pid before
+    /// codegen sees it; persists in the AST only between parse and
+    /// the lowering pass.
+    Ret(Box<Spanned<Self>>),
 
     // ── Arithmetic ────────────────────────────────────────────────────────
     Mul(Box<Spanned<Self>>, Box<Spanned<Self>>),

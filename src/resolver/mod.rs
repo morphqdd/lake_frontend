@@ -225,6 +225,7 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 Box::new(self.resolve_expr(*r)),
             ),
             Expr::Neg(inner) => Expr::Neg(Box::new(self.resolve_expr(*inner))),
+            Expr::Ret(inner) => Expr::Ret(Box::new(self.resolve_expr(*inner))),
 
             Expr::When { cond, branches } => {
                 let cond = Box::new(self.resolve_expr(*cond));
@@ -239,7 +240,11 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 Expr::When { cond, branches }
             }
 
-            Expr::Wait { handlers } => {
+            Expr::Wait { handlers, filter } => {
+                let filter = filter
+                    .into_iter()
+                    .map(|f| self.resolve_expr(f))
+                    .collect();
                 let handlers = handlers
                     .into_iter()
                     .map(|h| {
@@ -247,7 +252,7 @@ impl<'src, 'r> Resolver<'src, 'r> {
                         self.resolve_branch(h.inner).with_span(span)
                     })
                     .collect();
-                Expr::Wait { handlers }
+                Expr::Wait { handlers, filter }
             }
 
             other => other,
@@ -632,7 +637,7 @@ mod tests {
         let MachineItem::Branch(b) = &m.inner.items[0].inner else {
             panic!()
         };
-        let Expr::Wait { handlers } = &b.body[0].inner else {
+        let Expr::Wait { handlers, .. } = &b.body[0].inner else {
             panic!("expected Wait")
         };
         // `n` inside handler body should be resolved to i64
