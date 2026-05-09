@@ -5,6 +5,7 @@ use chumsky::{Parser, input::Input, span::Spanned};
 use crate::api::ast::Item;
 use crate::api::token::Token;
 use crate::loader::{ParsedProgram, ProgramSources};
+use crate::lowering::lower_program;
 use crate::registry::ProgramRegistry;
 use crate::resolver::resolve_program;
 use crate::typeck::typecheck_program;
@@ -128,6 +129,15 @@ pub fn build_program<'src>(
     if let Err(e) = registry.populate_from(&parsed) {
         return Err(e);
     }
+
+    // Desugar `ret`-typed machines and their callers using the registry
+    // we just built.  Then re-populate so machine signatures reflect the
+    // newly-prepended `__caller` parameter on every ret-branch.
+    let parsed = lower_program(parsed, &registry);
+    if let Err(e) = registry.populate_from(&parsed) {
+        return Err(e);
+    }
+
     let resolved = resolve_program(parsed, &mut registry);
     let errors = typecheck_program(&resolved, &registry);
     if !errors.is_empty() {

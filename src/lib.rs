@@ -12,6 +12,7 @@ pub mod api;
 pub mod error_handle;
 pub mod lexer;
 pub mod loader;
+pub mod lowering;
 pub mod parser;
 pub mod prelude;
 pub mod registry;
