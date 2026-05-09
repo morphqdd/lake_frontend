@@ -117,7 +117,10 @@ impl<'src> TypeChecker<'src> {
     ) {
         match expr {
             Expr::Var(name, ty) => {
-                if name == "self" {
+                // `self` is a keyword (always in scope) and `_` is the
+                // wildcard pattern (legal as a `when` arm and as a branch
+                // parameter; never refers to an actual binding).
+                if name == "self" || name == "_" {
                     return;
                 }
                 if is_unknown(&ty) && !scope.contains_key(name) {
