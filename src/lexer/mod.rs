@@ -27,10 +27,12 @@ pub fn lexer<'src>()
                 "self" => Token::SelfKw,
                 "wait" => Token::Wait,
                 "let" => Token::Let,
+                "as" => Token::As,
                 s => Token::Ident(s),
             }),
             just("@").to(Token::At),
             just(".").to(Token::Dot),
+            just(":").to(Token::Colon),
             just("->").to(Token::Arrow),
             just("+").to(Token::Plus),
             just("-").to(Token::Minus),
@@ -314,6 +316,39 @@ mod test {
         assert_eq!(tokens.len(), 2);
         assert!(matches!(tokens[0].inner, Token::Ident("n")));
         assert!(matches!(tokens[1].inner, Token::Ident("i64")));
+    }
+
+    #[test]
+    fn colon_token_test() {
+        let tokens = lexer().parse(":").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::Colon));
+    }
+
+    #[test]
+    fn module_path_lexes_as_ident_colon_chain() {
+        // `core:io:writer` → ident colon ident colon ident
+        let tokens = lexer()
+            .parse("core:io:writer")
+            .into_result()
+            .expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::Ident("core")));
+        assert!(matches!(tokens[1].inner, Token::Colon));
+        assert!(matches!(tokens[2].inner, Token::Ident("io")));
+        assert!(matches!(tokens[3].inner, Token::Colon));
+        assert!(matches!(tokens[4].inner, Token::Ident("writer")));
+    }
+
+    #[test]
+    fn as_keyword_test() {
+        let tokens = lexer().parse("as").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::As));
+    }
+
+    #[test]
+    fn as_is_not_an_ident() {
+        let tokens = lexer().parse("as foo").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::As));
+        assert!(matches!(tokens[1].inner, Token::Ident("foo")));
     }
 
     #[test]

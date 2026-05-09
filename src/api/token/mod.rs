@@ -14,6 +14,8 @@ pub enum Token<'src> {
     At,
     Arrow,
     Dot,
+    /// `:` — module path qualifier (`core:io:writer`).
+    Colon,
     Plus,
     Minus,
     Star,
@@ -36,6 +38,8 @@ pub enum Token<'src> {
     SelfKw,
     Wait,
     Let,
+    /// `as` — import alias (`+core.io.writer as foo`).
+    As,
 
     // Comments (filtered out after lexing)
     Comment,
@@ -49,6 +53,8 @@ impl<'src> Display for Token<'src> {
             Token::String(src) => write!(f, "\"{src}\""),
             Token::Arrow => write!(f, "->"),
             Token::Dot => write!(f, "."),
+            Token::Colon => write!(f, ":"),
+            Token::As => write!(f, "as"),
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),
             Token::Star => write!(f, "*"),
