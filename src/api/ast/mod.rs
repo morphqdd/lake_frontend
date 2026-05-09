@@ -364,8 +364,17 @@ impl<'src> Machine<'src> {
 
 #[derive(Debug, PartialEq, PartialOrd, Clone)]
 pub enum Import<'src> {
-    /// `+core.io.writer`
-    Import(Spanned<Ident<'src>>, Option<Spanned<Rc<RefCell<Self>>>>),
+    /// `+core.io.writer` or `+core.io.writer as wr`.
+    ///
+    /// `alias` is only meaningful when `next` is `None` (this node is the
+    /// leaf — the actual item being imported).  Attaching an alias to a
+    /// non-leaf segment is a parse-time check that will surface as a
+    /// diagnostic when the resolver populates the registry.
+    Import(
+        Spanned<Ident<'src>>,
+        Option<Spanned<Rc<RefCell<Self>>>>,
+        Option<Spanned<Ident<'src>>>,
+    ),
     /// `+core.{ box.box result.result }`
     MultiImport(Vec<Spanned<Rc<RefCell<Import<'src>>>>>),
 }
@@ -376,11 +385,22 @@ impl<'a> Import<'a> {
         next: Spanned<Rc<RefCell<Import<'a>>>>,
     ) -> Spanned<Rc<RefCell<Import<'a>>>> {
         match self {
-            Import::Import(_, slot) => {
+            Import::Import(_, slot, _) => {
                 let _ = slot.insert(next.clone());
                 next
             }
             Import::MultiImport(_) => panic!("set_next called on MultiImport"),
+        }
+    }
+
+    /// Attach an alias to this node.  Caller is responsible for only doing
+    /// so on a leaf (`next == None`); the resolver enforces this.
+    pub fn set_alias(&mut self, alias: Spanned<Ident<'a>>) {
+        match self {
+            Import::Import(_, _, slot) => {
+                *slot = Some(alias);
+            }
+            Import::MultiImport(_) => panic!("set_alias called on MultiImport"),
         }
     }
 }

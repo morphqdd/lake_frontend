@@ -215,7 +215,7 @@ impl SemanticAnalyzer {
     fn analyze_import(&mut self, import_rc: &Spanned<std::rc::Rc<std::cell::RefCell<Import>>>) {
         let import = import_rc.inner.borrow();
         match &*import {
-            Import::Import(ident, next) => {
+            Import::Import(ident, next, _alias) => {
                 // Add each component of the import path as a namespace
                 self.add_symbol(Symbol {
                     name: ident.inner.0.to_string(),

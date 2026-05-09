@@ -219,6 +219,103 @@ mod tests {
     }
 
     #[test]
+    fn import_with_as_alias_attaches_to_leaf() {
+        use crate::api::ast::Item;
+        let src = "+core.io.writer as wr";
+        let tokens = lexer().parse(src).into_result().expect("lex");
+        let ast = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse");
+        let Item::Import(import_rc) = &ast[0].inner else {
+            panic!("expected Import, got {:?}", ast[0].inner)
+        };
+        // Walk to leaf and assert alias.
+        let mut current = import_rc.clone();
+        loop {
+            let next_opt = match &*current.inner.borrow() {
+                crate::api::ast::Import::Import(_, next, _) => next.clone(),
+                _ => panic!(),
+            };
+            match next_opt {
+                Some(n) => current = n,
+                None => break,
+            }
+        }
+        let leaf = current.inner.borrow();
+        let crate::api::ast::Import::Import(ident, _, alias) = &*leaf else {
+            panic!()
+        };
+        assert_eq!(ident.inner, Ident::new("writer"));
+        assert_eq!(alias.as_ref().map(|a| a.inner.clone()), Some(Ident::new("wr")));
+    }
+
+    #[test]
+    fn import_block_per_entry_aliases() {
+        use crate::api::ast::Item;
+        let src = "+core.{ box.box as B  result.result as R }";
+        let tokens = lexer().parse(src).into_result().expect("lex");
+        let ast = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse");
+        let Item::Import(import_rc) = &ast[0].inner else { panic!() };
+        // Top: core.{ ... } — `core` chains into MultiImport
+        let top = import_rc.inner.borrow();
+        let crate::api::ast::Import::Import(_, Some(next), _) = &*top else { panic!() };
+        let multi = next.inner.borrow();
+        let crate::api::ast::Import::MultiImport(entries) = &*multi else { panic!() };
+        assert_eq!(entries.len(), 2);
+        // Each entry's leaf has alias B / R.
+        for (entry, expected_alias) in entries.iter().zip(["B", "R"]) {
+            let mut current = entry.clone();
+            loop {
+                let next_opt = match &*current.inner.borrow() {
+                    crate::api::ast::Import::Import(_, next, _) => next.clone(),
+                    _ => panic!(),
+                };
+                match next_opt {
+                    Some(n) => current = n,
+                    None => break,
+                }
+            }
+            let leaf = current.inner.borrow();
+            let crate::api::ast::Import::Import(_, _, alias) = &*leaf else { panic!() };
+            assert_eq!(
+                alias.as_ref().map(|a| a.inner.0),
+                Some(expected_alias),
+                "entry {expected_alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_without_alias_leaves_alias_none() {
+        use crate::api::ast::Item;
+        let src = "+core.io.writer";
+        let tokens = lexer().parse(src).into_result().expect("lex");
+        let ast = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse");
+        let Item::Import(import_rc) = &ast[0].inner else { panic!() };
+        let mut current = import_rc.clone();
+        loop {
+            let next_opt = match &*current.inner.borrow() {
+                crate::api::ast::Import::Import(_, next, _) => next.clone(),
+                _ => panic!(),
+            };
+            match next_opt {
+                Some(n) => current = n,
+                None => break,
+            }
+        }
+        let leaf = current.inner.borrow();
+        let crate::api::ast::Import::Import(_, _, alias) = &*leaf else { panic!() };
+        assert!(alias.is_none());
+    }
+
+    #[test]
     fn module_path_parses_as_path_expr() {
         with_branch_expr("m is { _ -> { core:io:writer } }", |expr| {
             let Expr::Path(segments) = expr else {
