@@ -19,8 +19,16 @@
 //! Lifetime parameter `'src` ties all borrowed identifiers to the lifetime
 //! of the underlying source strings (managed by the loader / caller).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use chumsky::span::Spanned;
+
+use crate::api::ast::{Branch, Directive, Import, Item, Machine, MachineItem, Type};
+use crate::error_handle::{LakeError, LakeErrors};
+use crate::loader::ParsedProgram;
 
 // ── primitive types ─────────────────────────────────────────────────────────
 
@@ -133,8 +141,10 @@ pub struct ModuleScope<'src> {
     pub source_path: Option<PathBuf>,
     /// Machines defined in this file, keyed by source name.
     pub machines: HashMap<&'src str, MachineEntry<'src>>,
-    /// FFI declarations defined in this file.
-    pub ffi_fns: HashMap<&'src str, Signature>,
+    /// FFI declarations defined in this file.  Keyed by owned String so
+    /// the resolver can populate without juggling source lifetimes for
+    /// what is fundamentally compile-time-only metadata.
+    pub ffi_fns: HashMap<String, Signature>,
     /// Aliases brought into scope by `+import` lines.
     /// Key = local binding name (alias or last path segment).
     /// Value = (target module, target item's source name).
@@ -273,6 +283,249 @@ impl<'src> ProgramRegistry<'src> {
     pub fn module_id_for_path(&self, path: &ModulePath) -> Option<ModuleId> {
         self.by_path.get(path).copied()
     }
+
+    /// Walk a [`ParsedProgram`] and populate the registry with every
+    /// module's machines, ffi declarations, and import bindings.
+    ///
+    /// Two passes:
+    ///   1. Register every module so its `ModuleId` exists.
+    ///   2. Walk each module's items, registering machines / ffi and
+    ///      resolving `+import` directives into local-name bindings.
+    ///
+    /// Borrowed identifiers (`MachineEntry::name`) keep the lifetime of
+    /// the underlying parsed source.
+    pub fn populate_from(
+        &mut self,
+        program: &ParsedProgram<'src>,
+    ) -> Result<(), LakeErrors> {
+        // Pass 1: ensure every loaded module has an id and a source path.
+        for module in &program.modules {
+            self.register_module(
+                module.module_path.clone(),
+                Some(module.source_path.clone()),
+            );
+        }
+
+        // Pass 2: register items + imports.
+        let mut errors: Vec<LakeError> = Vec::new();
+        for module in &program.modules {
+            let id = self
+                .by_path
+                .get(&module.module_path)
+                .copied()
+                .expect("module registered in pass 1");
+            for item in &module.ast {
+                match &item.inner {
+                    Item::Machine(m) => {
+                        let entry = build_machine_entry(&m.inner, id);
+                        self.module_mut(id)
+                            .machines
+                            .insert(m.inner.ident.inner.0, entry);
+                    }
+                    Item::Directive(d) if d.inner.name.inner.0 == "ffi" => {
+                        match build_ffi_signature(&d.inner) {
+                            Ok((name, sig)) => {
+                                self.module_mut(id).ffi_fns.insert(name, sig);
+                            }
+                            Err(e) => errors.push(e),
+                        }
+                    }
+                    Item::Directive(_) => {
+                        // `@rt(...)` and friends — handled out of band by
+                        // the static rt registry.  Nothing to record per
+                        // module.
+                    }
+                    Item::Import(rc) => {
+                        if let Err(mut errs) =
+                            register_import_bindings(rc, &[], id, self)
+                        {
+                            errors.append(&mut errs);
+                        }
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(LakeErrors::new(errors))
+        }
+    }
+}
+
+// ── helpers for populate_from ──────────────────────────────────────────────
+
+fn build_machine_entry<'src>(machine: &Machine<'src>, module: ModuleId) -> MachineEntry<'src> {
+    let branches: Vec<Signature> = machine
+        .items
+        .iter()
+        .filter_map(|item| match &item.inner {
+            MachineItem::Branch(b) => Some(branch_signature(b)),
+            _ => None,
+        })
+        .collect();
+    MachineEntry {
+        name: machine.ident.inner.0,
+        module,
+        is_pub: machine.vis,
+        branches,
+    }
+}
+
+fn branch_signature(branch: &Branch<'_>) -> Signature {
+    let params: Vec<String> = branch
+        .patterns
+        .iter()
+        .filter(|p| !p.inner.is_wildcard())
+        .map(|p| p.inner.ty.inner.to_string())
+        .collect();
+    Signature {
+        params,
+        ret: "pid".to_string(),
+    }
+}
+
+/// Extract `(name, signature)` from an `@ffi(name { params } { ret })`
+/// directive.  Returns a diagnostic on malformed shape.
+fn build_ffi_signature(directive: &Directive<'_>) -> Result<(String, Signature), LakeError> {
+    let args = &directive.args;
+    if args.len() != 3 {
+        return Err(LakeError::new(
+            format!(
+                "@ffi expects `name {{ params }} {{ ret }}` (3 arguments), \
+                 got {}",
+                args.len()
+            ),
+            directive.name.span,
+        )
+        .code("F001"));
+    }
+    let Spanned { inner: Type::Named(name), .. } = &args[0] else {
+        return Err(LakeError::new(
+            "@ffi: first argument must be the function name",
+            args[0].span,
+        )
+        .code("F002"));
+    };
+    let Type::Struct(params) = &args[1].inner else {
+        return Err(LakeError::new(
+            "@ffi: second argument must be `{ param_types ... }`",
+            args[1].span,
+        )
+        .code("F003"));
+    };
+    let Type::Struct(ret) = &args[2].inner else {
+        return Err(LakeError::new(
+            "@ffi: third argument must be `{ ret_type }`",
+            args[2].span,
+        )
+        .code("F004"));
+    };
+    let params: Vec<String> = params.iter().map(|p| p.inner.to_string()).collect();
+    // Single-element `{ ret }` — render the type; fall back to `{}` for
+    // empty `{}` which means "no return value" by convention.
+    let ret = ret
+        .first()
+        .map(|t| t.inner.to_string())
+        .unwrap_or_else(|| "{}".to_string());
+    Ok((
+        name.inner.0.to_string(),
+        Signature { params, ret },
+    ))
+}
+
+/// Walk an `Import` tree and add bindings to the named module's `imports`
+/// table.  Each leaf produces one binding; the local name is the alias if
+/// present, otherwise the leaf segment.
+fn register_import_bindings<'src>(
+    node: &Spanned<Rc<RefCell<Import<'src>>>>,
+    prefix: &[String],
+    current_module: ModuleId,
+    registry: &mut ProgramRegistry<'src>,
+) -> Result<(), Vec<LakeError>> {
+    let mut errors: Vec<LakeError> = Vec::new();
+    walk_import(node, prefix, current_module, registry, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn walk_import<'src>(
+    node: &Spanned<Rc<RefCell<Import<'src>>>>,
+    prefix: &[String],
+    current_module: ModuleId,
+    registry: &mut ProgramRegistry<'src>,
+    errors: &mut Vec<LakeError>,
+) {
+    let import_span = node.span;
+    let borrowed = node.inner.borrow();
+    match &*borrowed {
+        Import::Import(ident, Some(next), _alias) => {
+            let mut new_prefix = prefix.to_vec();
+            new_prefix.push(ident.inner.0.to_string());
+            // `next` is an Rc held by `borrowed`'s Import variant; clone
+            // the Spanned so we can drop the borrow before recursing.
+            let next_cloned = next.clone();
+            drop(borrowed);
+            walk_import(&next_cloned, &new_prefix, current_module, registry, errors);
+        }
+        Import::Import(ident, None, alias) => {
+            if prefix.is_empty() {
+                errors.push(
+                    LakeError::new(
+                        format!(
+                            "import `+{}` is too short — at least \
+                             `+module.item` is required",
+                            ident.inner.0
+                        ),
+                        import_span,
+                    )
+                    .code("M004"),
+                );
+                return;
+            }
+            let module_path = ModulePath(prefix.to_vec());
+            let target_id = match registry.module_id_for_path(&module_path) {
+                Some(id) => id,
+                None => {
+                    errors.push(
+                        LakeError::new(
+                            format!(
+                                "import target module `{}` was not loaded",
+                                module_path.display()
+                            ),
+                            import_span,
+                        )
+                        .code("M005"),
+                    );
+                    return;
+                }
+            };
+            let local_name = alias
+                .as_ref()
+                .map(|a| a.inner.0.to_string())
+                .unwrap_or_else(|| ident.inner.0.to_string());
+            registry.module_mut(current_module).imports.insert(
+                local_name,
+                ImportBinding {
+                    target_module: target_id,
+                    target_item: ident.inner.0.to_string(),
+                },
+            );
+        }
+        Import::MultiImport(entries) => {
+            // Snapshot then drop borrow so we can call walk_import which
+            // also borrows the registry mutably.
+            let entries_clone: Vec<_> = entries.clone();
+            drop(borrowed);
+            for entry in &entries_clone {
+                walk_import(entry, prefix, current_module, registry, errors);
+            }
+        }
+    }
 }
 
 /// Result of [`ProgramRegistry::resolve_bare`] / [`resolve_in_module`].
@@ -346,6 +599,100 @@ mod tests {
         let a = reg.register_module(p.clone(), None);
         let b = reg.register_module(p, None);
         assert_eq!(a, b);
+    }
+
+    fn parse_one(src: &str) -> Vec<Spanned<Item<'_>>> {
+        use chumsky::input::Input;
+        use chumsky::Parser;
+        let tokens = crate::lexer::lexer().parse(src).into_result().unwrap();
+        crate::parser::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .unwrap()
+    }
+
+    #[test]
+    fn populate_registers_machines_in_root_module() {
+        // Use loader-style inputs so we can call populate_from.
+        let src = "@rt(rt_write)\npub greet is { _ -> { } }\nmain is { _ -> { } }";
+        let ast = parse_one(src);
+
+        let program = crate::loader::ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("main.lake"),
+                ast,
+            }],
+        };
+
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&program).expect("populates");
+
+        let root = reg.module(ModuleId::ROOT);
+        assert!(root.machines.contains_key("greet"));
+        assert!(root.machines.contains_key("main"));
+        assert!(root.machines["greet"].is_pub);
+        assert!(!root.machines["main"].is_pub);
+    }
+
+    #[test]
+    fn populate_collects_branch_signatures() {
+        let src = "counter is { 0 i64 -> { } n i64 -> { self(n) } }";
+        let ast = parse_one(src);
+        let program = crate::loader::ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("main.lake"),
+                ast,
+            }],
+        };
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&program).expect("populates");
+
+        let entry = &reg.module(ModuleId::ROOT).machines["counter"];
+        assert_eq!(entry.branches.len(), 2);
+        assert_eq!(entry.branches[0].params, vec!["i64".to_string()]);
+        assert_eq!(entry.branches[1].params, vec!["i64".to_string()]);
+        assert_eq!(entry.spawn_ret(), "pid");
+    }
+
+    #[test]
+    fn populate_records_imports_with_alias() {
+        let core_io_src = "pub println is { s str -> { } }";
+        let main_src = "+core.io.println as p\nmain is { _ -> { p(\"hi\") } }";
+
+        let core_ast = parse_one(core_io_src);
+        let main_ast = parse_one(main_src);
+
+        let program = crate::loader::ParsedProgram {
+            modules: vec![
+                crate::loader::ParsedModule {
+                    module_path: ModulePath::root(),
+                    source_path: std::path::PathBuf::from("main.lake"),
+                    ast: main_ast,
+                },
+                crate::loader::ParsedModule {
+                    module_path: ModulePath(vec!["core".to_string(), "io".to_string()]),
+                    source_path: std::path::PathBuf::from("core/io.lake"),
+                    ast: core_ast,
+                },
+            ],
+        };
+
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&program).expect("populates");
+
+        let imports = &reg.module(ModuleId::ROOT).imports;
+        assert!(imports.contains_key("p"), "alias `p` should be in scope");
+        let binding = &imports["p"];
+        assert_eq!(binding.target_item, "println");
+
+        // Resolving `p` should give us the `println` machine in core.io.
+        let resolved = reg.resolve_bare("p").expect("resolves");
+        match resolved {
+            Resolution::Machine(m) => assert_eq!(m.name, "println"),
+            _ => panic!("expected machine"),
+        }
     }
 
     #[test]
