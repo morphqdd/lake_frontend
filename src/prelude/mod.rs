@@ -4,6 +4,10 @@ use chumsky::{Parser, input::Input, span::Spanned};
 
 use crate::api::ast::Item;
 use crate::api::token::Token;
+use crate::loader::{ParsedProgram, ProgramSources};
+use crate::registry::ProgramRegistry;
+use crate::resolver::resolve_program;
+use crate::typeck::typecheck_program;
 use crate::{error_handle::LakeErrors, lexer::lexer, parser::program};
 
 pub use crate::resolver::resolve;
@@ -69,4 +73,69 @@ pub fn build_ast<'src, P: AsRef<Path>>(
     } else {
         Err((tokens, all_errors))
     }
+}
+
+/// The fully-cooked compilation context: every loaded source file plus the
+/// resolved, type-checked, registry-aware AST.  Backends pull machines and
+/// directives out of `program.modules`, signature lookups out of `registry`.
+///
+/// Lifetime parameter `'src` ties [`ParsedProgram`] and [`ProgramRegistry`]
+/// to the underlying [`ProgramSources`].  In normal usage the caller owns
+/// the [`ProgramSources`] and produces this struct from
+/// [`build_program`].
+pub struct LakeProgram<'src> {
+    pub program: ParsedProgram<'src>,
+    pub registry: ProgramRegistry<'src>,
+}
+
+/// Multi-file entry point: load the entry source plus all its transitive
+/// `+import` dependencies, parse them, populate the [`ProgramRegistry`],
+/// resolve types, and run typeck.  Returns owned [`ProgramSources`]
+/// alongside the borrowed [`LakeProgram`] so the caller can keep both
+/// alive for the rest of the compilation.
+///
+/// Errors from any stage are accumulated and surfaced together.  The
+/// `ProgramSources` is returned even on error so callers can render
+/// diagnostics with the original source text.
+#[allow(clippy::type_complexity)]
+pub fn load_and_build<P: AsRef<Path>>(
+    entry: P,
+) -> Result<ProgramSources, LakeErrors> {
+    ProgramSources::load(entry)
+}
+
+/// Borrow phase of the multi-file pipeline.  Given owned
+/// [`ProgramSources`], parse every file, build the registry, resolve
+/// types, run typeck, and return the resulting [`LakeProgram`].
+///
+/// Errors from any stage are accumulated.  Lex / parse errors are
+/// tagged per-file; resolver / typeck diagnostics already carry their
+/// own codes.
+pub fn build_program<'src>(
+    sources: &'src ProgramSources,
+) -> Result<LakeProgram<'src>, LakeErrors> {
+    let parsed = sources.parse_all().map_err(|errs| {
+        // Flatten per-file ParseErrors into a single LakeErrors bag so
+        // callers handle one shape.
+        let mut bag = LakeErrors::default();
+        for (_, e) in errs.per_file {
+            bag.extend(e);
+        }
+        bag
+    })?;
+
+    let mut registry: ProgramRegistry<'src> = ProgramRegistry::with_rt();
+    if let Err(e) = registry.populate_from(&parsed) {
+        return Err(e);
+    }
+    let resolved = resolve_program(parsed, &mut registry);
+    let errors = typecheck_program(&resolved, &registry);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    Ok(LakeProgram {
+        program: resolved,
+        registry,
+    })
 }

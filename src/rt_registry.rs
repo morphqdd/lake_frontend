@@ -54,9 +54,15 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         ("rt_init_heap", s(&[], "{}")),
 
         // ── string helpers ──────────────────────────────────────────────
-        ("len", s(&["i64"], "i64")),
-        ("to_string", s(&["i64"], "i64")),
-        ("to_string_with_ln", s(&["i64"], "i64")),
+        //
+        // At the runtime level these all traffic in fat-pointer addresses
+        // (i64), but at the source level Lake types them as `str` so user
+        // code reads naturally:
+        //   `let s = to_string(n)` → s : str
+        //   `len(s)`               → fine, matches the str param
+        ("len", s(&["str"], "i64")),
+        ("to_string", s(&["i64"], "str")),
+        ("to_string_with_ln", s(&["i64"], "str")),
 
         // ── process / scheduler ─────────────────────────────────────────
         ("rt_exit", s(&["i64"], "{}")),
