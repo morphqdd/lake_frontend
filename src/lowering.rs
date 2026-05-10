@@ -75,7 +75,16 @@ pub fn lower_program<'src>(
         })
         .collect();
 
-    ParsedProgram { modules }
+    let result = ParsedProgram { modules };
+    if std::env::var("LAKE_DUMP_LOWERED").is_ok() {
+        for m in &result.modules {
+            eprintln!("=== module {:?} ===", m.module_path);
+            for item in &m.ast {
+                eprintln!("{:#?}", item.inner);
+            }
+        }
+    }
+    result
 }
 
 // ── ret-machine table ──────────────────────────────────────────────────────
@@ -203,6 +212,22 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         body: Vec<Spanned<Expr<'src>>>,
         is_ret_branch: bool,
     ) -> Vec<Spanned<Expr<'src>>> {
+        self.lower_body_impl(body, is_ret_branch, /* is_outermost */ true)
+    }
+
+    /// Internal worker — `is_outermost` controls whether Phase 3 (tail
+    /// wrap into `__caller(self <expr>)`) fires.  The outer branch body
+    /// owns the wrap; recursive calls from Phase 4 on `when` / `wait`
+    /// arm bodies pass `false` so each arm doesn't sprout its own
+    /// wrap (which would double-wrap the user's tail and feed
+    /// `__caller(...)` a self()-state-change argument the backend
+    /// can't fold into a value).
+    fn lower_body_impl(
+        &self,
+        body: Vec<Spanned<Expr<'src>>>,
+        is_ret_branch: bool,
+        is_outermost: bool,
+    ) -> Vec<Spanned<Expr<'src>>> {
         // Phase -1: collapse module-qualified Path callees into bare
         // Var references.  Backend's jump_expr only knows how to call
         // by name (flat symbol space at the codegen layer), so the
@@ -272,6 +297,19 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             .map(|e| self.rewrite_pin(e))
             .collect();
 
+        // Phase 1c: bare `M(args)` where M is a ret-machine becomes
+        // `let __discard_N = M(args)` so the call is awaited.  Without
+        // this, the body races ahead while the callee's side effects
+        // (mutating shared heap state in helpers like `set_be32`,
+        // `process_block`, …) are still pending.  Sequencing matters
+        // — SHA-256's inner loop wouldn't terminate correctly without
+        // it.  The Phase 2 sweep below sees the synth let just like
+        // any other and expands it into wait + pid_let.
+        let body: Vec<_> = body
+            .into_iter()
+            .map(|e| self.wrap_bare_ret_call_in_let(e))
+            .collect();
+
         // Phase 2: caller-side desugaring.  We iterate top-down; a
         // let-with-ret-call folds the remainder of the body into a wait
         // body, which itself may contain further ret-calls.  The
@@ -285,25 +323,123 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                 new_body.append(&mut emitted);
                 break;
             }
-            if let Some(rewritten) = self.try_rewrite_bare_ret_call(&expr) {
-                new_body.push(rewritten);
-                continue;
-            }
             new_body.push(expr);
         }
 
         // Phase 3: tail wrap for ret-branches.  Skip when the last
         // expression is already a __caller send (the user wrote `ret X`
-        // there) or when the body is empty (ret-typed branch with no
-        // value is a typeck issue, not ours to solve).
+        // there) or when the body is empty.  Only the outermost body
+        // wraps — Phase 4 calls back into `lower_body_impl` with
+        // `is_outermost=false` for each arm, since the outer wrap
+        // already accounts for the fall-through value.
         if is_ret_branch
+            && is_outermost
             && let Some(last) = new_body.last_mut()
             && !is_caller_send(&last.inner)
         {
             wrap_in_caller_send(last);
         }
 
+        // Phase 4: re-enter `when` / `wait` arm bodies as their own
+        // sub-bodies so lift + expand_let_with_ret get the same shot
+        // at them they get at the top-level body.  Without this,
+        // `let s = ret_machine(x)` written inside an arm stays
+        // unlowered (typeck then fails on the un-prepended `self`).
+        // Phase 1 (Ret rewrite) is idempotent, Phase 1.0 has an
+        // explicit `already_threaded` guard, so re-running both on
+        // an arm body that the existing recursion has already
+        // touched is safe.
+        new_body = new_body
+            .into_iter()
+            .map(|e| self.lower_arm_bodies_in_expr(e, is_ret_branch))
+            .collect();
+
         new_body
+    }
+
+    /// Walk an expression and re-run `lower_body` on each nested
+    /// `when` / `wait` arm body.  Each arm carries its own scope, so
+    /// each arm's body is treated as an independent body pass.  The
+    /// `is_ret_branch` flag propagates so arms inherit the enclosing
+    /// branch's return discipline.
+    fn lower_arm_bodies_in_expr(
+        &self,
+        expr: Spanned<Expr<'src>>,
+        is_ret_branch: bool,
+    ) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        let inner = match expr.inner {
+            Expr::When { cond, branches } => {
+                let cond = Box::new(self.lower_arm_bodies_in_expr(*cond, is_ret_branch));
+                let branches = branches
+                    .into_iter()
+                    .map(|(pat, body)| {
+                        let pat = self.lower_arm_bodies_in_expr(pat, is_ret_branch);
+                        let body = self.lower_body_impl(body, is_ret_branch, false);
+                        (pat, body)
+                    })
+                    .collect();
+                Expr::When { cond, branches }
+            }
+            Expr::Wait { handlers, filter } => {
+                let filter = filter
+                    .into_iter()
+                    .map(|f| self.lower_arm_bodies_in_expr(f, is_ret_branch))
+                    .collect();
+                let handlers = handlers
+                    .into_iter()
+                    .map(|h| {
+                        let h_span = h.span;
+                        let mut br = h.inner;
+                        br.body = self.lower_body_impl(br.body, is_ret_branch, false);
+                        br.with_span(h_span)
+                    })
+                    .collect();
+                Expr::Wait { handlers, filter }
+            }
+            Expr::Let { ident, ty, default } => Expr::Let {
+                ident,
+                ty,
+                default: default
+                    .map(|d| Box::new(self.lower_arm_bodies_in_expr(*d, is_ret_branch))),
+            },
+            // Phase 3 may have wrapped the tail in `__caller(self
+            // <expr>)`.  Descend through the synthetic Jump so a
+            // wrapped `when` / `wait` still gets its arm bodies
+            // lowered.  Other AST shapes that can host a control-flow
+            // node (Ret, Pin, Tuple, TupleIndex, Neg) get the same
+            // treatment.
+            Expr::Jump { ident, args } => Expr::Jump {
+                ident: Box::new(self.lower_arm_bodies_in_expr(*ident, is_ret_branch)),
+                args: args
+                    .into_iter()
+                    .map(|a| self.lower_arm_bodies_in_expr(a, is_ret_branch))
+                    .collect(),
+            },
+            Expr::Ret(inner) => Expr::Ret(Box::new(
+                self.lower_arm_bodies_in_expr(*inner, is_ret_branch),
+            )),
+            Expr::Pin(inner) => Expr::Pin(Box::new(
+                self.lower_arm_bodies_in_expr(*inner, is_ret_branch),
+            )),
+            Expr::Tuple(elems) => Expr::Tuple(
+                elems
+                    .into_iter()
+                    .map(|e| self.lower_arm_bodies_in_expr(e, is_ret_branch))
+                    .collect(),
+            ),
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(
+                    self.lower_arm_bodies_in_expr(*receiver, is_ret_branch),
+                ),
+                index,
+            },
+            Expr::Neg(inner) => Expr::Neg(Box::new(
+                self.lower_arm_bodies_in_expr(*inner, is_ret_branch),
+            )),
+            other => other,
+        };
+        inner.with_span(span)
     }
 
     /// Expand every `Expr::LetTuple { fields, default }` in a body
@@ -384,11 +520,21 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                     &ident.inner,
                     Expr::Var("self", _)
                 );
+                // Idempotency guard: if a previous pass already
+                // prepended `__caller`, don't add a second copy.
+                // This matters because Phase 4 re-runs lower_body on
+                // when/wait arm bodies, which fires this pass again
+                // on already-threaded calls.
+                let already_threaded = is_self_call
+                    && args
+                        .first()
+                        .map(|a| matches!(&a.inner, Expr::Var("__caller", _)))
+                        .unwrap_or(false);
                 let new_args: Vec<_> = args
                     .into_iter()
                     .map(|a| self.thread_caller_in_self_calls(a))
                     .collect();
-                let final_args = if is_self_call {
+                let final_args = if is_self_call && !already_threaded {
                     let mut prepended = Vec::with_capacity(new_args.len() + 1);
                     prepended.push(
                         Expr::Var("__caller", Type::Named(
@@ -683,13 +829,91 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             Expr::Neg(inner) => {
                 Expr::Neg(Box::new(self.lift_in_expr(*inner, lifts))).with_span(span)
             }
-            // when / wait have their own scoped bodies — recursing into
-            // them would bleed lifts across arms, which is wrong.  Lifts
-            // for those should happen inside the arm's own body when the
-            // pipeline re-enters lower_body for that scope.  For now the
-            // outer arm cond / filter slot can still contain a call;
-            // surface that as-is and let backend handle (or fail) — this
-            // matches the pre-lift behaviour.
+            // Binary operators recurse into both operands — `lift_arg`
+            // hoists any nested ret-machine call out of arithmetic /
+            // bitwise / compare positions into a fresh `let __lift_<id>`
+            // so expand_let_with_ret can later cascade it through a
+            // wait-handler.  Without this, `rotr32(x 2) ^ rotr32(x 13)`
+            // stays as two unlifted Jumps and typeck fails because
+            // they never gain the synthetic `self` first arg the
+            // ret-machine signature expects after lowering.
+            Expr::Add(l, r) => Expr::Add(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Sub(l, r) => Expr::Sub(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Mul(l, r) => Expr::Mul(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Div(l, r) => Expr::Div(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Eq(l, r) => Expr::Eq(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Lt(l, r) => Expr::Lt(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Gt(l, r) => Expr::Gt(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Le(l, r) => Expr::Le(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Ge(l, r) => Expr::Ge(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::BAnd(l, r) => Expr::BAnd(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::BOr(l, r) => Expr::BOr(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::BXor(l, r) => Expr::BXor(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Shl(l, r) => Expr::Shl(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            Expr::Shr(l, r) => Expr::Shr(
+                Box::new(self.lift_arg(*l, lifts)),
+                Box::new(self.lift_arg(*r, lifts)),
+            )
+            .with_span(span),
+            // when / wait arm bodies have their own scope; Phase 4 in
+            // `lower_body` re-enters each arm by recursively calling
+            // lower_body, which fires this pass on the arm body in
+            // isolation.  Recursing here would bleed lifts across
+            // arms (lifts pushed into the outer body, referenced from
+            // an arm body that the lift's binding is no longer
+            // visible in).
             other => other.with_span(span),
         }
     }
@@ -1108,6 +1332,37 @@ impl<'a, 'src> LowerCx<'a, 'src> {
     /// Bare `M(args)` (no let) calling a ret-machine: prepend the null
     /// pid sentinel `0` so the callee's `__caller(self X)` send is a
     /// no-op at runtime.
+    /// Wrap a bare top-level call `M(args)` whose callee is a
+    /// ret-machine in a synthetic `let __discard_<id> = M(args)`.
+    /// The Phase 2 sweep then expands the let into wait + pid_let,
+    /// turning the bare call into a sync await.  Non-ret callees
+    /// (rt-funcs, regular machines, pid sends) pass through.
+    fn wrap_bare_ret_call_in_let(
+        &self,
+        expr: Spanned<Expr<'src>>,
+    ) -> Spanned<Expr<'src>> {
+        // Only act on top-level Jump expressions.  Let / When / Wait /
+        // arith etc are walked by other phases; the bare-call shape
+        // is exactly `M(args)` at statement position.
+        if !matches!(expr.inner, Expr::Jump { .. }) {
+            return expr;
+        }
+        if self.ret_target(&expr.inner).is_none() {
+            return expr;
+        }
+        let span = expr.span;
+        let id = self.fresh_id();
+        let name: &'static str =
+            Box::leak(format!("__discard_{id}").into_boxed_str());
+        Expr::Let {
+            ident: Ident::new(name).with_span(span),
+            ty: Type::Unknown.with_span(span),
+            default: Some(Box::new(expr)),
+        }
+        .with_span(span)
+    }
+
+    #[allow(dead_code)]
     fn try_rewrite_bare_ret_call(
         &self,
         expr: &Spanned<Expr<'src>>,
@@ -1116,6 +1371,16 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             return None;
         };
         let _ = self.ret_target(&expr.inner)?;
+        // Idempotency guard: a pid-typed first arg means a previous
+        // pass already prepended either a `self` (caller-side
+        // expand_let_with_ret) or a `0` null sentinel (this pass).
+        // Phase 4 re-runs lower_body on `when` / `wait` arm bodies,
+        // which would otherwise stack one extra null pid per pass.
+        if let Some(first) = args.first()
+            && first_arg_is_pid(&first.inner)
+        {
+            return None;
+        }
         let span = expr.span;
         let null_pid = synth_null_pid(span);
         let mut new_args = Vec::with_capacity(args.len() + 1);
@@ -1229,6 +1494,19 @@ fn synth_caller_pattern<'src>(span: SimpleSpan) -> Spanned<Pattern<'src>> {
         Type::Named(Ident::new("pid").with_span(span)).with_span(span),
     )
     .with_span(span)
+}
+
+/// Cheap shape check: does `expr` evaluate to a pid?  Used by the
+/// bare-ret-call rewrite as an idempotency marker — if the first
+/// argument is already a pid expression, the prepend has already
+/// fired on a previous pass.  We accept both the `0`-pid sentinel
+/// and `self` since both shapes pre-date a re-run.
+fn first_arg_is_pid<'src>(expr: &Expr<'src>) -> bool {
+    match expr {
+        Expr::Var(_, Type::Named(t)) if t.inner.0 == "pid" => true,
+        Expr::Num(_, Type::Named(t)) if t.inner.0 == "pid" => true,
+        _ => false,
+    }
 }
 
 fn synth_null_pid<'src>(span: SimpleSpan) -> Spanned<Expr<'src>> {

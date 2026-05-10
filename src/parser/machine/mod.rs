@@ -46,7 +46,10 @@ pub fn machine<'t, 'src: 't>()
             ident_parser()
                 .repeated()
                 .collect::<Vec<_>>()
-                .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+                .nested_in(select_ref!(
+                    Token::Parens(ts) = e => ts.split_spanned(e.span()),
+                    Token::TightParens(ts) = e => ts.split_spanned(e.span()),
+                ))
                 .or_not()
                 .map(|g| g.unwrap_or_default()),
         )

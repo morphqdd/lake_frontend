@@ -7,7 +7,19 @@ pub enum Token<'src> {
     Ident(&'src str),
     Num(&'src str),
     String(&'src str),
+    /// `(...)` with at least one whitespace between the opening `(`
+    /// and the previous non-comment token.  Use sites:
+    ///   * paren-group (`(a + b) * c`).
+    ///   * fresh argument in an arg-list (`f(x (y - 1))`).
+    /// Never matched by the postfix-call rule — a space before `(` is
+    /// the syntactic signal that `(` opens a new value, not a call.
     Parens(Vec<Spanned<Self>>),
+    /// `(...)` whose opening `(` byte-position is exactly the end of
+    /// the previous non-comment token.  Lake's call grammar is
+    /// `f(args)` with no whitespace; this variant exists so the
+    /// parser can distinguish `f(x)` (call) from `f (x)` (Var + value)
+    /// without comma separators.
+    TightParens(Vec<Spanned<Self>>),
     SquareBrackets(Vec<Spanned<Self>>),
     CurlyBrackets(Vec<Spanned<Self>>),
 
@@ -98,6 +110,7 @@ impl<'src> Display for Token<'src> {
             Token::Less => write!(f, "<"),
             Token::Greater => write!(f, ">"),
             Token::Parens(_) => write!(f, "( ... )"),
+            Token::TightParens(_) => write!(f, "( ... )"),
             Token::SquareBrackets(_) => write!(f, "[ ... ]"),
             Token::CurlyBrackets(_) => write!(f, "{{ ... }}"),
             Token::At => write!(f, "@"),

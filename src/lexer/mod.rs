@@ -89,6 +89,14 @@ pub fn lexer<'src>()
                             .unwrap_or(s),
                     )
                 }),
+            // Container tokens collect their inner tokens via this
+            // recursion, but the top-level `Comment`-filter only fires
+            // on the outermost stream — so any `// ...` inside
+            // `(...)`, `{...}`, or `[...]` would survive the filter
+            // and surface to the parser as a stray `Token::Comment`,
+            // breaking branch / call grammars.  Each container
+            // therefore filters comments out of its own inner Vec
+            // before tagging the wrapping token.
             token
                 .clone()
                 .padded()
@@ -97,7 +105,9 @@ pub fn lexer<'src>()
                 .collect::<Vec<_>>()
                 .padded()
                 .delimited_by(just("("), just(")"))
-                .map(Token::Parens),
+                .map(|toks: Vec<Spanned<Token>>| {
+                    Token::Parens(toks.into_iter().filter(|t| !matches!(t.inner, Token::Comment)).collect())
+                }),
             token
                 .clone()
                 .padded()
@@ -106,14 +116,18 @@ pub fn lexer<'src>()
                 .collect::<Vec<_>>()
                 .padded()
                 .delimited_by(just("{"), just("}"))
-                .map(Token::CurlyBrackets),
+                .map(|toks: Vec<Spanned<Token>>| {
+                    Token::CurlyBrackets(toks.into_iter().filter(|t| !matches!(t.inner, Token::Comment)).collect())
+                }),
             token
                 .padded()
                 .repeated()
                 .at_least(0)
-                .collect()
+                .collect::<Vec<_>>()
                 .delimited_by(just("[").padded(), just("]").padded())
-                .map(Token::SquareBrackets),
+                .map(|toks: Vec<Spanned<Token>>| {
+                    Token::SquareBrackets(toks.into_iter().filter(|t| !matches!(t.inner, Token::Comment)).collect())
+                }),
         ))
         .spanned()
         .padded()
@@ -121,11 +135,58 @@ pub fn lexer<'src>()
     .repeated()
     .collect()
     .map(|tokens: Vec<Spanned<Token>>| {
-        // Filter out comments
-        tokens.into_iter()
+        // Filter out comments, then tag each `Parens` as tight or
+        // loose based on adjacency to the previous token.  A `(` whose
+        // byte-position is exactly the previous token's end means
+        // no whitespace separated them — Lake's call grammar reads
+        // this as `f(args)`.  A space before the `(` flips the token
+        // to plain `Parens`, which the parser treats as a value-level
+        // paren-group (never as a postfix call).
+        let filtered: Vec<Spanned<Token>> = tokens
+            .into_iter()
             .filter(|t| !matches!(t.inner, Token::Comment))
-            .collect()
+            .collect();
+        tag_paren_adjacency(filtered)
     })
+}
+
+/// Walk a flat token stream and promote each `Parens` whose opening
+/// `(` byte-position equals the previous token's end byte-position to
+/// `TightParens`.  Recurses into nested container tokens so an `(a)`
+/// inside another `(b ...)` is also tagged correctly.
+fn tag_paren_adjacency<'src>(
+    tokens: Vec<Spanned<Token<'src>>>,
+) -> Vec<Spanned<Token<'src>>> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut prev_end: Option<usize> = None;
+    for tok in tokens {
+        let start: usize = tok.span.start;
+        let end: usize = tok.span.end;
+        let tight = prev_end == Some(start);
+        let new_inner = match tok.inner {
+            Token::Parens(inner) => {
+                let inner = tag_paren_adjacency(inner);
+                if tight {
+                    Token::TightParens(inner)
+                } else {
+                    Token::Parens(inner)
+                }
+            }
+            Token::CurlyBrackets(inner) => {
+                Token::CurlyBrackets(tag_paren_adjacency(inner))
+            }
+            Token::SquareBrackets(inner) => {
+                Token::SquareBrackets(tag_paren_adjacency(inner))
+            }
+            other => other,
+        };
+        out.push(Spanned {
+            inner: new_inner,
+            span: tok.span,
+        });
+        prev_end = Some(end);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -392,5 +453,36 @@ counter is {
         // Should have: counter, is, {, n, i64, ->, {, self, (, n, -, 1, ), }, }
         assert!(tokens.len() > 0);
         assert!(matches!(tokens[0].inner, Token::Ident("counter")));
+    }
+}
+
+#[cfg(test)]
+mod bracket_comment_test {
+    use chumsky::Parser;
+    use crate::lexer::lexer;
+
+    #[test]
+    fn brackets_in_comment_top_level() {
+        let result = lexer().parse("x i64 // has [brackets]\ny i64").into_result();
+        assert!(result.is_ok(), "lexer rejected brackets in comment: {:?}", result);
+    }
+
+    #[test]
+    fn brackets_in_comment_inside_braces() {
+        let src = "f is { x i64 -> {\n    // [brackets]\n    ret x\n  }\n}";
+        let result = lexer().parse(src).into_result();
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn comment_inside_curly_block() {
+        // Body of a branch is wrapped in `{}` — comments inside that
+        // block must not pollute the inner token stream.  Reproduces
+        // the sha256.lake parse failure where `// W[0..15]` was
+        // tokenised through the SquareBrackets path inside curlies.
+        use crate::api::token::Token;
+        let src = "f is {\n  x i64 -> ret i64 {\n    // W[0..15] note\n    ret x + 1\n  }\n}";
+        let result = lexer().parse(src).into_result();
+        assert!(result.is_ok(), "lexer rejected comment-with-brackets inside curly body: {:?}", result);
     }
 }

@@ -99,16 +99,24 @@ pub fn expr<'t, 'src: 't>()
 
         // `(expr)` — parenthesised grouping at expression-start.  The
         // same `Parens` token serves as the postfix `Call(args)`
-        // delimiter, but call grammar attaches parens to a preceding
-        // atom; reaching `atom` with a `(` means we are at a value
-        // position, so a single nested expression is grouping.
-        // Multi-expression parens (more than one item) stay reserved
-        // for the call form — we explicitly match exactly one inner
-        // expression so `f(a b)` continues to parse as `Jump(f, [a, b])`
-        // via the postfix rule.
+        // delimiter, so calling `(expr)` ambiguates with using the
+        // grouping in an argument list (`f((w) (i-2)*4)` would parse
+        // as `f(w(i-2) * 4)` if `(w)` could carry a postfix call).
+        // Solution: paren_group lives at the primary level (next to
+        // atom-with-postfix), NOT inside `atom`, so it never accrues
+        // a postfix `(...)` of its own.  To call a value-of-expression
+        // anyway, hoist via `let f_val = (...); f_val(args)`.
+        // Grouping accepts both shapes — a parenthesised value is a
+        // group whether or not whitespace precedes it (`(x + 1)` at
+        // any position).  Only the postfix call rule cares about the
+        // distinction, since calls must be tight (no space between
+        // callee and `(`).
         let paren_group = expr
             .clone()
-            .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+            .nested_in(select_ref!(
+                Token::Parens(ts) = e => ts.split_spanned(e.span()),
+                Token::TightParens(ts) = e => ts.split_spanned(e.span()),
+            ))
             .map(|inner: Spanned<Expr<'src>>| inner.inner);
 
         let atom = choice((
@@ -281,20 +289,28 @@ pub fn expr<'t, 'src: 't>()
             TupleIdx(usize),
         }
 
+        // Postfix call only attaches when the `(` is tight (no
+        // whitespace between callee and parens).  `Token::TightParens`
+        // is emitted by the lexer's adjacency post-pass; the plain
+        // `Token::Parens` variant means a space-separated `(...)`
+        // which is grammar-level "fresh value", not a call.
         let call_op = expr
             .clone()
             .repeated()
             .collect::<Vec<_>>()
-            .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+            .nested_in(select_ref!(Token::TightParens(ts) = e => ts.split_spanned(e.span())))
             .map(PostfixOp::Call);
 
+        // `@method(args)` reuses tight parens for the same reason —
+        // `obj@m (args)` would otherwise parse `obj@m` and then drop
+        // `(args)` as a stranded paren-group.
         let at_op = just(Token::At)
             .ignore_then(ident_parser())
             .then(
                 expr.clone()
                     .repeated()
                     .collect::<Vec<_>>()
-                    .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+                    .nested_in(select_ref!(Token::TightParens(ts) = e => ts.split_spanned(e.span())))
                     .or_not(),
             )
             .map(|(method, args)| match args {
