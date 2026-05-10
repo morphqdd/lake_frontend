@@ -511,6 +511,22 @@ mod tests {
     }
 
     #[test]
+    fn let_destructure_two_fields() {
+        with_branch_expr(
+            r#"m is { _ -> { let { a b } = { 1 2 } } }"#,
+            |expr| {
+                let Expr::LetTuple { fields, default } = expr else {
+                    panic!("expected LetTuple, got {expr:?}")
+                };
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].inner, Ident::new("a"));
+                assert_eq!(fields[1].inner, Ident::new("b"));
+                assert!(matches!(default.inner, Expr::Tuple(_)));
+            },
+        );
+    }
+
+    #[test]
     fn tuple_index_access() {
         with_branch_expr("m is { _ -> { let x = pair.0 } }", |expr| {
             let Expr::Let { default, .. } = expr else {

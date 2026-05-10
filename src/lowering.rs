@@ -203,7 +203,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         body: Vec<Spanned<Expr<'src>>>,
         is_ret_branch: bool,
     ) -> Vec<Spanned<Expr<'src>>> {
-        // Phase 0: inline `const` values.  Every `Expr::Var(name, _)` whose
+        // Phase 0a: inline `const` values.  Every `Expr::Var(name, _)` whose
         // bare-name resolution lands on a `Resolution::Const(_)` is
         // replaced by the literal expression encoded by the const.
         // After this pass the rest of the pipeline never sees const
@@ -212,6 +212,13 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             .into_iter()
             .map(|e| self.inline_consts(e))
             .collect();
+
+        // Phase 0b: expand `let { a b } = expr` destructure.  Each
+        // LetTuple statement is replaced by N+1 ordinary lets:
+        // a synthetic `__dst_<id>` for the source value, plus one
+        // `let f = __dst_<id>.<i>` per field.  Sequential expansion
+        // keeps source ordering stable.
+        let body = self.expand_let_tuple(body);
 
         // Phase 1: recursive `Expr::Ret` → `__caller(self X)` rewrite.
         let body: Vec<_> = body
@@ -261,6 +268,67 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         }
 
         new_body
+    }
+
+    /// Expand every `Expr::LetTuple { fields, default }` in a body
+    /// into a synthetic temporary binding plus one ordinary `Let`
+    /// per field.  Run after const inlining so the destructured
+    /// expression has already had any const folded into a literal.
+    fn expand_let_tuple(
+        &self,
+        body: Vec<Spanned<Expr<'src>>>,
+    ) -> Vec<Spanned<Expr<'src>>> {
+        let mut out = Vec::with_capacity(body.len());
+        for expr in body {
+            let span = expr.span;
+            match expr.inner {
+                Expr::LetTuple { fields, default } => {
+                    let id = self.fresh_id();
+                    let synth_name: &'static str =
+                        Box::leak(format!("__dst_{id}").into_boxed_str());
+                    let synth_ident =
+                        Ident::new(synth_name).with_span(span);
+
+                    // let __dst_<id> = <default>
+                    out.push(
+                        Expr::Let {
+                            ident: synth_ident.clone(),
+                            ty: Type::Unknown.with_span(span),
+                            default: Some(default),
+                        }
+                        .with_span(span),
+                    );
+
+                    // let <field_i> = __dst_<id>.<i>
+                    for (i, fname) in fields.into_iter().enumerate() {
+                        let receiver =
+                            Expr::Var(synth_name, Type::Unknown).with_span(span);
+                        out.push(
+                            Expr::Let {
+                                ident: fname.clone(),
+                                ty: Type::Unknown.with_span(fname.span),
+                                default: Some(Box::new(
+                                    Expr::TupleIndex {
+                                        receiver: Box::new(receiver),
+                                        index: i,
+                                    }
+                                    .with_span(span),
+                                )),
+                            }
+                            .with_span(fname.span),
+                        );
+                    }
+                }
+                other => out.push(other.with_span(span)),
+            }
+        }
+        out
+    }
+
+    fn fresh_id(&self) -> u32 {
+        let id = self.counter.get();
+        self.counter.set(id + 1);
+        id
     }
 
     /// Replace every `Expr::Var(name, _)` whose bare-name resolution

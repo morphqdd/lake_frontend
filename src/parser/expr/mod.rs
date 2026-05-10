@@ -188,6 +188,24 @@ pub fn expr<'t, 'src: 't>()
             )
             .map(|(filter, handlers)| Expr::Wait { handlers, filter });
 
+        // `let { a b c } = expr` — positional tuple destructure.
+        // Tried before the regular let so the `{` after `let` doesn't
+        // get misread as a block.
+        let let_destructure = just(Token::Let)
+            .ignore_then(
+                ident_parser()
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>()
+                    .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span()))),
+            )
+            .then_ignore(just(Token::Eq))
+            .then(expr.clone())
+            .map(|(fields, default)| Expr::LetTuple {
+                fields,
+                default: Box::new(default),
+            });
+
         let let_expr = just(Token::Let)
             .ignore_then(ident_parser())
             .then(type_expr().boxed().or_not())
@@ -224,6 +242,7 @@ pub fn expr<'t, 'src: 't>()
             ret_expr.spanned().boxed(),
             pin_expr.spanned().boxed(),
             wait_expr.spanned().boxed(),
+            let_destructure.spanned().boxed(),
             let_expr.spanned().boxed(),
             when_expr.spanned(),
             atom.spanned(),

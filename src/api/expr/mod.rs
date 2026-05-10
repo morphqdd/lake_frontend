@@ -71,6 +71,16 @@ pub enum Expr<'src> {
         index: usize,
     },
 
+    /// `let { a b c } = expr` — positional tuple destructure.
+    /// The lowering pass expands this into a synthetic temporary
+    /// binding for `expr` plus one ordinary `Expr::Let` per field
+    /// (`let a = __dst_<id>.0`, `let b = __dst_<id>.1`, …).  Resolver
+    /// and codegen never see this variant.
+    LetTuple {
+        fields: Vec<Spanned<Ident<'src>>>,
+        default: Box<Spanned<Self>>,
+    },
+
     // ── Pattern matching ──────────────────────────────────────────────────
     /// `when expr { pat -> { body } ... }`
     When {
