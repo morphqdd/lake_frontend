@@ -203,6 +203,16 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         body: Vec<Spanned<Expr<'src>>>,
         is_ret_branch: bool,
     ) -> Vec<Spanned<Expr<'src>>> {
+        // Phase 0: inline `const` values.  Every `Expr::Var(name, _)` whose
+        // bare-name resolution lands on a `Resolution::Const(_)` is
+        // replaced by the literal expression encoded by the const.
+        // After this pass the rest of the pipeline never sees const
+        // references — codegen needs no special-case lookup.
+        let body: Vec<_> = body
+            .into_iter()
+            .map(|e| self.inline_consts(e))
+            .collect();
+
         // Phase 1: recursive `Expr::Ret` → `__caller(self X)` rewrite.
         let body: Vec<_> = body
             .into_iter()
@@ -251,6 +261,145 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         }
 
         new_body
+    }
+
+    /// Replace every `Expr::Var(name, _)` whose bare-name resolution
+    /// lands on a `Resolution::Const` with the literal Expr that the
+    /// const declares.  Recursive across all Expr shapes.
+    fn inline_consts(&self, expr: Spanned<Expr<'src>>) -> Spanned<Expr<'src>> {
+        use crate::registry::{ConstValue, Resolution};
+        let span = expr.span;
+        let inner = match expr.inner {
+            Expr::Var(name, ref ty) => {
+                if let Some(Resolution::Const(c)) =
+                    self.registry.resolve_bare_in(self.module_id, name)
+                {
+                    let ty_named = |s: &'static str| {
+                        Type::Named(Ident::new(s).with_span(span))
+                    };
+                    return match &c.value {
+                        ConstValue::Int(v) => {
+                            let leaked: &'static str =
+                                Box::leak(v.to_string().into_boxed_str());
+                            Expr::Num(leaked, ty_named("i64")).with_span(span)
+                        }
+                        ConstValue::Bool(b) => Expr::Bool(*b).with_span(span),
+                        ConstValue::Str(s) => {
+                            let leaked: &'static str =
+                                Box::leak(s.clone().into_boxed_str());
+                            Expr::String(leaked, ty_named("str")).with_span(span)
+                        }
+                        ConstValue::Atom(s) => {
+                            let leaked: &'static str =
+                                Box::leak(s.clone().into_boxed_str());
+                            Expr::Atom(leaked).with_span(span)
+                        }
+                    };
+                }
+                Expr::Var(name, ty.clone())
+            }
+            Expr::Let { ident, ty, default } => Expr::Let {
+                ident,
+                ty,
+                default: default.map(|d| Box::new(self.inline_consts(*d))),
+            },
+            Expr::Jump { ident, args } => Expr::Jump {
+                ident: Box::new(self.inline_consts(*ident)),
+                args: args.into_iter().map(|a| self.inline_consts(a)).collect(),
+            },
+            Expr::MethodCall { receiver, method, args } => Expr::MethodCall {
+                receiver: Box::new(self.inline_consts(*receiver)),
+                method,
+                args: args.into_iter().map(|a| self.inline_consts(a)).collect(),
+            },
+            Expr::AtAccess { receiver, field } => Expr::AtAccess {
+                receiver: Box::new(self.inline_consts(*receiver)),
+                field,
+            },
+            Expr::DotAccess { receiver, field } => Expr::DotAccess {
+                receiver: Box::new(self.inline_consts(*receiver)),
+                field,
+            },
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(self.inline_consts(*receiver)),
+                index,
+            },
+            Expr::StructInit { base, fields } => Expr::StructInit {
+                base: Box::new(self.inline_consts(*base)),
+                fields: fields.into_iter().map(|f| self.inline_consts(f)).collect(),
+            },
+            Expr::Tuple(elems) => Expr::Tuple(
+                elems.into_iter().map(|e| self.inline_consts(e)).collect(),
+            ),
+            Expr::When { cond, branches } => Expr::When {
+                cond: Box::new(self.inline_consts(*cond)),
+                branches: branches
+                    .into_iter()
+                    .map(|(p, body)| {
+                        (
+                            self.inline_consts(p),
+                            body.into_iter().map(|e| self.inline_consts(e)).collect(),
+                        )
+                    })
+                    .collect(),
+            },
+            Expr::Wait { handlers, filter } => Expr::Wait {
+                handlers: handlers
+                    .into_iter()
+                    .map(|h| {
+                        let span = h.span;
+                        let mut br = h.inner;
+                        br.body = br.body
+                            .into_iter()
+                            .map(|e| self.inline_consts(e))
+                            .collect();
+                        br.with_span(span)
+                    })
+                    .collect(),
+                filter: filter.into_iter().map(|f| self.inline_consts(f)).collect(),
+            },
+            Expr::Add(l, r) => Expr::Add(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Sub(l, r) => Expr::Sub(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Mul(l, r) => Expr::Mul(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Div(l, r) => Expr::Div(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Le(l, r) => Expr::Le(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Ge(l, r) => Expr::Ge(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Eq(l, r) => Expr::Eq(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Lt(l, r) => Expr::Lt(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Gt(l, r) => Expr::Gt(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Neg(inner) => Expr::Neg(Box::new(self.inline_consts(*inner))),
+            Expr::Ret(inner) => Expr::Ret(Box::new(self.inline_consts(*inner))),
+            Expr::Pin(inner) => Expr::Pin(Box::new(self.inline_consts(*inner))),
+            other => other,
+        };
+        inner.with_span(span)
     }
 
     /// Rewrite `pin <expr>` at the top level of a body sequence into
