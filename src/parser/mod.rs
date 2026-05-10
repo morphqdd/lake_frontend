@@ -470,4 +470,51 @@ mod tests {
             ));
         });
     }
+
+    #[test]
+    fn let_with_tuple_literal() {
+        // `{ 1 "alice" }` in value position is a tuple, not a block.
+        with_branch_expr(r#"m is { _ -> { let p = { 1 "alice" } } }"#, |expr| {
+            let Expr::Let { default, .. } = expr else {
+                panic!("expected Let, got {expr:?}")
+            };
+            let inner = default.expect("expected default").inner;
+            let Expr::Tuple(elems) = inner else {
+                panic!("expected Tuple, got {inner:?}")
+            };
+            assert_eq!(elems.len(), 2);
+            assert!(matches!(elems[0].inner, Expr::Num("1", _)));
+            assert!(matches!(elems[1].inner, Expr::String("alice", _)));
+        });
+    }
+
+    #[test]
+    fn let_with_atom_literal() {
+        with_branch_expr("m is { _ -> { let r = :ok } }", |expr| {
+            let Expr::Let { default, .. } = expr else {
+                panic!("expected Let, got {expr:?}")
+            };
+            assert!(matches!(
+                default.expect("expected default").inner,
+                Expr::Atom("ok")
+            ));
+        });
+    }
+
+    #[test]
+    fn let_with_tagged_tuple() {
+        // Erlang-flavoured tagged tuple: first element is an atom, rest values.
+        with_branch_expr("m is { _ -> { let r = { :ok 42 } } }", |expr| {
+            let Expr::Let { default, .. } = expr else {
+                panic!("expected Let, got {expr:?}")
+            };
+            let inner = default.expect("expected default").inner;
+            let Expr::Tuple(elems) = inner else {
+                panic!("expected Tuple, got {inner:?}")
+            };
+            assert_eq!(elems.len(), 2);
+            assert!(matches!(elems[0].inner, Expr::Atom("ok")));
+            assert!(matches!(elems[1].inner, Expr::Num("42", _)));
+        });
+    }
 }

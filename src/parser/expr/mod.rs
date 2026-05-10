@@ -73,7 +73,40 @@ pub fn expr<'t, 'src: 't>()
             )
         });
 
-        let atom = choice((num, string_lit, bool_false, bool_true, self_kw, var));
+        // `:ident` — atom literal.  Compile-time interned tag value used as
+        // discriminator in tagged tuples (`{ :ok 42 }`) and patterns.  Lexer
+        // emits `Colon` + `Ident`; the leading `Colon` only forms an atom
+        // when nothing precedes it inside the same expression slot — module
+        // paths (`core:io`) start with an ident, so the `var` arm above
+        // claims them first.
+        let atom_lit = just(Token::Colon)
+            .ignore_then(select_ref! {
+                Token::Ident(n) = _e => n,
+            })
+            .map(|n| Expr::Atom(n));
+
+        // `{ a b c }` — anonymous tuple in expression position.  The same
+        // `CurlyBrackets` token also delimits blocks (when/wait handler
+        // bodies, branch bodies), but those grammar contexts consume the
+        // brackets themselves before falling through to `atom`, so reaching
+        // this rule means we are genuinely at a value position.
+        let tuple_lit = expr
+            .clone()
+            .repeated()
+            .collect::<Vec<_>>()
+            .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())))
+            .map(Expr::Tuple);
+
+        let atom = choice((
+            tuple_lit.boxed(),
+            atom_lit.boxed(),
+            num.boxed(),
+            string_lit.boxed(),
+            bool_false.boxed(),
+            bool_true.boxed(),
+            self_kw.boxed(),
+            var.boxed(),
+        ));
 
         let when_branch =
             expr.clone()
