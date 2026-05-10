@@ -158,7 +158,7 @@ impl<'src> Pattern<'src> {
     pub fn new(ident: Spanned<Ident<'src>>, ty: Spanned<Type<'src>>) -> Self {
         let kind = if ident.inner.0 == "_" {
             PatternKind::Wildcard
-        } else if let Ok(n) = ident.inner.0.parse::<i64>() {
+        } else if let Ok(n) = crate::api::expr::parse_int_literal(ident.inner.0) {
             PatternKind::NumGuard(n)
         } else {
             PatternKind::Var

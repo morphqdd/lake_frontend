@@ -4,6 +4,23 @@ use chumsky::span::Spanned;
 
 use crate::api::ast::{Branch, Ident, Type};
 
+/// Parse an integer literal slice — `42`, `0xff`, `0b1010`.
+///
+/// The lexer keeps the original prefix so this is the single
+/// canonical reduction used by every callsite that needs the i64
+/// value (codegen, when-dispatch, const folding, pattern guards).
+pub fn parse_int_literal(s: &str) -> Result<i64, std::num::ParseIntError> {
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        // i64::from_str_radix doesn't accept a leading sign on hex, but
+        // crypto / mask code is the only consumer and never writes one.
+        i64::from_str_radix(rest, 16)
+    } else if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        i64::from_str_radix(rest, 2)
+    } else {
+        s.parse::<i64>()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum Expr<'src> {
     // ── Literals ──────────────────────────────────────────────────────────

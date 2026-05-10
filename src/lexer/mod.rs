@@ -12,6 +12,47 @@ use crate::api::token::Token;
 pub fn lexer<'src>()
 -> impl Parser<'src, &'src str, Vec<Spanned<Token<'src>>>, extra::Err<Rich<'src, char>>> {
     recursive(|token| {
+        let punct = choice((
+            just("@").to(Token::At),
+            just(".").to(Token::Dot),
+            just(":").to(Token::Colon),
+            just("->").to(Token::Arrow),
+            just("+").to(Token::Plus),
+            just("-").to(Token::Minus),
+            just("*").to(Token::Star),
+            just("/").to(Token::Slash),
+            just("<<").to(Token::Shl),
+            just(">>").to(Token::Shr),
+            just("<=").to(Token::LessEq),
+            just(">=").to(Token::GreaterEq),
+            just("==").to(Token::EqEq),
+            just("=").to(Token::Eq),
+            just("<").to(Token::Less),
+            just(">").to(Token::Greater),
+            just("&").to(Token::BitAnd),
+            just("|").to(Token::BitOr),
+            just("^").to(Token::BitXor),
+        ));
+
+        // Hex / binary literals share the Token::Num shape but are
+        // tried before the decimal / float rule because both prefixes
+        // start with `0` and would otherwise be sliced as a leading
+        // zero plus an ident.
+        let nums = choice((
+            just("0x")
+                .then(any().filter(|c: &char| c.is_ascii_hexdigit()).repeated().at_least(1))
+                .to_slice()
+                .map(Token::Num),
+            just("0b")
+                .then(any().filter(|c: &char| *c == '0' || *c == '1').repeated().at_least(1))
+                .to_slice()
+                .map(Token::Num),
+            text::int(10)
+                .then(just('.').then(text::digits(10)).or_not())
+                .to_slice()
+                .map(Token::Num),
+        ));
+
         choice((
             // Parse comments as tokens (will be filtered later)
             just("//")
@@ -32,29 +73,8 @@ pub fn lexer<'src>()
                 "const" => Token::Const,
                 s => Token::Ident(s),
             }),
-            just("@").to(Token::At),
-            just(".").to(Token::Dot),
-            just(":").to(Token::Colon),
-            just("->").to(Token::Arrow),
-            just("+").to(Token::Plus),
-            just("-").to(Token::Minus),
-            just("*").to(Token::Star),
-            just("/").to(Token::Slash),
-            just("<<").to(Token::Shl),
-            just(">>").to(Token::Shr),
-            just("<=").to(Token::LessEq),
-            just(">=").to(Token::GreaterEq),
-            just("==").to(Token::EqEq),
-            just("=").to(Token::Eq),
-            just("<").to(Token::Less),
-            just(">").to(Token::Greater),
-            just("&").to(Token::BitAnd),
-            just("|").to(Token::BitOr),
-            just("^").to(Token::BitXor),
-            text::int(10)
-                .then(just('.').then(text::digits(10)).or_not())
-                .to_slice()
-                .map(Token::Num),
+            punct,
+            nums,
             any()
                 .and_is(one_of("\"").not())
                 .repeated()

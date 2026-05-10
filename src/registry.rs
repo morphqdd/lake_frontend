@@ -426,7 +426,7 @@ fn build_const_entry<'src>(
     let span = decl.value.span;
     let (ty, value) = match &decl.value.inner {
         Expr::Num(s, _) => {
-            let v = s.parse::<i64>().map_err(|_| {
+            let v = crate::api::expr::parse_int_literal(s).map_err(|_| {
                 LakeError::new(format!("invalid integer literal `{s}`"), span).code("E010")
             })?;
             ("i64".to_string(), ConstValue::Int(v))
