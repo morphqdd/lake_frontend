@@ -49,6 +49,7 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         ("rt_load_u16", s(&["i64", "i64"], "i64")),
         ("rt_load_u32", s(&["i64", "i64"], "i64")),
         ("rt_load_u64", s(&["i64", "i64"], "i64")),
+        ("rt_copy_bytes", s(&["i64", "i64", "i64", "i64", "i64"], "{}")),
         ("rt_mmap", s(&["i64", "i64", "i64", "i64", "i64", "i64"], "i64")),
         ("rt_munmap", s(&["i64", "i64"], "i64")),
         ("rt_init_heap", s(&[], "{}")),

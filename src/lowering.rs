@@ -233,6 +233,19 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         // keeps source ordering stable.
         let body = self.expand_let_tuple(body);
 
+        // Phase 1.0: thread `__caller` through `self(args)` calls
+        // inside a ret-typed branch.  Without this, a tail-recursive
+        // `self(...)` would have one fewer arg than the branch
+        // signature (which now begins with the synthetic `__caller
+        // pid` parameter), surfacing as an arity mismatch at typeck.
+        let body: Vec<_> = if is_ret_branch {
+            body.into_iter()
+                .map(|e| self.thread_caller_in_self_calls(e))
+                .collect()
+        } else {
+            body
+        };
+
         // Phase 1: recursive `Expr::Ret` → `__caller(self X)` rewrite.
         let body: Vec<_> = body
             .into_iter()
@@ -352,6 +365,106 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         let id = self.counter.get();
         self.counter.set(id + 1);
         id
+    }
+
+    /// Recursively prepend `__caller` to every `Expr::Jump` whose
+    /// callee is a bare `self`.  Run only inside ret-typed branches
+    /// where the synthetic `__caller pid` parameter has already been
+    /// inserted at position 0; non-ret branches keep the user's args
+    /// untouched so `self(n - 1)` in a counter machine still works.
+    fn thread_caller_in_self_calls(
+        &self,
+        expr: Spanned<Expr<'src>>,
+    ) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        let inner = match expr.inner {
+            Expr::Jump { ident, args } => {
+                // Detect `self(...)` — the callee is a Var named "self".
+                let is_self_call = matches!(
+                    &ident.inner,
+                    Expr::Var("self", _)
+                );
+                let new_args: Vec<_> = args
+                    .into_iter()
+                    .map(|a| self.thread_caller_in_self_calls(a))
+                    .collect();
+                let final_args = if is_self_call {
+                    let mut prepended = Vec::with_capacity(new_args.len() + 1);
+                    prepended.push(
+                        Expr::Var("__caller", Type::Named(
+                            crate::api::ast::Ident::new("pid").with_span(span),
+                        ))
+                        .with_span(span),
+                    );
+                    prepended.extend(new_args);
+                    prepended
+                } else {
+                    new_args
+                };
+                Expr::Jump {
+                    ident: Box::new(self.thread_caller_in_self_calls(*ident)),
+                    args: final_args,
+                }
+            }
+            Expr::Let { ident, ty, default } => Expr::Let {
+                ident,
+                ty,
+                default: default.map(|d| Box::new(self.thread_caller_in_self_calls(*d))),
+            },
+            Expr::When { cond, branches } => Expr::When {
+                cond: Box::new(self.thread_caller_in_self_calls(*cond)),
+                branches: branches
+                    .into_iter()
+                    .map(|(p, body)| {
+                        (
+                            self.thread_caller_in_self_calls(p),
+                            body.into_iter()
+                                .map(|e| self.thread_caller_in_self_calls(e))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            },
+            Expr::Wait { handlers, filter } => Expr::Wait {
+                handlers: handlers
+                    .into_iter()
+                    .map(|h| {
+                        let span = h.span;
+                        let mut br = h.inner;
+                        br.body = br.body
+                            .into_iter()
+                            .map(|e| self.thread_caller_in_self_calls(e))
+                            .collect();
+                        br.with_span(span)
+                    })
+                    .collect(),
+                filter: filter
+                    .into_iter()
+                    .map(|f| self.thread_caller_in_self_calls(f))
+                    .collect(),
+            },
+            Expr::Tuple(elems) => Expr::Tuple(
+                elems
+                    .into_iter()
+                    .map(|e| self.thread_caller_in_self_calls(e))
+                    .collect(),
+            ),
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(self.thread_caller_in_self_calls(*receiver)),
+                index,
+            },
+            Expr::Ret(inner) => {
+                Expr::Ret(Box::new(self.thread_caller_in_self_calls(*inner)))
+            }
+            Expr::Pin(inner) => {
+                Expr::Pin(Box::new(self.thread_caller_in_self_calls(*inner)))
+            }
+            Expr::Neg(inner) => {
+                Expr::Neg(Box::new(self.thread_caller_in_self_calls(*inner)))
+            }
+            other => other,
+        };
+        inner.with_span(span)
     }
 
     /// Walk the expression and rewrite every `Expr::Path` whose target
