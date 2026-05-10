@@ -86,6 +86,21 @@ impl<'src, 'r> Resolver<'src, 'r> {
             Expr::String(_, _) => static_named("str", span),
             Expr::Bool(_) => static_named("bool", span),
             Expr::Unit => Type::Unit,
+            Expr::Atom(_) => static_named("atom", span),
+            Expr::Tuple(elems) => Type::Struct(
+                elems
+                    .iter()
+                    .map(|e| self.infer_expr_type(&e.inner, e.span).with_span(e.span))
+                    .collect(),
+            ),
+            Expr::TupleIndex { receiver, index } => {
+                let recv_ty = self.infer_expr_type(&receiver.inner, receiver.span);
+                if let Type::Struct(fields) = recv_ty {
+                    fields.get(*index).map(|f| f.inner.clone()).unwrap_or(Type::Unknown)
+                } else {
+                    Type::Unknown
+                }
+            }
             Expr::Var(name, ty) => {
                 if !is_unknown(ty) {
                     ty.clone()
@@ -255,6 +270,14 @@ impl<'src, 'r> Resolver<'src, 'r> {
                     .collect();
                 Expr::Wait { handlers, filter }
             }
+
+            Expr::Tuple(elems) => Expr::Tuple(
+                elems.into_iter().map(|e| self.resolve_expr(e)).collect(),
+            ),
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(self.resolve_expr(*receiver)),
+                index,
+            },
 
             other => other,
         };
@@ -648,6 +671,42 @@ mod tests {
         assert!(
             matches!(ty, Type::Named(i) if i.inner == Ident::new("i64")),
             "expected i64, got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn infers_let_type_from_atom() {
+        let body = resolve_with_reg("m is { _ -> { let r = :ok } }");
+        let Expr::Let { ty, .. } = &body[0] else { panic!() };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("atom")),
+            "got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn infers_let_type_from_tuple() {
+        let body = resolve_with_reg(r#"m is { _ -> { let p = { 1 "alice" } } }"#);
+        let Expr::Let { ty, .. } = &body[0] else { panic!() };
+        let Type::Struct(fields) = &ty.inner else {
+            panic!("expected Struct, got {:?}", ty.inner)
+        };
+        assert_eq!(fields.len(), 2);
+        assert!(matches!(&fields[0].inner, Type::Named(i) if i.inner == Ident::new("i64")));
+        assert!(matches!(&fields[1].inner, Type::Named(i) if i.inner == Ident::new("str")));
+    }
+
+    #[test]
+    fn infers_let_type_from_tuple_index() {
+        let body = resolve_with_reg(
+            r#"m is { _ -> { let p = { 1 "alice" } let n = p.0 } }"#,
+        );
+        let Expr::Let { ty, .. } = &body[1] else {
+            panic!("expected second Let, got {:?}", body[1])
+        };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("i64")),
+            "got {ty:?}"
         );
     }
 }

@@ -163,6 +163,22 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
                 }
             }
 
+            Expr::Tuple(elems) => {
+                for e in elems {
+                    self.check_expr(machine_name, scope, &e.inner, e.span);
+                }
+            }
+
+            Expr::TupleIndex { receiver, .. } => {
+                // Bounds-check happens at codegen via the resolved
+                // Type::Struct fields; the surface check here just
+                // recurses into the receiver to surface scope errors.
+                self.check_expr(machine_name, scope, &receiver.inner, receiver.span);
+            }
+
+            // Atoms are bare literal tags — nothing to validate at this layer.
+            Expr::Atom(_) => {}
+
             _ => {}
         }
     }
@@ -348,6 +364,13 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
             | Expr::Ge(_, _)
             | Expr::Lt(_, _)
             | Expr::Gt(_, _) => "i64".to_string(),
+            Expr::Atom(_) => "atom".to_string(),
+            // Tuples surface here when passed as call arguments; the
+            // signature side cannot yet describe a structured type, so
+            // surface a coarse `tuple` token.  Refine when call-arg sigs
+            // gain shape awareness.
+            Expr::Tuple(_) => "tuple".to_string(),
+            Expr::TupleIndex { .. } => "?".to_string(),
             Expr::Jump { ident, .. } => match &ident.inner {
                 Expr::Var(name, _) => self
                     .registry
