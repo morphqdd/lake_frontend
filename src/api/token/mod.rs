@@ -47,6 +47,18 @@ pub enum Token<'src> {
     /// `const` — module-level compile-time constant.
     /// Inlined at every use-site; restricted to literal RHS.
     Const,
+    /// `&` — bitwise AND.
+    BitAnd,
+    /// `|` — bitwise OR.
+    BitOr,
+    /// `^` — bitwise XOR.
+    BitXor,
+    /// `<<` — left shift (logical).
+    Shl,
+    /// `>>` — right shift (logical / unsigned).  Lake's i64 is treated
+    /// as a bit pattern for these ops; an arithmetic right shift would
+    /// be a separate token (`>>>`) if we ever need it.
+    Shr,
 
     // Comments (filtered out after lexing)
     Comment,
@@ -64,6 +76,11 @@ impl<'src> Display for Token<'src> {
             Token::As => write!(f, "as"),
             Token::Pin => write!(f, "pin"),
             Token::Const => write!(f, "const"),
+            Token::BitAnd => write!(f, "&"),
+            Token::BitOr => write!(f, "|"),
+            Token::BitXor => write!(f, "^"),
+            Token::Shl => write!(f, "<<"),
+            Token::Shr => write!(f, ">>"),
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),
             Token::Star => write!(f, "*"),

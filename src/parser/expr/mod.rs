@@ -386,20 +386,40 @@ pub fn expr<'t, 'src: 't>()
                 infix(left(9), just(Token::Minus), |x, _, y, e| {
                     Expr::Sub(Box::new(x), Box::new(y)).with_span(e.span())
                 }),
-                infix(left(8), just(Token::LessEq), |x, _, y, e| {
+                // Shifts bind looser than +/- but tighter than the
+                // bitwise group below, matching Java/Rust convention so
+                // `x + 1 >> 2` is `(x + 1) >> 2`.
+                infix(left(8), just(Token::Shl), |x, _, y, e| {
+                    Expr::Shl(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(8), just(Token::Shr), |x, _, y, e| {
+                    Expr::Shr(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                // Bitwise AND > XOR > OR — stricter than comparisons so
+                // `x & 0xff == 0` parses the way crypto code expects.
+                infix(left(7), just(Token::BitAnd), |x, _, y, e| {
+                    Expr::BAnd(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(6), just(Token::BitXor), |x, _, y, e| {
+                    Expr::BXor(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(5), just(Token::BitOr), |x, _, y, e| {
+                    Expr::BOr(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(4), just(Token::LessEq), |x, _, y, e| {
                     Expr::Le(Box::new(x), Box::new(y)).with_span(e.span())
                 }),
-                infix(left(8), just(Token::GreaterEq), |x, _, y, e| {
+                infix(left(4), just(Token::GreaterEq), |x, _, y, e| {
                     Expr::Ge(Box::new(x), Box::new(y)).with_span(e.span())
                 }),
-                infix(left(8), just(Token::EqEq), |x, _, y, e| {
-                    Expr::Eq(Box::new(x), Box::new(y)).with_span(e.span())
-                }),
-                infix(left(8), just(Token::Less), |x, _, y, e| {
+                infix(left(4), just(Token::Less), |x, _, y, e| {
                     Expr::Lt(Box::new(x), Box::new(y)).with_span(e.span())
                 }),
-                infix(left(8), just(Token::Greater), |x, _, y, e| {
+                infix(left(4), just(Token::Greater), |x, _, y, e| {
                     Expr::Gt(Box::new(x), Box::new(y)).with_span(e.span())
+                }),
+                infix(left(3), just(Token::EqEq), |x, _, y, e| {
+                    Expr::Eq(Box::new(x), Box::new(y)).with_span(e.span())
                 }),
             ))
     })

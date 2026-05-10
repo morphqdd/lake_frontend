@@ -462,6 +462,26 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                 Box::new(self.inline_consts(*l)),
                 Box::new(self.inline_consts(*r)),
             ),
+            Expr::BAnd(l, r) => Expr::BAnd(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::BOr(l, r) => Expr::BOr(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::BXor(l, r) => Expr::BXor(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Shl(l, r) => Expr::Shl(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
+            Expr::Shr(l, r) => Expr::Shr(
+                Box::new(self.inline_consts(*l)),
+                Box::new(self.inline_consts(*r)),
+            ),
             Expr::Neg(inner) => Expr::Neg(Box::new(self.inline_consts(*inner))),
             Expr::Ret(inner) => Expr::Ret(Box::new(self.inline_consts(*inner))),
             Expr::Pin(inner) => Expr::Pin(Box::new(self.inline_consts(*inner))),

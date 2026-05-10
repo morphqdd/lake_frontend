@@ -120,7 +120,12 @@ pub fn walk_expr<'src, V: Visit<'src> + ?Sized>(v: &mut V, expr: &Spanned<Expr<'
         | Expr::Le(l, r)
         | Expr::Ge(l, r)
         | Expr::Lt(l, r)
-        | Expr::Gt(l, r) => {
+        | Expr::Gt(l, r)
+        | Expr::BAnd(l, r)
+        | Expr::BOr(l, r)
+        | Expr::BXor(l, r)
+        | Expr::Shl(l, r)
+        | Expr::Shr(l, r) => {
             v.visit_expr(l);
             v.visit_expr(r);
         }

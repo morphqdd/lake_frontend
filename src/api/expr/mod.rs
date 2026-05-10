@@ -133,6 +133,14 @@ pub enum Expr<'src> {
     Lt(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Gt(Box<Spanned<Self>>, Box<Spanned<Self>>),
 
+    // ── Bitwise ───────────────────────────────────────────────────────────
+    BAnd(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    BOr(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    BXor(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    Shl(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    /// Logical / unsigned right shift (Cranelift `ushr`).
+    Shr(Box<Spanned<Self>>, Box<Spanned<Self>>),
+
 }
 
 impl Hash for Expr<'_> {

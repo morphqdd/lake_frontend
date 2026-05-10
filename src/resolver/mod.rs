@@ -116,7 +116,8 @@ impl<'src, 'r> Resolver<'src, 'r> {
                     Type::Unknown
                 }
             }
-            // Arithmetic, negation, and comparisons all evaluate to i64.
+            // Arithmetic, negation, comparisons, and bitwise ops all
+            // evaluate to i64.
             Expr::Add(_, _)
             | Expr::Sub(_, _)
             | Expr::Mul(_, _)
@@ -126,7 +127,12 @@ impl<'src, 'r> Resolver<'src, 'r> {
             | Expr::Le(_, _)
             | Expr::Ge(_, _)
             | Expr::Lt(_, _)
-            | Expr::Gt(_, _) => static_named("i64", span),
+            | Expr::Gt(_, _)
+            | Expr::BAnd(_, _)
+            | Expr::BOr(_, _)
+            | Expr::BXor(_, _)
+            | Expr::Shl(_, _)
+            | Expr::Shr(_, _) => static_named("i64", span),
             Expr::Jump { ident, .. } => self.infer_jump_return(&ident.inner, span),
             // Higher-order shapes (let, when, wait, method-call, …) don't
             // have a defined "value" yet — leave them unresolved.
@@ -242,6 +248,26 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 Box::new(self.resolve_expr(*r)),
             ),
             Expr::Div(l, r) => Expr::Div(
+                Box::new(self.resolve_expr(*l)),
+                Box::new(self.resolve_expr(*r)),
+            ),
+            Expr::BAnd(l, r) => Expr::BAnd(
+                Box::new(self.resolve_expr(*l)),
+                Box::new(self.resolve_expr(*r)),
+            ),
+            Expr::BOr(l, r) => Expr::BOr(
+                Box::new(self.resolve_expr(*l)),
+                Box::new(self.resolve_expr(*r)),
+            ),
+            Expr::BXor(l, r) => Expr::BXor(
+                Box::new(self.resolve_expr(*l)),
+                Box::new(self.resolve_expr(*r)),
+            ),
+            Expr::Shl(l, r) => Expr::Shl(
+                Box::new(self.resolve_expr(*l)),
+                Box::new(self.resolve_expr(*r)),
+            ),
+            Expr::Shr(l, r) => Expr::Shr(
                 Box::new(self.resolve_expr(*l)),
                 Box::new(self.resolve_expr(*r)),
             ),

@@ -40,12 +40,17 @@ pub fn lexer<'src>()
             just("-").to(Token::Minus),
             just("*").to(Token::Star),
             just("/").to(Token::Slash),
+            just("<<").to(Token::Shl),
+            just(">>").to(Token::Shr),
             just("<=").to(Token::LessEq),
             just(">=").to(Token::GreaterEq),
             just("==").to(Token::EqEq),
             just("=").to(Token::Eq),
             just("<").to(Token::Less),
             just(">").to(Token::Greater),
+            just("&").to(Token::BitAnd),
+            just("|").to(Token::BitOr),
+            just("^").to(Token::BitXor),
             text::int(10)
                 .then(just('.').then(text::digits(10)).or_not())
                 .to_slice()
