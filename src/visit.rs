@@ -48,6 +48,7 @@ pub trait Visit<'src> {
 pub fn walk_item<'src, V: Visit<'src> + ?Sized>(v: &mut V, item: &Spanned<Item<'src>>) {
     match &item.inner {
         Item::Machine(m) => v.visit_machine(m),
+        Item::Const(c) => v.visit_expr(&c.inner.value),
         Item::Import(_) | Item::Directive(_) => {}
     }
 }
@@ -124,11 +125,17 @@ pub fn walk_expr<'src, V: Visit<'src> + ?Sized>(v: &mut V, expr: &Spanned<Expr<'
             v.visit_expr(r);
         }
         Expr::Neg(inner) | Expr::Ret(inner) | Expr::Pin(inner) => v.visit_expr(inner),
+        Expr::Tuple(elems) => {
+            for e in elems {
+                v.visit_expr(e);
+            }
+        }
         Expr::Var(_, _)
         | Expr::Path(_)
         | Expr::Num(_, _)
         | Expr::String(_, _)
         | Expr::Bool(_)
+        | Expr::Atom(_)
         | Expr::Unit => {}
     }
 }

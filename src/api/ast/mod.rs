@@ -325,6 +325,32 @@ pub enum Item<'src> {
     Directive(Spanned<Directive<'src>>),
     /// `[pub] name [(generics)] is { ... }` — process / function definition
     Machine(Spanned<Machine<'src>>),
+    /// `[pub] const NAME = <literal>` — module-level compile-time constant.
+    /// RHS is restricted to literal expressions (Num/String/Bool); inlined at
+    /// every use-site, no runtime cost.
+    Const(Spanned<ConstDecl<'src>>),
+}
+
+/// `[pub] const NAME = <literal>`.
+///
+/// `value` is the unevaluated literal expression.  Type is derived from
+/// the literal kind (Num → i64, String → str, Bool → bool).  Resolver and
+/// typeck refuse non-literal RHS.
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub struct ConstDecl<'src> {
+    pub vis: bool,
+    pub ident: Spanned<Ident<'src>>,
+    pub value: Spanned<crate::api::expr::Expr<'src>>,
+}
+
+impl<'src> ConstDecl<'src> {
+    pub fn new(
+        vis: bool,
+        ident: Spanned<Ident<'src>>,
+        value: Spanned<crate::api::expr::Expr<'src>>,
+    ) -> Self {
+        Self { vis, ident, value }
+    }
 }
 
 impl Hash for Item<'_> {

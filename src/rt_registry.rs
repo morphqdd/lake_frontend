@@ -61,6 +61,7 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         //   `let s = to_string(n)` → s : str
         //   `len(s)`               → fine, matches the str param
         ("len", s(&["str"], "i64")),
+        ("rt_str_ptr", s(&["str"], "i64")),
         ("to_string", s(&["i64"], "str")),
         ("to_string_with_ln", s(&["i64"], "str")),
 

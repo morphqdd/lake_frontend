@@ -29,6 +29,7 @@ pub fn lexer<'src>()
                 "let" => Token::Let,
                 "as" => Token::As,
                 "pin" => Token::Pin,
+                "const" => Token::Const,
                 s => Token::Ident(s),
             }),
             just("@").to(Token::At),

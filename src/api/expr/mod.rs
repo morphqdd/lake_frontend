@@ -55,6 +55,15 @@ pub enum Expr<'src> {
         fields: Vec<Spanned<Self>>,
     },
 
+    /// `{ a b c }` — anonymous tuple (heap-alloc, positional access via `.N`).
+    /// First element may be an atom for tagged-tuple use: `{ :ok 42 }`.
+    /// Pattern matching: `when t { { :ok v } -> ... }`.
+    Tuple(Vec<Spanned<Self>>),
+
+    /// `:ident` — atom literal (compile-time interned to a small int).
+    /// Used as discriminator tag in tagged tuples and pattern-match guards.
+    Atom(&'src str),
+
     // ── Pattern matching ──────────────────────────────────────────────────
     /// `when expr { pat -> { body } ... }`
     When {

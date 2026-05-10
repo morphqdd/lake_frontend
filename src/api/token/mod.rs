@@ -44,6 +44,9 @@ pub enum Token<'src> {
     /// blocks the current actor until M's reply arrives and discards
     /// the value (the captured binding is anonymous and hidden).
     Pin,
+    /// `const` — module-level compile-time constant.
+    /// Inlined at every use-site; restricted to literal RHS.
+    Const,
 
     // Comments (filtered out after lexing)
     Comment,
@@ -60,6 +63,7 @@ impl<'src> Display for Token<'src> {
             Token::Colon => write!(f, ":"),
             Token::As => write!(f, "as"),
             Token::Pin => write!(f, "pin"),
+            Token::Const => write!(f, "const"),
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),
             Token::Star => write!(f, "*"),

@@ -295,6 +295,9 @@ impl SemanticAnalyzer {
                         self.info.machines.insert(machine_name, Vec::new());
                     }
                 }
+                Item::Const(_) => {
+                    // C3 will register const symbols here.  Placeholder.
+                }
                 Item::Import(_) => {}
             }
         }
@@ -307,6 +310,11 @@ impl<'src> Visit<'src> for SemanticAnalyzer {
             Item::Import(import) => self.analyze_import(import),
             Item::Directive(directive) => self.analyze_directive(directive),
             Item::Machine(machine) => self.visit_machine(machine),
+            Item::Const(_) => {
+                // Const RHS is restricted to a literal (Num/String/Bool) — no
+                // identifier resolution needed here.  Symbol registration
+                // belongs to C3 (resolver pass).
+            }
         }
     }
 

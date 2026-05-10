@@ -357,6 +357,10 @@ impl<'src> ProgramRegistry<'src> {
                         // the static rt registry.  Nothing to record per
                         // module.
                     }
+                    Item::Const(_) => {
+                        // C3 will populate per-module const map here.
+                        // Skipped in C1 so the AST builds.
+                    }
                     Item::Import(rc) => {
                         if let Err(mut errs) =
                             register_import_bindings(rc, &[], id, self)
