@@ -145,10 +145,31 @@ pub struct ModuleScope<'src> {
     /// the resolver can populate without juggling source lifetimes for
     /// what is fundamentally compile-time-only metadata.
     pub ffi_fns: HashMap<String, Signature>,
+    /// `const` declarations defined in this file, keyed by source name.
+    pub consts: HashMap<&'src str, ConstEntry>,
     /// Aliases brought into scope by `+import` lines.
     /// Key = local binding name (alias or last path segment).
     /// Value = (target module, target item's source name).
     pub imports: HashMap<String, ImportBinding>,
+}
+
+/// Reduced form of a `const` decl, kept on the registry so codegen
+/// can inline the value at every use site.  Values are extracted from
+/// the literal AST node once, at populate time.
+#[derive(Debug, Clone)]
+pub struct ConstEntry {
+    pub vis: bool,
+    pub ty: String,
+    pub value: ConstValue,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConstValue {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+    /// The atom's source name; codegen folds it via `pure_expr::atom_id`.
+    Atom(String),
 }
 
 /// One resolved row from a `+import` directive.
@@ -258,6 +279,9 @@ impl<'src> ProgramRegistry<'src> {
         if let Some(sig) = cur.ffi_fns.get(name) {
             return Some(Resolution::Ffi(sig));
         }
+        if let Some(c) = cur.consts.get(name) {
+            return Some(Resolution::Const(c));
+        }
         if let Some(binding) = cur.imports.get(name) {
             return self.resolve_in_module(binding.target_module, &binding.target_item);
         }
@@ -280,6 +304,9 @@ impl<'src> ProgramRegistry<'src> {
         if let Some(sig) = cur.ffi_fns.get(name) {
             return Some(Resolution::Ffi(sig));
         }
+        if let Some(c) = cur.consts.get(name) {
+            return Some(Resolution::Const(c));
+        }
         if let Some(binding) = cur.imports.get(name) {
             return self.resolve_in_module(binding.target_module, &binding.target_item);
         }
@@ -296,6 +323,9 @@ impl<'src> ProgramRegistry<'src> {
         }
         if let Some(sig) = scope.ffi_fns.get(name) {
             return Some(Resolution::Ffi(sig));
+        }
+        if let Some(c) = scope.consts.get(name) {
+            return Some(Resolution::Const(c));
         }
         None
     }
@@ -357,9 +387,15 @@ impl<'src> ProgramRegistry<'src> {
                         // the static rt registry.  Nothing to record per
                         // module.
                     }
-                    Item::Const(_) => {
-                        // C3 will populate per-module const map here.
-                        // Skipped in C1 so the AST builds.
+                    Item::Const(c) => {
+                        match build_const_entry(&c.inner) {
+                            Ok((name, entry)) => {
+                                self.module_mut(id)
+                                    .consts
+                                    .insert(name, entry);
+                            }
+                            Err(e) => errors.push(e),
+                        }
                     }
                     Item::Import(rc) => {
                         if let Err(mut errs) =
@@ -381,6 +417,43 @@ impl<'src> ProgramRegistry<'src> {
 }
 
 // ── helpers for populate_from ──────────────────────────────────────────────
+
+fn build_const_entry<'src>(
+    decl: &crate::api::ast::ConstDecl<'src>,
+) -> Result<(&'src str, ConstEntry), LakeError> {
+    use crate::api::expr::Expr;
+    let name = decl.ident.inner.0;
+    let span = decl.value.span;
+    let (ty, value) = match &decl.value.inner {
+        Expr::Num(s, _) => {
+            let v = s.parse::<i64>().map_err(|_| {
+                LakeError::new(format!("invalid integer literal `{s}`"), span).code("E010")
+            })?;
+            ("i64".to_string(), ConstValue::Int(v))
+        }
+        Expr::String(s, _) => ("str".to_string(), ConstValue::Str(s.to_string())),
+        Expr::Bool(b) => ("bool".to_string(), ConstValue::Bool(*b)),
+        Expr::Atom(s) => ("atom".to_string(), ConstValue::Atom(s.to_string())),
+        other => {
+            return Err(LakeError::new(
+                format!(
+                    "const RHS must be a literal (int, str, bool, atom); got `{:?}`",
+                    other
+                ),
+                span,
+            )
+            .code("E011"));
+        }
+    };
+    Ok((
+        name,
+        ConstEntry {
+            vis: decl.vis,
+            ty,
+            value,
+        },
+    ))
+}
 
 fn build_machine_entry<'src>(machine: &Machine<'src>, module: ModuleId) -> MachineEntry<'src> {
     let branches: Vec<Signature> = machine
@@ -560,6 +633,9 @@ pub enum Resolution<'a> {
     Rt(&'a Signature),
     Machine(&'a MachineEntry<'a>),
     Ffi(&'a Signature),
+    /// Compile-time constant.  Use sites look up the entry to inline its
+    /// value at codegen — never a call.
+    Const(&'a ConstEntry),
 }
 
 impl<'a> Resolution<'a> {
@@ -568,6 +644,7 @@ impl<'a> Resolution<'a> {
         match self {
             Resolution::Rt(sig) | Resolution::Ffi(sig) => &sig.ret,
             Resolution::Machine(_) => "pid",
+            Resolution::Const(c) => &c.ty,
         }
     }
 }

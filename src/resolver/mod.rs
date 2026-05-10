@@ -106,6 +106,12 @@ impl<'src, 'r> Resolver<'src, 'r> {
                     ty.clone()
                 } else if let Some(t) = self.scope.get(name) {
                     t.clone()
+                } else if let Some(reg) = self.registry {
+                    use crate::registry::Resolution;
+                    match reg.resolve_bare_in(self.current_module, name) {
+                        Some(Resolution::Const(c)) => type_from_str(&c.ty, span),
+                        _ => Type::Unknown,
+                    }
                 } else {
                     Type::Unknown
                 }
@@ -671,6 +677,35 @@ mod tests {
         assert!(
             matches!(ty, Type::Named(i) if i.inner == Ident::new("i64")),
             "expected i64, got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn const_var_reference_resolves_to_const_type() {
+        let body = resolve_with_reg(
+            "const N = 42\nm is { _ -> { let r = N } }",
+        );
+        let Expr::Let { ty, .. } = &body[0] else {
+            panic!("expected Let, got {:?}", body[0])
+        };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("i64")),
+            "got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn const_string_reference_resolves_to_str() {
+        let body = resolve_with_reg(
+            r#"const HELLO = "hi"
+m is { _ -> { let r = HELLO } }"#,
+        );
+        let Expr::Let { ty, .. } = &body[0] else {
+            panic!("expected Let, got {:?}", body[0])
+        };
+        assert!(
+            matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("str")),
+            "got {ty:?}"
         );
     }
 

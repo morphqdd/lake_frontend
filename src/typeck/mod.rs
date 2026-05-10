@@ -280,6 +280,19 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
                     ));
                 }
             }
+            Some(Resolution::Const(_)) => {
+                // Calling a const is meaningless — it's a value, not a
+                // callable.  Surface a tailored error so the user fixes
+                // the call shape rather than wonders why the signature
+                // didn't match.
+                self.errors.push(
+                    LakeError::new(
+                        format!("`{display_name}` is a const value, not a callable"),
+                        call_span,
+                    )
+                    .code("E004"),
+                );
+            }
             None => {
                 // Unknown name — surface as an explicit "no such callable"
                 // error.  Cheaper than waiting for codegen to fail.
