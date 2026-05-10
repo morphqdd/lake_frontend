@@ -502,6 +502,21 @@ mod tests {
     }
 
     #[test]
+    fn tuple_index_access() {
+        with_branch_expr("m is { _ -> { let x = pair.0 } }", |expr| {
+            let Expr::Let { default, .. } = expr else {
+                panic!("expected Let, got {expr:?}")
+            };
+            let inner = default.expect("expected default").inner;
+            let Expr::TupleIndex { index, receiver } = inner else {
+                panic!("expected TupleIndex, got {inner:?}")
+            };
+            assert_eq!(index, 0);
+            assert!(matches!(receiver.inner, Expr::Var("pair", _)));
+        });
+    }
+
+    #[test]
     fn let_with_tagged_tuple() {
         // Erlang-flavoured tagged tuple: first element is an atom, rest values.
         with_branch_expr("m is { _ -> { let r = { :ok 42 } } }", |expr| {

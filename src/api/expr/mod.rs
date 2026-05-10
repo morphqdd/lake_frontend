@@ -64,6 +64,13 @@ pub enum Expr<'src> {
     /// Used as discriminator tag in tagged tuples and pattern-match guards.
     Atom(&'src str),
 
+    /// `t.0`, `t.1`, … — positional access into a tuple value.
+    /// Lowered to `load(fat_ptr.start + index * 8)` at codegen.
+    TupleIndex {
+        receiver: Box<Spanned<Self>>,
+        index: usize,
+    },
+
     // ── Pattern matching ──────────────────────────────────────────────────
     /// `when expr { pat -> { body } ... }`
     When {

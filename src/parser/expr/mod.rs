@@ -243,6 +243,8 @@ pub fn expr<'t, 'src: 't>()
             DotInit(Vec<Spanned<Expr<'src>>>),
             /// `.field` — dot field access
             DotAccess(Spanned<Ident<'src>>),
+            /// `.0`, `.1`, … — tuple positional index
+            TupleIdx(usize),
         }
 
         let call_op = expr
@@ -266,12 +268,24 @@ pub fn expr<'t, 'src: 't>()
                 None => PostfixOp::AtAccess(method),
             });
 
+        // `.<num>` — positional access on a tuple.  Tried BEFORE `.field`
+        // because the lexer emits `Token::Num` rather than `Token::Ident`
+        // for a digit run, so the ident-only branch would otherwise reject
+        // perfectly valid `t.0` syntax.  Non-integer numerics (`t.1.5`)
+        // fall through to `parse::<usize>` failure → parse error, which
+        // is the right outcome — fractional indices have no meaning.
         let dot_op = just(Token::Dot).ignore_then(choice((
             expr.clone()
                 .repeated()
                 .collect::<Vec<_>>()
                 .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())))
                 .map(PostfixOp::DotInit),
+            select_ref! { Token::Num(n) = _e => n }
+                .try_map(|n: &&str, span| {
+                    n.parse::<usize>()
+                        .map(PostfixOp::TupleIdx)
+                        .map_err(|_| Rich::custom(span, format!("invalid tuple index: {n}")))
+                }),
             ident_parser().map(PostfixOp::DotAccess),
         )));
 
@@ -325,6 +339,11 @@ pub fn expr<'t, 'src: 't>()
                         PostfixOp::DotAccess(field) => Expr::DotAccess {
                             receiver: Box::new(acc),
                             field,
+                        }
+                        .with_span(span),
+                        PostfixOp::TupleIdx(index) => Expr::TupleIndex {
+                            receiver: Box::new(acc),
+                            index,
                         }
                         .with_span(span),
                     }
