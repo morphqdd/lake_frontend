@@ -83,6 +83,7 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         ("rt_listen_tcp", s(&["i64"], "i64")),
         ("rt_accept_async", s(&["i64"], "i64")),
         ("rt_send_async", s(&["i64", "str", "i64"], "i64")),
+        ("rt_recv_async", s(&["i64", "i64", "i64"], "i64")),
         ("rt_close", s(&["i64"], "{}")),
     ]
 }

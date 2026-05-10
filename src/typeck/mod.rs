@@ -376,7 +376,28 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
 // ── helpers ────────────────────────────────────────────────────────────────
 
 fn sig_matches_args(sig: &Signature, args: &[String]) -> bool {
-    sig.params == args
+    if sig.params.len() != args.len() {
+        return false;
+    }
+    sig.params
+        .iter()
+        .zip(args.iter())
+        .all(|(p, a)| types_compatible(p, a))
+}
+
+/// Coarse type compatibility check used by call-arity validation.
+///
+/// At runtime Lake's `str` is a fat-pointer represented as an `i64`;
+/// any function that takes a fat-pointer (rt_write, rt_recv_async,
+/// rt_allocate-derived buffers, …) accepts both source-level kinds.
+/// We accept the obvious overlap here so `rt_write(1 my_buf len)`
+/// (where `my_buf` is `i64` from `rt_allocate`) and `rt_write(1
+/// "hello" 5)` both pass.
+fn types_compatible(param: &str, arg: &str) -> bool {
+    if param == arg {
+        return true;
+    }
+    matches!((param, arg), ("str", "i64") | ("i64", "str"))
 }
 
 fn display_sig(sig: &Signature) -> String {
