@@ -130,6 +130,15 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
                 self.check_arith_operand(machine_name, scope, r);
             }
 
+            Expr::BAnd(l, r)
+            | Expr::BOr(l, r)
+            | Expr::BXor(l, r)
+            | Expr::Shl(l, r)
+            | Expr::Shr(l, r) => {
+                self.check_arith_operand(machine_name, scope, l);
+                self.check_arith_operand(machine_name, scope, r);
+            }
+
             Expr::Neg(inner) => {
                 self.check_arith_operand(machine_name, scope, inner);
             }
@@ -376,7 +385,12 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
             | Expr::Le(_, _)
             | Expr::Ge(_, _)
             | Expr::Lt(_, _)
-            | Expr::Gt(_, _) => "i64".to_string(),
+            | Expr::Gt(_, _)
+            | Expr::BAnd(_, _)
+            | Expr::BOr(_, _)
+            | Expr::BXor(_, _)
+            | Expr::Shl(_, _)
+            | Expr::Shr(_, _) => "i64".to_string(),
             Expr::Atom(_) => "atom".to_string(),
             // Tuples surface here when passed as call arguments; the
             // signature side cannot yet describe a structured type, so

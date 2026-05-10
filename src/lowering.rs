@@ -226,6 +226,16 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             .map(|e| self.rewrite_ret_in_expr(e))
             .collect();
 
+        // Phase 1.5: lift nested calls out of argument position.
+        // Backend's pure_expr can fold a Var / Num / arith but not a
+        // Jump, so `f(g(x))` becomes `let __lift_<id> = g(x); f(__lift_<id>)`.
+        // Applied AFTER ret-rewrite because that pass synthesises the
+        // most common nested-call shape: `__caller(self X)` where X is
+        // a call.  Recursive across all expressions in the body so
+        // tuple elements (`{ ok g(x) }`) and nested arg lists
+        // (`f(g(h(x)))`) both flatten.
+        let body = self.lift_nested_calls(body);
+
         // Phase 1b: `pin <expr>` → `let __pin_<id> = <expr>`.  Done
         // before the let-with-ret-target sweep so the synthesised let
         // is itself caught by that pass when the inner expr is a
@@ -329,6 +339,116 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         let id = self.counter.get();
         self.counter.set(id + 1);
         id
+    }
+
+    /// Lift every `Jump`-shaped argument into a fresh `let` binding
+    /// before the enclosing expression.  Backend's pure_expr fold is
+    /// happy with Var / Num / arith but bails on a Jump in argument
+    /// position, so flattening these here means the rest of the
+    /// pipeline never has to special-case nested calls.
+    ///
+    /// Applied per body statement: each lifted call lands as its own
+    /// preceding `let __lift_<id> = inner_call`, the original
+    /// expression keeps its position, and ordering is preserved.
+    fn lift_nested_calls(
+        &self,
+        body: Vec<Spanned<Expr<'src>>>,
+    ) -> Vec<Spanned<Expr<'src>>> {
+        let mut out = Vec::with_capacity(body.len());
+        for expr in body {
+            let lifted = self.lift_in_expr(expr, &mut out);
+            out.push(lifted);
+        }
+        out
+    }
+
+    fn lift_in_expr(
+        &self,
+        expr: Spanned<Expr<'src>>,
+        lifts: &mut Vec<Spanned<Expr<'src>>>,
+    ) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        match expr.inner {
+            Expr::Jump { ident, args } => {
+                // Recurse into the callee (rare — usually a Var) AND
+                // every arg.  An arg that is itself a Jump is hoisted
+                // into a fresh let; otherwise it is recursively
+                // descended in case it contains nested calls deeper
+                // (e.g. `f(g(x) + 1)` lifts `g(x)`).
+                let new_callee = Box::new(self.lift_in_expr(*ident, lifts));
+                let new_args: Vec<_> = args
+                    .into_iter()
+                    .map(|a| self.lift_arg(a, lifts))
+                    .collect();
+                Expr::Jump {
+                    ident: new_callee,
+                    args: new_args,
+                }
+                .with_span(span)
+            }
+            Expr::Let { ident, ty, default } => {
+                let default = default.map(|d| Box::new(self.lift_in_expr(*d, lifts)));
+                Expr::Let { ident, ty, default }.with_span(span)
+            }
+            Expr::Tuple(elems) => {
+                let new_elems: Vec<_> = elems
+                    .into_iter()
+                    .map(|e| self.lift_arg(e, lifts))
+                    .collect();
+                Expr::Tuple(new_elems).with_span(span)
+            }
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(self.lift_in_expr(*receiver, lifts)),
+                index,
+            }
+            .with_span(span),
+            Expr::Ret(inner) => {
+                Expr::Ret(Box::new(self.lift_in_expr(*inner, lifts))).with_span(span)
+            }
+            Expr::Pin(inner) => {
+                Expr::Pin(Box::new(self.lift_in_expr(*inner, lifts))).with_span(span)
+            }
+            Expr::Neg(inner) => {
+                Expr::Neg(Box::new(self.lift_in_expr(*inner, lifts))).with_span(span)
+            }
+            // when / wait have their own scoped bodies — recursing into
+            // them would bleed lifts across arms, which is wrong.  Lifts
+            // for those should happen inside the arm's own body when the
+            // pipeline re-enters lower_body for that scope.  For now the
+            // outer arm cond / filter slot can still contain a call;
+            // surface that as-is and let backend handle (or fail) — this
+            // matches the pre-lift behaviour.
+            other => other.with_span(span),
+        }
+    }
+
+    /// Lift a single sub-expression that sits in a *value* position
+    /// (call arg, tuple element).  If the expr is a `Jump`, push a
+    /// `let __lift_<id> = <expr>` into `lifts` and return a `Var`
+    /// reference; otherwise descend recursively for deeper nests.
+    fn lift_arg(
+        &self,
+        expr: Spanned<Expr<'src>>,
+        lifts: &mut Vec<Spanned<Expr<'src>>>,
+    ) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        if matches!(expr.inner, Expr::Jump { .. }) {
+            let recursed = self.lift_in_expr(expr, lifts);
+            let id = self.fresh_id();
+            let name: &'static str = Box::leak(format!("__lift_{id}").into_boxed_str());
+            let ident = Ident::new(name).with_span(span);
+            lifts.push(
+                Expr::Let {
+                    ident: ident.clone(),
+                    ty: Type::Unknown.with_span(span),
+                    default: Some(Box::new(recursed)),
+                }
+                .with_span(span),
+            );
+            Expr::Var(name, Type::Unknown).with_span(span)
+        } else {
+            self.lift_in_expr(expr, lifts)
+        }
     }
 
     /// Replace every `Expr::Var(name, _)` whose bare-name resolution
