@@ -316,14 +316,38 @@ impl ProgramSources {
             collect_referenced_modules(&ast)
         };
 
-        for sub in imports {
-            let sub_path = match search.resolve(&sub) {
-                ResolveOutcome::Found(p) => p,
-                ResolveOutcome::NotFound { tried } => {
-                    return Err(LakeErrors::new(vec![module_not_found(&sub, &tried)]));
+        for cand in imports {
+            // Try the namespace path first.  If that file exists, load
+            // it and skip the fallback — the leaf is a namespace
+            // import.  Otherwise drop to item interpretation.
+            let ns_outcome = search.resolve(&cand.namespace);
+            if let ResolveOutcome::Found(p) = ns_outcome {
+                self.load_recursive(cand.namespace, p, search, in_progress)?;
+                continue;
+            }
+            // Item-style fallback.
+            let fb_outcome = search.resolve(&cand.item_fallback);
+            match fb_outcome {
+                ResolveOutcome::Found(p) => {
+                    self.load_recursive(cand.item_fallback, p, search, in_progress)?;
                 }
-            };
-            self.load_recursive(sub, sub_path, search, in_progress)?;
+                ResolveOutcome::NotFound { tried } => {
+                    // Namespace candidate also missed; surface the
+                    // longer path in the diagnostic since that is what
+                    // the source spelled.  Both attempted locations are
+                    // shown so the user can see what files were probed.
+                    let ns_tried = match search.resolve(&cand.namespace) {
+                        ResolveOutcome::NotFound { tried } => tried,
+                        _ => vec![],
+                    };
+                    let mut all_tried = ns_tried;
+                    all_tried.extend(tried);
+                    return Err(LakeErrors::new(vec![module_not_found(
+                        &cand.namespace,
+                        &all_tried,
+                    )]));
+                }
+            }
         }
 
         // Mark loaded ONLY after every dependency finished — see the
@@ -392,10 +416,31 @@ impl ParseErrors {
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /// Collect every module file referenced by the imports in `ast`.  Returns a
-/// deduplicated list — multiple `+core.io.{ a b }` entries that share the
-/// same target file produce one entry.
-fn collect_referenced_modules(ast: &[Spanned<Item<'_>>]) -> Vec<ModulePath> {
-    let mut out = HashSet::<ModulePath>::new();
+/// One leaf-style import resolves to a (preferred, fallback) pair so a
+/// shape like `+std.bytes` can mean either:
+///   * **namespace**: load `std/bytes.lake`, alias the local name to
+///     that module (preferred when the file exists)
+///   * **item**: load `std.lake`, alias the local name to item
+///     `bytes` inside it (fallback)
+///
+/// `+std.bytes.{ at }` and `+std.bytes.foo` use the recursive form
+/// and never land in the leaf branch with a "namespace" candidate —
+/// they always carry an explicit child segment, which fixes the
+/// interpretation as item-style.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImportCandidate {
+    /// Try loading this path first.  If it resolves, the leaf becomes
+    /// a namespace import.
+    namespace: ModulePath,
+    /// Fall back to this path when the namespace candidate has no
+    /// file.  This is the legacy "item from module" path.
+    item_fallback: ModulePath,
+}
+
+/// Walk the parsed AST for every `+import` statement and return the
+/// deduplicated list of candidate import shapes.
+fn collect_referenced_modules(ast: &[Spanned<Item<'_>>]) -> Vec<ImportCandidate> {
+    let mut out = HashSet::<ImportCandidate>::new();
     for item in ast {
         if let Item::Import(rc) = &item.inner {
             collect_from_import(&rc.inner, &[], &mut out);
@@ -403,14 +448,14 @@ fn collect_referenced_modules(ast: &[Spanned<Item<'_>>]) -> Vec<ModulePath> {
     }
     let mut v: Vec<_> = out.into_iter().collect();
     // Stable order so error messages and load sequence are deterministic.
-    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v.sort_by(|a, b| a.namespace.0.cmp(&b.namespace.0));
     v
 }
 
 fn collect_from_import(
     node: &Rc<RefCell<Import<'_>>>,
     prefix: &[String],
-    out: &mut HashSet<ModulePath>,
+    out: &mut HashSet<ImportCandidate>,
 ) {
     match &*node.borrow() {
         Import::Import(ident, Some(next), _alias) => {
@@ -418,13 +463,17 @@ fn collect_from_import(
             new_prefix.push(ident.inner.0.to_string());
             collect_from_import(&next.inner, &new_prefix, out);
         }
-        Import::Import(_ident, None, _alias) => {
-            // Leaf reached.  `prefix` is the module path; the leaf's ident
-            // is the item NAME within that module — not part of the file
-            // path.  An import like `+core.io.writer` therefore refers to
-            // file `core/io.lake` (path ["core", "io"]) and item `writer`.
+        Import::Import(ident, None, _alias) => {
+            // Leaf reached.  Generate two candidates:
+            //   namespace = prefix + leaf (file: prefix/leaf.lake)
+            //   item_fallback = prefix    (file: prefix.lake, leaf is
+            //                              an item inside)
             if !prefix.is_empty() {
-                out.insert(ModulePath(prefix.to_vec()));
+                let item_fallback = ModulePath(prefix.to_vec());
+                let mut ns = prefix.to_vec();
+                ns.push(ident.inner.0.to_string());
+                let namespace = ModulePath(ns);
+                out.insert(ImportCandidate { namespace, item_fallback });
             }
         }
         Import::MultiImport(entries) => {

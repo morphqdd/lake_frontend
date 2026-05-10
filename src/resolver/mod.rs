@@ -161,28 +161,24 @@ impl<'src, 'r> Resolver<'src, 'r> {
                     return type_from_str(r.return_type(), span);
                 }
                 // Imported alias: walk the current module's import table.
+                // Namespace imports (target_item == None) can't be invoked
+                // bare; the path-form rule handles them via resolve_path.
                 let scope = reg.module(self.current_module);
                 if let Some(binding) = scope.imports.get(*name) {
-                    if let Some(r) = reg.resolve_in_module(
-                        binding.target_module,
-                        &binding.target_item,
-                    ) {
-                        return type_from_str(r.return_type(), span);
+                    if let Some(item) = &binding.target_item {
+                        if let Some(r) =
+                            reg.resolve_in_module(binding.target_module, item)
+                        {
+                            return type_from_str(r.return_type(), span);
+                        }
                     }
                 }
                 Type::Unknown
             }
             Expr::Path(segments) => {
-                if segments.len() < 2 {
-                    return Type::Unknown;
-                }
-                let module_segs: Vec<String> = segments[..segments.len() - 1]
-                    .iter()
-                    .map(|s| s.inner.0.to_string())
-                    .collect();
-                let item = segments.last().expect("len >= 2").inner.0;
-                let module_path = ModulePath(module_segs);
-                let Some(target_id) = reg.module_id_for_path(&module_path) else {
+                let Some((target_id, item)) =
+                    reg.resolve_path(self.current_module, segments)
+                else {
                     return Type::Unknown;
                 };
                 reg.resolve_in_module(target_id, item)

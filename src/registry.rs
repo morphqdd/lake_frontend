@@ -173,11 +173,18 @@ pub enum ConstValue {
 }
 
 /// One resolved row from a `+import` directive.
+///
+/// When `target_item` is `None` the binding points at the module
+/// itself — a namespace import.  Bare-name lookup of such a binding
+/// is meaningless (there's nothing to call); paths whose head is a
+/// namespace alias (e.g. `bytes:at` after `+std.bytes`) are rewritten
+/// at resolve time into the equivalent fully-qualified path.
 #[derive(Debug, Clone)]
 pub struct ImportBinding {
     pub target_module: ModuleId,
-    /// Item name in the *target* module's source (not the alias).
-    pub target_item: String,
+    /// Item name in the *target* module's source.  `None` means the
+    /// alias points at the module itself (namespace import).
+    pub target_item: Option<String>,
 }
 
 // ── top-level registry ──────────────────────────────────────────────────────
@@ -269,23 +276,10 @@ impl<'src> ProgramRegistry<'src> {
     ///   4. import binding in current module → resolve into target module's
     ///      machine or ffi
     pub fn resolve_bare(&self, name: &str) -> Option<Resolution<'_>> {
-        if let Some(sig) = self.rt_fns.get(name) {
-            return Some(Resolution::Rt(sig));
-        }
-        let cur = self.module(self.current);
-        if let Some(m) = cur.machines.get(name) {
-            return Some(Resolution::Machine(m));
-        }
-        if let Some(sig) = cur.ffi_fns.get(name) {
-            return Some(Resolution::Ffi(sig));
-        }
-        if let Some(c) = cur.consts.get(name) {
-            return Some(Resolution::Const(c));
-        }
-        if let Some(binding) = cur.imports.get(name) {
-            return self.resolve_in_module(binding.target_module, &binding.target_item);
-        }
-        None
+        // Convenience wrapper — the bulk of the lookup logic lives in
+        // resolve_bare_in (which the rest of the pipeline also calls)
+        // so they share the global-fallback behaviour for free.
+        self.resolve_bare_in(self.current, name)
     }
 
     /// Resolve a bare name against a specific module's scope, without
@@ -308,9 +302,77 @@ impl<'src> ProgramRegistry<'src> {
             return Some(Resolution::Const(c));
         }
         if let Some(binding) = cur.imports.get(name) {
-            return self.resolve_in_module(binding.target_module, &binding.target_item);
+            if let Some(item) = &binding.target_item {
+                return self.resolve_in_module(binding.target_module, item);
+            }
+        }
+        // Last-resort: lowering's flatten_paths collapses `ns:item` to
+        // bare `item` for the backend's flat symbol space.  After that
+        // collapse the typeck / resolver still want to find the entry,
+        // so fall through to a global pub-item scan keyed by name.
+        // Any unique pub match wins; ambiguous names are an error
+        // surface for module-aware mangling (see #72) and are punted
+        // for now — the backend's predeclare_machine already errors on
+        // duplicate symbols, which is good enough until collisions
+        // actually occur in stdlib.
+        for module in &self.modules {
+            if let Some(m) = module.machines.get(name) {
+                if m.is_pub {
+                    return Some(Resolution::Machine(m));
+                }
+            }
+            if let Some(c) = module.consts.get(name) {
+                if c.vis {
+                    return Some(Resolution::Const(c));
+                }
+            }
         }
         None
+    }
+
+    /// Resolve a multi-segment path like `bytes:at` or `std:bytes:at`
+    /// in the context of `current`.  Returns the target module id and
+    /// the item name within it.
+    ///
+    /// Lookup proceeds in two steps: direct module lookup first
+    /// (`std:bytes:at` → module path ["std", "bytes"] + item "at");
+    /// if that fails, the head segment is expanded via the current
+    /// module's namespace alias table (e.g. `bytes:at` after
+    /// `+std.bytes` → expand "bytes" to ["std", "bytes"]).
+    pub fn resolve_path<'a>(
+        &self,
+        current: ModuleId,
+        segments: &'a [Spanned<crate::api::ast::Ident<'a>>],
+    ) -> Option<(ModuleId, &'a str)> {
+        if segments.len() < 2 {
+            return None;
+        }
+        let last = segments.last().expect("len >= 2").inner.0;
+        let module_segs: Vec<&str> = segments[..segments.len() - 1]
+            .iter()
+            .map(|s| s.inner.0)
+            .collect();
+
+        // Direct path attempt.
+        let direct_path = ModulePath(module_segs.iter().map(|s| s.to_string()).collect());
+        if let Some(id) = self.module_id_for_path(&direct_path) {
+            return Some((id, last));
+        }
+
+        // Head-as-namespace-alias attempt.
+        let head = *module_segs.first()?;
+        let scope = self.module(current);
+        let binding = scope.imports.get(head)?;
+        if binding.target_item.is_some() {
+            // Item alias — not a namespace, can't expand.
+            return None;
+        }
+        let target_module_path = &self.module(binding.target_module).path;
+        let mut new_segs: Vec<String> = target_module_path.0.clone();
+        new_segs.extend(module_segs[1..].iter().map(|s| s.to_string()));
+        let expanded = ModulePath(new_segs);
+        let id = self.module_id_for_path(&expanded)?;
+        Some((id, last))
     }
 
     /// Resolve `name` in a specific module.  Used by inline qualified paths
@@ -586,6 +648,28 @@ fn walk_import<'src>(
                 );
                 return;
             }
+            // Prefer the namespace interpretation (prefix + ident as
+            // a module file).  Fall back to the item interpretation
+            // only when the namespace candidate isn't loaded.
+            let mut ns_segs = prefix.to_vec();
+            ns_segs.push(ident.inner.0.to_string());
+            let ns_path = ModulePath(ns_segs);
+            let local_name = alias
+                .as_ref()
+                .map(|a| a.inner.0.to_string())
+                .unwrap_or_else(|| ident.inner.0.to_string());
+
+            if let Some(ns_id) = registry.module_id_for_path(&ns_path) {
+                registry.module_mut(current_module).imports.insert(
+                    local_name,
+                    ImportBinding {
+                        target_module: ns_id,
+                        target_item: None,
+                    },
+                );
+                return;
+            }
+
             let module_path = ModulePath(prefix.to_vec());
             let target_id = match registry.module_id_for_path(&module_path) {
                 Some(id) => id,
@@ -603,15 +687,11 @@ fn walk_import<'src>(
                     return;
                 }
             };
-            let local_name = alias
-                .as_ref()
-                .map(|a| a.inner.0.to_string())
-                .unwrap_or_else(|| ident.inner.0.to_string());
             registry.module_mut(current_module).imports.insert(
                 local_name,
                 ImportBinding {
                     target_module: target_id,
-                    target_item: ident.inner.0.to_string(),
+                    target_item: Some(ident.inner.0.to_string()),
                 },
             );
         }
@@ -788,7 +868,7 @@ mod tests {
         let imports = &reg.module(ModuleId::ROOT).imports;
         assert!(imports.contains_key("p"), "alias `p` should be in scope");
         let binding = &imports["p"];
-        assert_eq!(binding.target_item, "println");
+        assert_eq!(binding.target_item.as_deref(), Some("println"));
 
         // Resolving `p` should give us the `println` machine in core.io.
         let resolved = reg.resolve_bare("p").expect("resolves");
@@ -825,7 +905,7 @@ mod tests {
             "out".to_string(),
             ImportBinding {
                 target_module: core_io,
-                target_item: "println".to_string(),
+                target_item: Some("println".to_string()),
             },
         );
 

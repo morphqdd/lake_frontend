@@ -203,6 +203,19 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         body: Vec<Spanned<Expr<'src>>>,
         is_ret_branch: bool,
     ) -> Vec<Spanned<Expr<'src>>> {
+        // Phase -1: collapse module-qualified Path callees into bare
+        // Var references.  Backend's jump_expr only knows how to call
+        // by name (flat symbol space at the codegen layer), so the
+        // path-form `io:println(s)` is rewritten to `println(s)` once
+        // resolve_path has confirmed the target.  Same-named items
+        // across modules will collide at predeclare_machine — a
+        // problem for whoever introduces the collision, not this
+        // pass.
+        let body: Vec<_> = body
+            .into_iter()
+            .map(|e| self.flatten_paths(e))
+            .collect();
+
         // Phase 0a: inline `const` values.  Every `Expr::Var(name, _)` whose
         // bare-name resolution lands on a `Resolution::Const(_)` is
         // replaced by the literal expression encoded by the const.
@@ -339,6 +352,152 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         let id = self.counter.get();
         self.counter.set(id + 1);
         id
+    }
+
+    /// Walk the expression and rewrite every `Expr::Path` whose target
+    /// resolves into a Var(item_name).  Backend's jump dispatcher only
+    /// understands bare-name callees (flat symbol space across the
+    /// whole compilation), so collapsing the path here keeps the
+    /// pipeline simple.  Unresolvable paths (e.g. `unknown:foo`) pass
+    /// through; typeck reports them with a proper diagnostic.
+    fn flatten_paths(&self, expr: Spanned<Expr<'src>>) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        let inner = match expr.inner {
+            Expr::Path(ref segments) => {
+                if let Some((_, item)) =
+                    self.registry.resolve_path(self.module_id, segments)
+                {
+                    // Need a 'src lifetime — leak the item name so the
+                    // resulting Var slice lives for the whole compile.
+                    let leaked: &'static str =
+                        Box::leak(item.to_string().into_boxed_str());
+                    Expr::Var(leaked, Type::Unknown)
+                } else {
+                    expr.inner
+                }
+            }
+            Expr::Let { ident, ty, default } => Expr::Let {
+                ident,
+                ty,
+                default: default.map(|d| Box::new(self.flatten_paths(*d))),
+            },
+            Expr::Jump { ident, args } => Expr::Jump {
+                ident: Box::new(self.flatten_paths(*ident)),
+                args: args.into_iter().map(|a| self.flatten_paths(a)).collect(),
+            },
+            Expr::MethodCall { receiver, method, args } => Expr::MethodCall {
+                receiver: Box::new(self.flatten_paths(*receiver)),
+                method,
+                args: args.into_iter().map(|a| self.flatten_paths(a)).collect(),
+            },
+            Expr::AtAccess { receiver, field } => Expr::AtAccess {
+                receiver: Box::new(self.flatten_paths(*receiver)),
+                field,
+            },
+            Expr::DotAccess { receiver, field } => Expr::DotAccess {
+                receiver: Box::new(self.flatten_paths(*receiver)),
+                field,
+            },
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(self.flatten_paths(*receiver)),
+                index,
+            },
+            Expr::StructInit { base, fields } => Expr::StructInit {
+                base: Box::new(self.flatten_paths(*base)),
+                fields: fields.into_iter().map(|f| self.flatten_paths(f)).collect(),
+            },
+            Expr::Tuple(elems) => Expr::Tuple(
+                elems.into_iter().map(|e| self.flatten_paths(e)).collect(),
+            ),
+            Expr::When { cond, branches } => Expr::When {
+                cond: Box::new(self.flatten_paths(*cond)),
+                branches: branches
+                    .into_iter()
+                    .map(|(p, body)| {
+                        (
+                            self.flatten_paths(p),
+                            body.into_iter().map(|e| self.flatten_paths(e)).collect(),
+                        )
+                    })
+                    .collect(),
+            },
+            Expr::Wait { handlers, filter } => Expr::Wait {
+                handlers: handlers
+                    .into_iter()
+                    .map(|h| {
+                        let span = h.span;
+                        let mut br = h.inner;
+                        br.body = br.body
+                            .into_iter()
+                            .map(|e| self.flatten_paths(e))
+                            .collect();
+                        br.with_span(span)
+                    })
+                    .collect(),
+                filter: filter.into_iter().map(|f| self.flatten_paths(f)).collect(),
+            },
+            Expr::Ret(inner) => Expr::Ret(Box::new(self.flatten_paths(*inner))),
+            Expr::Pin(inner) => Expr::Pin(Box::new(self.flatten_paths(*inner))),
+            Expr::Neg(inner) => Expr::Neg(Box::new(self.flatten_paths(*inner))),
+            Expr::Add(l, r) => Expr::Add(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Sub(l, r) => Expr::Sub(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Mul(l, r) => Expr::Mul(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Div(l, r) => Expr::Div(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Le(l, r) => Expr::Le(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Ge(l, r) => Expr::Ge(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Eq(l, r) => Expr::Eq(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Lt(l, r) => Expr::Lt(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Gt(l, r) => Expr::Gt(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::BAnd(l, r) => Expr::BAnd(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::BOr(l, r) => Expr::BOr(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::BXor(l, r) => Expr::BXor(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Shl(l, r) => Expr::Shl(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            Expr::Shr(l, r) => Expr::Shr(
+                Box::new(self.flatten_paths(*l)),
+                Box::new(self.flatten_paths(*r)),
+            ),
+            other => other,
+        };
+        inner.with_span(span)
     }
 
     /// Lift every `Jump`-shaped argument into a fresh `let` binding
@@ -886,14 +1045,18 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         let name = match &ident.inner {
             Expr::Var(name, _) => name.to_string(),
             Expr::Path(segments) if segments.len() >= 2 => {
-                // Inline `core:io:writer(...)` form.
-                let module_segs: Vec<String> = segments[..segments.len() - 1]
-                    .iter()
-                    .map(|s| s.inner.0.to_string())
-                    .collect();
-                let item = segments.last().expect("len >= 2").inner.0.to_string();
+                // Inline `core:io:writer(...)` form, possibly via a
+                // namespace alias (`io:println` after `+std.io`).
+                // resolve_path expands the head segment when it's a
+                // namespace alias in the current module.
+                let (target_id, item) = self
+                    .registry
+                    .resolve_path(self.module_id, segments)?;
+                let item = item.to_string();
+                let target_path =
+                    self.registry.module(target_id).path.clone();
                 let key = RetKey {
-                    module: ModulePath(module_segs),
+                    module: target_path,
                     name: item.clone(),
                 };
                 return self.ret_machines.get(&key).cloned().map(|t| (item, t));
@@ -912,12 +1075,25 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         }
         // Imported alias?  Resolve via the registry's import binding.
         if let Some(binding) = scope.imports.get(&name) {
-            return self.resolve_import_ret(binding).map(|t| (name, t));
+            if let Some(ret_ty) = self.resolve_import_ret(binding) {
+                return Some((name, ret_ty));
+            }
+        }
+        // Last-resort global scan — matches the resolve_bare_in
+        // fallback used after flatten_paths collapses Path callees
+        // (`io:println` → bare `println`) into the flat symbol space.
+        for (key, ret_ty) in self.ret_machines.iter() {
+            if key.name == name {
+                return Some((name, ret_ty.clone()));
+            }
         }
         None
     }
 
     fn resolve_import_ret(&self, binding: &ImportBinding) -> Option<String> {
+        // Namespace imports don't carry a single item name — there's
+        // nothing to resolve as a ret-machine here.
+        let item_name = binding.target_item.as_ref()?;
         let target_module = self
             .registry
             .modules
@@ -926,7 +1102,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             .clone();
         let key = RetKey {
             module: target_module,
-            name: binding.target_item.clone(),
+            name: item_name.clone(),
         };
         self.ret_machines.get(&key).cloned()
     }

@@ -227,21 +227,17 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
                 if segments.len() < 2 {
                     return;
                 }
-                let module_segs: Vec<String> = segments[..segments.len() - 1]
-                    .iter()
-                    .map(|s| s.inner.0.to_string())
-                    .collect();
-                let item_name = segments.last().expect("len >= 2").inner.0;
                 let display_path = segments
                     .iter()
                     .map(|s| s.inner.0)
                     .collect::<Vec<_>>()
                     .join(":");
-                let module_path = ModulePath(module_segs);
-                let Some(target_id) = self.registry.module_id_for_path(&module_path) else {
+                let Some((target_id, item_name)) =
+                    self.registry.resolve_path(self.current_module, segments)
+                else {
                     self.errors.push(
                         LakeError::new(
-                            format!("unknown module `{}`", module_path.display()),
+                            format!("unknown module path `{display_path}`"),
                             call_span,
                         )
                         .code("M005"),
@@ -404,18 +400,12 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
                     .resolve_bare_in(self.current_module, name)
                     .map(|r| r.return_type().to_string())
                     .unwrap_or_else(|| "?".to_string()),
-                Expr::Path(segments) if segments.len() >= 2 => {
-                    let module_segs: Vec<String> = segments[..segments.len() - 1]
-                        .iter()
-                        .map(|s| s.inner.0.to_string())
-                        .collect();
-                    let item = segments.last().expect("len >= 2").inner.0;
-                    self.registry
-                        .module_id_for_path(&ModulePath(module_segs))
-                        .and_then(|id| self.registry.resolve_in_module(id, item))
-                        .map(|r| r.return_type().to_string())
-                        .unwrap_or_else(|| "?".to_string())
-                }
+                Expr::Path(segments) if segments.len() >= 2 => self
+                    .registry
+                    .resolve_path(self.current_module, segments)
+                    .and_then(|(id, item)| self.registry.resolve_in_module(id, item))
+                    .map(|r| r.return_type().to_string())
+                    .unwrap_or_else(|| "?".to_string()),
                 _ => "?".to_string(),
             },
             _ => "?".to_string(),
