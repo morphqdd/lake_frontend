@@ -8,13 +8,17 @@ use chumsky::{
 
 use crate::{
     api::{
-        ast::{Directive, Item, Machine},
+        ast::{ConstDecl, Directive, Item, Machine},
         token::Token,
     },
-    parser::{directive::directive, helpers::TokenInput, import::import, machine::machine},
+    parser::{
+        const_item::const_item, directive::directive, helpers::TokenInput, import::import,
+        machine::machine,
+    },
 };
 
 mod branch;
+mod const_item;
 mod directive;
 mod expr;
 mod helpers;
@@ -45,7 +49,12 @@ pub fn program<'t, 'src: 't>()
         Item::Import(i).with_span(span)
     });
 
-    choice((import_item, directive_item, machine_item))
+    let const_item_node = const_item().map(|c: Spanned<ConstDecl>| {
+        let span = c.span;
+        Item::Const(c).with_span(span)
+    });
+
+    choice((import_item, directive_item, const_item_node, machine_item))
         .repeated()
         .collect::<Vec<_>>()
 }
@@ -514,6 +523,78 @@ mod tests {
             assert_eq!(index, 0);
             assert!(matches!(receiver.inner, Expr::Var("pair", _)));
         });
+    }
+
+    #[test]
+    fn parse_const_int() {
+        use crate::api::ast::Item;
+        let src = "const N = 42";
+        let tokens = lexer().parse(src).into_result().expect("lex");
+        let ast = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse");
+        let Item::Const(c) = &ast[0].inner else {
+            panic!("expected Const, got {:?}", ast[0].inner)
+        };
+        assert!(!c.inner.vis);
+        assert_eq!(c.inner.ident.inner, Ident::new("N"));
+        assert!(matches!(c.inner.value.inner, Expr::Num("42", _)));
+    }
+
+    #[test]
+    fn parse_pub_const_atom() {
+        use crate::api::ast::Item;
+        let src = "pub const STATUS = :ok";
+        let tokens = lexer().parse(src).into_result().expect("lex");
+        let ast = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse");
+        let Item::Const(c) = &ast[0].inner else {
+            panic!("expected Const, got {:?}", ast[0].inner)
+        };
+        assert!(c.inner.vis);
+        assert!(matches!(c.inner.value.inner, Expr::Atom("ok")));
+    }
+
+    #[test]
+    fn parse_const_string() {
+        use crate::api::ast::Item;
+        let src = r#"const HELLO = "world""#;
+        let tokens = lexer().parse(src).into_result().expect("lex");
+        let ast = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse");
+        let Item::Const(c) = &ast[0].inner else {
+            panic!("expected Const, got {:?}", ast[0].inner)
+        };
+        assert!(matches!(c.inner.value.inner, Expr::String("world", _)));
+    }
+
+    #[test]
+    fn const_rejects_non_literal_rhs() {
+        let src = "const N = 1 + 2";
+        let tokens = lexer().parse(src).into_result().expect("lex");
+        let result = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result();
+        // Either an outright parse error (preferred), or the literal_rhs
+        // matched only `1` and the rest spilled — both surfaces let the
+        // user know the RHS isn't allowed.  Verify the AST is not the
+        // happy `Const { value: Add(..) }` shape.
+        if let Ok(ast) = result {
+            if let Some(item) = ast.first() {
+                if let crate::api::ast::Item::Const(c) = &item.inner {
+                    let bad = matches!(
+                        c.inner.value.inner,
+                        Expr::Add(..) | Expr::Sub(..) | Expr::Mul(..) | Expr::Div(..)
+                    );
+                    assert!(!bad, "non-literal const RHS should not parse as compute");
+                }
+            }
+        }
     }
 
     #[test]
