@@ -97,9 +97,24 @@ pub fn expr<'t, 'src: 't>()
             .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())))
             .map(Expr::Tuple);
 
+        // `(expr)` — parenthesised grouping at expression-start.  The
+        // same `Parens` token serves as the postfix `Call(args)`
+        // delimiter, but call grammar attaches parens to a preceding
+        // atom; reaching `atom` with a `(` means we are at a value
+        // position, so a single nested expression is grouping.
+        // Multi-expression parens (more than one item) stay reserved
+        // for the call form — we explicitly match exactly one inner
+        // expression so `f(a b)` continues to parse as `Jump(f, [a, b])`
+        // via the postfix rule.
+        let paren_group = expr
+            .clone()
+            .nested_in(select_ref!(Token::Parens(ts) = e => ts.split_spanned(e.span())))
+            .map(|inner: Spanned<Expr<'src>>| inner.inner);
+
         let atom = choice((
             tuple_lit.boxed(),
             atom_lit.boxed(),
+            paren_group.boxed(),
             num.boxed(),
             string_lit.boxed(),
             bool_false.boxed(),
