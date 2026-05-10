@@ -209,6 +209,16 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             .map(|e| self.rewrite_ret_in_expr(e))
             .collect();
 
+        // Phase 1b: `pin <expr>` → `let __pin_<id> = <expr>`.  Done
+        // before the let-with-ret-target sweep so the synthesised let
+        // is itself caught by that pass when the inner expr is a
+        // ret-machine call.  Non-ret callees pass through as a let
+        // with an unused binding, which is harmless.
+        let body: Vec<_> = body
+            .into_iter()
+            .map(|e| self.rewrite_pin(e))
+            .collect();
+
         // Phase 2: caller-side desugaring.  We iterate top-down; a
         // let-with-ret-call folds the remainder of the body into a wait
         // body, which itself may contain further ret-calls.  The
@@ -241,6 +251,31 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         }
 
         new_body
+    }
+
+    /// Rewrite `pin <expr>` at the top level of a body sequence into
+    /// `let __pin_<id> = <expr>`.  We don't recurse into nested
+    /// expressions: `pin` only makes sense as a statement-position
+    /// wrapper around a call whose value would otherwise be discarded.
+    /// Callers writing `pin` mid-expression (e.g. `1 + pin foo()`) are
+    /// silently passed through here and will fail later in typeck.
+    fn rewrite_pin(&self, expr: Spanned<Expr<'src>>) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        match expr.inner {
+            Expr::Pin(inner) => {
+                let id = self.counter.get();
+                self.counter.set(id + 1);
+                let name: &'static str =
+                    Box::leak(format!("__pin_{id}").into_boxed_str());
+                Expr::Let {
+                    ident: Ident::new(name).with_span(span),
+                    ty: Type::Unknown.with_span(span),
+                    default: Some(Box::new(*inner)),
+                }
+                .with_span(span)
+            }
+            other => Spanned { inner: other, span },
+        }
     }
 
     /// Recursively rewrite `Expr::Ret(x)` into `__caller(self, x)`.
@@ -336,6 +371,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                 Box::new(self.rewrite_ret_in_expr(*r)),
             ),
             Expr::Neg(inner) => Expr::Neg(Box::new(self.rewrite_ret_in_expr(*inner))),
+            Expr::Pin(inner) => Expr::Pin(Box::new(self.rewrite_ret_in_expr(*inner))),
             other => other,
         };
         expr
@@ -383,6 +419,22 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         let pid_name: &'static str = Box::leak(format!("__ret_{id}_pid").into_boxed_str());
         let sender_name: &'static str = Box::leak(format!("__ret_{id}_sender").into_boxed_str());
 
+        // If the user wrote `let _ = M(args)`, the value pattern would be
+        // a wildcard `_`.  wait_expr's dequeue counts only non-wildcard,
+        // non-guard patterns when sizing the message read, so a wildcard
+        // value pattern leaves the value half of the (sender, value)
+        // message stranded in the mailbox — the next wait then sees it
+        // as a stray sender pid and drops or mismatches.  Substitute a
+        // fresh synthetic name so the slot is consumed even though the
+        // bound value is unused.
+        let value_ident = if ident.inner.0 == "_" {
+            let synth: &'static str =
+                Box::leak(format!("__ret_{id}_value").into_boxed_str());
+            crate::api::ast::Ident::new(synth).with_span(ident.span)
+        } else {
+            ident
+        };
+
         // Step 1: `let __ret_N_pid pid = M(self ...args)`.  The original
         // call's args get `self` prepended — the ret-machine reads it as
         // its `__caller` first parameter.
@@ -404,7 +456,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             Ident::new(sender_name).with_span(span),
             Type::Named(Ident::new("pid").with_span(span)).with_span(span),
         );
-        let value_pat = Pattern::new(ident, ret_ty_node.with_span(span));
+        let value_pat = Pattern::new(value_ident, ret_ty_node.with_span(span));
         let handler = Branch::new(
             None,
             vec![sender_pat.with_span(span), value_pat.with_span(span)],

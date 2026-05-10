@@ -179,8 +179,17 @@ pub fn expr<'t, 'src: 't>()
             .ignore_then(expr.clone())
             .map(|inner| Expr::Ret(Box::new(inner)));
 
+        // `pin <expr>` — sync sugar for a ret-machine call.  Same
+        // greedy capture as `ret`: `pin println(s)` parses as
+        // `Pin(Jump(println, [s]))`, and the lowering turns it into
+        // `let __pin_<id> = println(s)`.
+        let pin_expr = just(Token::Pin)
+            .ignore_then(expr.clone())
+            .map(|inner| Expr::Pin(Box::new(inner)));
+
         let base = choice((
             ret_expr.spanned().boxed(),
+            pin_expr.spanned().boxed(),
             wait_expr.spanned().boxed(),
             let_expr.spanned().boxed(),
             when_expr.spanned(),

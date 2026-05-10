@@ -226,6 +226,7 @@ impl<'src, 'r> Resolver<'src, 'r> {
             ),
             Expr::Neg(inner) => Expr::Neg(Box::new(self.resolve_expr(*inner))),
             Expr::Ret(inner) => Expr::Ret(Box::new(self.resolve_expr(*inner))),
+            Expr::Pin(inner) => Expr::Pin(Box::new(self.resolve_expr(*inner))),
 
             Expr::When { cond, branches } => {
                 let cond = Box::new(self.resolve_expr(*cond));

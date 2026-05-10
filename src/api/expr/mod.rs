@@ -86,6 +86,12 @@ pub enum Expr<'src> {
     /// the lowering pass.
     Ret(Box<Spanned<Self>>),
 
+    /// `pin <expr>` — sync sugar for a ret-machine call.  Lowered to
+    /// a fresh `let __pin_<id> = <expr>` so the existing
+    /// let-with-ret-target rewrite turns it into spawn + wait.
+    /// Non-ret callees pass through as ordinary lets.
+    Pin(Box<Spanned<Self>>),
+
     // ── Arithmetic ────────────────────────────────────────────────────────
     Mul(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Div(Box<Spanned<Self>>, Box<Spanned<Self>>),
