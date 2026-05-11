@@ -136,6 +136,10 @@ pub fn walk_expr<'src, V: Visit<'src> + ?Sized>(v: &mut V, expr: &Spanned<Expr<'
             }
         }
         Expr::TupleIndex { receiver, .. } => v.visit_expr(receiver),
+        Expr::Index { receiver, index } => {
+            v.visit_expr(receiver);
+            v.visit_expr(index);
+        }
         Expr::LetTuple { default, .. } => v.visit_expr(default),
         Expr::Var(_, _)
         | Expr::Path(_)

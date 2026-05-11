@@ -176,7 +176,12 @@ fn tag_paren_adjacency<'src>(
                 Token::CurlyBrackets(tag_paren_adjacency(inner))
             }
             Token::SquareBrackets(inner) => {
-                Token::SquareBrackets(tag_paren_adjacency(inner))
+                let inner = tag_paren_adjacency(inner);
+                if tight {
+                    Token::TightSquareBrackets(inner)
+                } else {
+                    Token::SquareBrackets(inner)
+                }
             }
             other => other,
         };

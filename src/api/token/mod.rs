@@ -21,6 +21,11 @@ pub enum Token<'src> {
     /// without comma separators.
     TightParens(Vec<Spanned<Self>>),
     SquareBrackets(Vec<Spanned<Self>>),
+    /// `[...]` whose opening `[` is adjacent to the previous token (no
+    /// whitespace).  Used for postfix indexing (`buf[i]`); the parser
+    /// only matches indexing on this variant so `wait [pid]` etc. stay
+    /// as space-separated filter syntax.
+    TightSquareBrackets(Vec<Spanned<Self>>),
     CurlyBrackets(Vec<Spanned<Self>>),
 
     At,
@@ -112,6 +117,7 @@ impl<'src> Display for Token<'src> {
             Token::Parens(_) => write!(f, "( ... )"),
             Token::TightParens(_) => write!(f, "( ... )"),
             Token::SquareBrackets(_) => write!(f, "[ ... ]"),
+            Token::TightSquareBrackets(_) => write!(f, "[ ... ]"),
             Token::CurlyBrackets(_) => write!(f, "{{ ... }}"),
             Token::At => write!(f, "@"),
             Token::Eq => write!(f, "="),

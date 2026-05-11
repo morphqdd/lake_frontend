@@ -185,6 +185,15 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
                 self.check_expr(machine_name, scope, &receiver.inner, receiver.span);
             }
 
+            Expr::Index { receiver, index } => {
+                // Bounds-check is enforced at runtime by the codegen.
+                // Walk sub-exprs so scope errors surface here.  Stricter
+                // shape checks (receiver must be buf/str, index must be
+                // i64) land with #76's ownership-aware typeck.
+                self.check_expr(machine_name, scope, &receiver.inner, receiver.span);
+                self.check_expr(machine_name, scope, &index.inner, index.span);
+            }
+
             // Atoms are bare literal tags — nothing to validate at this layer.
             Expr::Atom(_) => {}
 
@@ -394,6 +403,7 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
             // gain shape awareness.
             Expr::Tuple(_) => "tuple".to_string(),
             Expr::TupleIndex { .. } => "?".to_string(),
+            Expr::Index { .. } => "i64".to_string(),
             Expr::Jump { ident, .. } => match &ident.inner {
                 Expr::Var(name, _) => self
                     .registry

@@ -101,6 +101,8 @@ impl<'src, 'r> Resolver<'src, 'r> {
                     Type::Unknown
                 }
             }
+            // `buf[i]` always yields a zero-extended byte → i64.
+            Expr::Index { .. } => static_named("i64", span),
             Expr::Var(name, ty) => {
                 if !is_unknown(ty) {
                     ty.clone()
@@ -305,6 +307,10 @@ impl<'src, 'r> Resolver<'src, 'r> {
             Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
                 receiver: Box::new(self.resolve_expr(*receiver)),
                 index,
+            },
+            Expr::Index { receiver, index } => Expr::Index {
+                receiver: Box::new(self.resolve_expr(*receiver)),
+                index: Box::new(self.resolve_expr(*index)),
             },
 
             other => other,

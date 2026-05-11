@@ -88,6 +88,16 @@ pub enum Expr<'src> {
         index: usize,
     },
 
+    /// `buf[i]` — single-byte load from a fat-pointer buffer.  Bounds-
+    /// checked at runtime, result is `i64` (zero-extended byte).
+    /// No desugar to any rt_* primitive — the backend emits the load
+    /// directly so users see no implementation leakage.
+    Index {
+        receiver: Box<Spanned<Self>>,
+        index: Box<Spanned<Self>>,
+    },
+
+
     /// `let { a b c } = expr` — positional tuple destructure.
     /// The lowering pass expands this into a synthetic temporary
     /// binding for `expr` plus one ordinary `Expr::Let` per field

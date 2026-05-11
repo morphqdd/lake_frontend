@@ -287,6 +287,10 @@ pub fn expr<'t, 'src: 't>()
             DotAccess(Spanned<Ident<'src>>),
             /// `.0`, `.1`, … — tuple positional index
             TupleIdx(usize),
+            /// `[expr]` — single-byte index into a fat-pointer buffer.
+            /// Only matched when the `[` is tight against the receiver
+            /// (no whitespace).
+            Index(Spanned<Expr<'src>>),
         }
 
         // Postfix call only attaches when the `(` is tight (no
@@ -339,7 +343,17 @@ pub fn expr<'t, 'src: 't>()
             ident_parser().map(PostfixOp::DotAccess),
         )));
 
-        let postfix = choice((call_op, at_op, dot_op));
+        // `buf[i]` postfix index — matches only when `[` is adjacent
+        // to the receiver, so `wait [pid]` and other list-style uses
+        // of plain `Token::SquareBrackets` stay as filter syntax.
+        let index_op = expr
+            .clone()
+            .nested_in(
+                select_ref!(Token::TightSquareBrackets(ts) = e => ts.split_spanned(e.span())),
+            )
+            .map(PostfixOp::Index);
+
+        let postfix = choice((call_op, at_op, dot_op, index_op));
 
         base.then(postfix.spanned().repeated().collect::<Vec<_>>())
             .validate(|(base_expr, ops), _, emitter| {
@@ -406,6 +420,11 @@ pub fn expr<'t, 'src: 't>()
                         PostfixOp::TupleIdx(index) => Expr::TupleIndex {
                             receiver: Box::new(acc),
                             index,
+                        }
+                        .with_span(span),
+                        PostfixOp::Index(idx) => Expr::Index {
+                            receiver: Box::new(acc),
+                            index: Box::new(idx),
                         }
                         .with_span(span),
                     }
