@@ -57,7 +57,7 @@ impl ModuleId {
 /// Dotted module path, e.g. `core.io` is `["core", "io"]`.
 ///
 /// The empty path denotes the program root (the entry file's module).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ModulePath(pub Vec<String>);
 
 impl ModulePath {

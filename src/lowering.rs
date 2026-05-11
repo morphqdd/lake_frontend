@@ -56,6 +56,20 @@ pub fn lower_program<'src>(
     // bindings.
     let ret_machines = collect_ret_machines(&program);
 
+    // Detect ret-machines whose bodies are statically pure: no spawn /
+    // wait / self / send / I/O.  Used by #78 to bypass the spawn+wait
+    // mailbox roundtrip for these calls.  Phase 1 only **reports** —
+    // future phases consume this set.
+    let pure_ret_machines = collect_pure_ret_machines(&program, &ret_machines);
+    if std::env::var("LAKE_DUMP_PURE").is_ok() {
+        let mut sorted: Vec<_> = pure_ret_machines.iter().collect();
+        sorted.sort();
+        eprintln!("=== pure ret-machines ===");
+        for k in sorted {
+            eprintln!("  {}::{}", k.module.display(), k.name);
+        }
+    }
+
     let counter = Rc::new(Cell::new(0u32));
 
     let modules = program
@@ -89,7 +103,7 @@ pub fn lower_program<'src>(
 
 // ── ret-machine table ──────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct RetKey {
     module: ModulePath,
     /// Source-visible machine name.
@@ -114,6 +128,160 @@ fn collect_ret_machines<'src>(program: &ParsedProgram<'src>) -> HashMap<RetKey, 
         }
     }
     out
+}
+
+/// rt-funcs that don't yield the scheduler and don't perform I/O.  Memory
+/// ops, allocator, mmap.  Calling these from a pure body keeps the body
+/// pure (no scheduler interaction, no observable side effect other than
+/// memory writes that the call site already authorised).
+fn pure_rt_funcs() -> std::collections::HashSet<&'static str> {
+    [
+        "rt_allocate",
+        "rt_free",
+        "rt_store",
+        "rt_load_u8",
+        "rt_load_u16",
+        "rt_load_u32",
+        "rt_load_u64",
+        "rt_copy_bytes",
+        "rt_mmap",
+        "rt_munmap",
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Detect ret-machines whose bodies are pure w.r.t. concurrency:
+/// no `wait`, no `pin`, no `self()`, no spawn-style call, no I/O.
+/// Calls to other pure ret-machines are allowed (transitive).  Phase 1
+/// of #78 — non-recursive only; self-recursive purity is a follow-on.
+fn collect_pure_ret_machines<'src>(
+    program: &ParsedProgram<'src>,
+    ret_machines: &HashMap<RetKey, String>,
+) -> std::collections::HashSet<RetKey> {
+    use std::collections::HashSet;
+    let pure_rt = pure_rt_funcs();
+
+    // Index machines by RetKey for fixpoint lookups.
+    let mut bodies: HashMap<RetKey, Vec<Spanned<Expr<'src>>>> = HashMap::new();
+    for module in &program.modules {
+        for item in &module.ast {
+            if let Item::Machine(m) = &item.inner {
+                let key = RetKey {
+                    module: module.module_path.clone(),
+                    name: m.inner.ident.inner.0.to_string(),
+                };
+                if !ret_machines.contains_key(&key) {
+                    continue;
+                }
+                // Concatenate all branch bodies — purity is a per-machine
+                // property; any branch with a yield kills it for all.
+                let mut body = Vec::new();
+                for mi in &m.inner.items {
+                    if let MachineItem::Branch(b) = &mi.inner {
+                        body.extend(b.body.iter().cloned());
+                    }
+                }
+                bodies.insert(key, body);
+            }
+        }
+    }
+
+    // Initially assume every ret-machine is pure; then strike out the ones
+    // with disallowed shapes.  Fixpoint converges in O(depth) iterations.
+    let mut candidates: HashSet<RetKey> = bodies.keys().cloned().collect();
+    loop {
+        let snapshot = candidates.clone();
+        let before = candidates.len();
+        candidates.retain(|key| {
+            let body = bodies.get(key).expect("indexed above");
+            body.iter()
+                .all(|e| expr_is_pure(&e.inner, &snapshot, &pure_rt, ret_machines))
+        });
+        if candidates.len() == before {
+            break;
+        }
+    }
+    candidates
+}
+
+fn expr_is_pure<'src>(
+    expr: &Expr<'src>,
+    pure_machines: &std::collections::HashSet<RetKey>,
+    pure_rt: &std::collections::HashSet<&'static str>,
+    ret_machines: &HashMap<RetKey, String>,
+) -> bool {
+    use Expr::*;
+    match expr {
+        Num(_, _) | String(_, _) | Bool(_) | Unit | Atom(_) | Var(_, _) | Path(_) => true,
+        Let { default, .. } => default
+            .as_ref()
+            .map(|d| expr_is_pure(&d.inner, pure_machines, pure_rt, ret_machines))
+            .unwrap_or(true),
+        Ret(inner) => expr_is_pure(&inner.inner, pure_machines, pure_rt, ret_machines),
+        // `pin` is sync sugar for a ret-call — same shape as a normal Jump
+        // to a ret-machine; treat its inner the same way.
+        Pin(_) => false,
+        // `wait` and explicit ret-call shapes are scheduler interactions.
+        Wait { .. } => false,
+        Jump { ident, args } => {
+            // Callee is a bare Var or a Path; reject anything else as
+            // "can't tell, assume impure".
+            let callee_pure = match &ident.inner {
+                Var(name, _) => {
+                    if *name == "self" {
+                        false
+                    } else if pure_rt.contains(name) {
+                        true
+                    } else {
+                        // Look up by name across all modules — name-only
+                        // collision is rare and phase-1-acceptable.
+                        ret_machines.keys().any(|k| k.name == *name)
+                            && pure_machines.iter().any(|k| k.name == *name)
+                    }
+                }
+                Path(segs) => {
+                    let leaf = segs.last().map(|s| s.inner.0).unwrap_or("");
+                    pure_machines.iter().any(|k| k.name == leaf)
+                }
+                _ => false,
+            };
+            if !callee_pure {
+                return false;
+            }
+            args.iter()
+                .all(|a| expr_is_pure(&a.inner, pure_machines, pure_rt, ret_machines))
+        }
+        MethodCall { .. } | AtAccess { .. } | DotAccess { .. } | StructInit { .. } => false,
+        Tuple(elems) => elems
+            .iter()
+            .all(|e| expr_is_pure(&e.inner, pure_machines, pure_rt, ret_machines)),
+        TupleIndex { receiver, .. } => {
+            expr_is_pure(&receiver.inner, pure_machines, pure_rt, ret_machines)
+        }
+        Index { receiver, index } => {
+            expr_is_pure(&receiver.inner, pure_machines, pure_rt, ret_machines)
+                && expr_is_pure(&index.inner, pure_machines, pure_rt, ret_machines)
+        }
+        LetTuple { default, .. } => {
+            expr_is_pure(&default.inner, pure_machines, pure_rt, ret_machines)
+        }
+        When { cond, branches } => {
+            expr_is_pure(&cond.inner, pure_machines, pure_rt, ret_machines)
+                && branches.iter().all(|(c, body)| {
+                    expr_is_pure(&c.inner, pure_machines, pure_rt, ret_machines)
+                        && body.iter().all(|e| {
+                            expr_is_pure(&e.inner, pure_machines, pure_rt, ret_machines)
+                        })
+                })
+        }
+        Mul(l, r) | Div(l, r) | Add(l, r) | Sub(l, r) | Le(l, r) | Ge(l, r) | Eq(l, r)
+        | Lt(l, r) | Gt(l, r) | BAnd(l, r) | BOr(l, r) | BXor(l, r) | Shl(l, r) | Shr(l, r) => {
+            expr_is_pure(&l.inner, pure_machines, pure_rt, ret_machines)
+                && expr_is_pure(&r.inner, pure_machines, pure_rt, ret_machines)
+        }
+        Neg(inner) => expr_is_pure(&inner.inner, pure_machines, pure_rt, ret_machines),
+    }
 }
 
 /// The return type of the first branch that has one.  Branches of a single
