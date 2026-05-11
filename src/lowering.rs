@@ -58,15 +58,27 @@ pub fn lower_program<'src>(
 
     // Detect ret-machines whose bodies are statically pure: no spawn /
     // wait / self / send / I/O.  Used by #78 to bypass the spawn+wait
-    // mailbox roundtrip for these calls.  Phase 1 only **reports** —
-    // future phases consume this set.
+    // mailbox roundtrip for these calls.
     let pure_ret_machines = collect_pure_ret_machines(&program, &ret_machines);
+    // Restrict to "simple" pure bodies (single top-level `ret`, no nested).
+    // Multi-arm `when` bodies (`k`, `h_init`) are excluded for phase 2a;
+    // they need a "valued when" lowering to be inlineable.
+    let pure_bodies = if std::env::var("LAKE_NO_PURE_INLINE").is_ok() {
+        HashMap::new()
+    } else {
+        collect_pure_bodies(&program, &pure_ret_machines)
+    };
     if std::env::var("LAKE_DUMP_PURE").is_ok() {
         let mut sorted: Vec<_> = pure_ret_machines.iter().collect();
         sorted.sort();
         eprintln!("=== pure ret-machines ===");
         for k in sorted {
-            eprintln!("  {}::{}", k.module.display(), k.name);
+            let inlineable = if pure_bodies.contains_key(k) {
+                " [inlineable]"
+            } else {
+                ""
+            };
+            eprintln!("  {}::{}{}", k.module.display(), k.name, inlineable);
         }
     }
 
@@ -83,6 +95,7 @@ pub fn lower_program<'src>(
                 registry,
                 module_id,
                 ret_machines: &ret_machines,
+                pure_bodies: &pure_bodies,
                 counter: counter.clone(),
             };
             cx.lower_module(module)
@@ -297,38 +310,587 @@ fn first_ret_ty(machine: &Machine<'_>) -> Option<String> {
     })
 }
 
+/// Body template for an inlineable pure ret-machine.  Captures the
+/// pre-lowering AST so that callers can substitute parameter names and
+/// splice the body into their own scope.  Only "simple" pure bodies
+/// qualify — a single `ret <expr>` at top level, no nested `ret`.  This
+/// excludes `k(i)` / `h_init(i)` whose multi-arm `when` bodies need a
+/// later "valued when" lowering (see #78 phase 2b).
+#[derive(Debug, Clone)]
+struct PureBodyTemplate<'src> {
+    params: Vec<Spanned<Pattern<'src>>>,
+    body: Vec<Spanned<Expr<'src>>>,
+}
+
+/// True when the body has exactly one `Expr::Ret` at the top level
+/// (the last statement) and none nested elsewhere.  Side-effecting
+/// statements before the final `ret` are allowed (`set(...)`, etc.).
+fn is_simple_pure_body<'src>(body: &[Spanned<Expr<'src>>]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    let last = body.last().unwrap();
+    if !matches!(last.inner, Expr::Ret(_)) {
+        return false;
+    }
+    // Final Ret's inner expression must contain no Ret.
+    if let Expr::Ret(inner) = &last.inner {
+        if expr_contains_ret(&inner.inner) {
+            return false;
+        }
+    }
+    // Prior statements must not contain Ret either.
+    for stmt in &body[..body.len() - 1] {
+        if expr_contains_ret(&stmt.inner) {
+            return false;
+        }
+    }
+    true
+}
+
+fn expr_contains_ret<'src>(expr: &Expr<'src>) -> bool {
+    use Expr::*;
+    match expr {
+        Ret(_) => true,
+        Let { default, .. } => default
+            .as_ref()
+            .map(|d| expr_contains_ret(&d.inner))
+            .unwrap_or(false),
+        Pin(inner) | Neg(inner) => expr_contains_ret(&inner.inner),
+        Jump { ident, args } => {
+            expr_contains_ret(&ident.inner)
+                || args.iter().any(|a| expr_contains_ret(&a.inner))
+        }
+        MethodCall { receiver, args, .. } => {
+            expr_contains_ret(&receiver.inner)
+                || args.iter().any(|a| expr_contains_ret(&a.inner))
+        }
+        AtAccess { receiver, .. } | DotAccess { receiver, .. } => {
+            expr_contains_ret(&receiver.inner)
+        }
+        StructInit { base, fields } => {
+            expr_contains_ret(&base.inner)
+                || fields.iter().any(|f| expr_contains_ret(&f.inner))
+        }
+        Tuple(elems) => elems.iter().any(|e| expr_contains_ret(&e.inner)),
+        TupleIndex { receiver, .. } => expr_contains_ret(&receiver.inner),
+        Index { receiver, index } => {
+            expr_contains_ret(&receiver.inner) || expr_contains_ret(&index.inner)
+        }
+        LetTuple { default, .. } => expr_contains_ret(&default.inner),
+        When { cond, branches } => {
+            expr_contains_ret(&cond.inner)
+                || branches
+                    .iter()
+                    .any(|(c, b)| expr_contains_ret(&c.inner) || b.iter().any(|e| expr_contains_ret(&e.inner)))
+        }
+        Wait { handlers, filter } => {
+            filter.iter().any(|f| expr_contains_ret(&f.inner))
+                || handlers
+                    .iter()
+                    .any(|h| h.inner.body.iter().any(|e| expr_contains_ret(&e.inner)))
+        }
+        Add(l, r) | Sub(l, r) | Mul(l, r) | Div(l, r) | Eq(l, r) | Le(l, r)
+        | Ge(l, r) | Lt(l, r) | Gt(l, r) | BAnd(l, r) | BOr(l, r) | BXor(l, r)
+        | Shl(l, r) | Shr(l, r) => {
+            expr_contains_ret(&l.inner) || expr_contains_ret(&r.inner)
+        }
+        Num(_, _) | String(_, _) | Bool(_) | Unit | Atom(_) | Var(_, _) | Path(_) => false,
+    }
+}
+
+/// Index simple-pure ret-machines by their (module, name) key, storing
+/// the original branch parameters + body.  Only machines that pass both
+/// `collect_pure_ret_machines` AND `is_simple_pure_body` are included.
+fn collect_pure_bodies<'src>(
+    program: &ParsedProgram<'src>,
+    pure_set: &std::collections::HashSet<RetKey>,
+) -> HashMap<RetKey, PureBodyTemplate<'src>> {
+    let mut out = HashMap::new();
+    for module in &program.modules {
+        for item in &module.ast {
+            if let Item::Machine(m) = &item.inner {
+                let key = RetKey {
+                    module: module.module_path.clone(),
+                    name: m.inner.ident.inner.0.to_string(),
+                };
+                if !pure_set.contains(&key) {
+                    continue;
+                }
+                // Expect a single branch (phase 2a restriction).  Bail if not.
+                let mut branches = m.inner.items.iter().filter_map(|mi| {
+                    if let MachineItem::Branch(b) = &mi.inner {
+                        Some(b)
+                    } else {
+                        None
+                    }
+                });
+                let Some(branch) = branches.next() else { continue };
+                if branches.next().is_some() {
+                    // Multi-branch — skip for phase 2a.
+                    continue;
+                }
+                if !is_simple_pure_body(&branch.body) {
+                    continue;
+                }
+                out.insert(
+                    key,
+                    PureBodyTemplate {
+                        params: branch.patterns.clone(),
+                        body: branch.body.clone(),
+                    },
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Substitute identifier names in an expression tree according to `map`.
+/// Used by the inline-pure phase to rename a pure body's parameters and
+/// internal locals to fresh names per inline site.  Var references and
+/// Let bindings get the substitution applied; Jump callees do NOT (they
+/// reference machine names, not local variables).
+fn substitute_in_expr<'src>(
+    expr: Spanned<Expr<'src>>,
+    map: &HashMap<String, &'static str>,
+) -> Spanned<Expr<'src>> {
+    let span = expr.span;
+    use Expr::*;
+    let new_inner = match expr.inner {
+        Var(name, ty) => {
+            if let Some(fresh) = map.get(name) {
+                Var(*fresh, ty)
+            } else {
+                Var(name, ty)
+            }
+        }
+        Let { ident, ty, default } => {
+            let ident_str: std::string::String = ident.inner.0.to_string();
+            let new_ident = if let Some(fresh) = map.get(&ident_str) {
+                Ident::new(*fresh).with_span(ident.span)
+            } else {
+                ident
+            };
+            Let {
+                ident: new_ident,
+                ty,
+                default: default.map(|d| Box::new(substitute_in_expr(*d, map))),
+            }
+        }
+        Ret(inner) => Ret(Box::new(substitute_in_expr(*inner, map))),
+        Pin(inner) => Pin(Box::new(substitute_in_expr(*inner, map))),
+        Jump { ident, args } => Jump {
+            // Don't substitute the callee's name — it's a machine reference.
+            // But DO walk it in case it's a Path with its own structure.
+            ident,
+            args: args
+                .into_iter()
+                .map(|a| substitute_in_expr(a, map))
+                .collect(),
+        },
+        When { cond, branches } => When {
+            cond: Box::new(substitute_in_expr(*cond, map)),
+            branches: branches
+                .into_iter()
+                .map(|(pat, body)| {
+                    (
+                        substitute_in_expr(pat, map),
+                        body.into_iter()
+                            .map(|e| substitute_in_expr(e, map))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        },
+        Wait { handlers, filter } => Wait {
+            handlers,
+            filter: filter
+                .into_iter()
+                .map(|f| substitute_in_expr(f, map))
+                .collect(),
+        },
+        Tuple(elems) => Tuple(
+            elems
+                .into_iter()
+                .map(|e| substitute_in_expr(e, map))
+                .collect(),
+        ),
+        TupleIndex { receiver, index } => TupleIndex {
+            receiver: Box::new(substitute_in_expr(*receiver, map)),
+            index,
+        },
+        Index { receiver, index } => Index {
+            receiver: Box::new(substitute_in_expr(*receiver, map)),
+            index: Box::new(substitute_in_expr(*index, map)),
+        },
+        LetTuple { fields, default } => LetTuple {
+            fields,
+            default: Box::new(substitute_in_expr(*default, map)),
+        },
+        MethodCall {
+            receiver,
+            method,
+            args,
+        } => MethodCall {
+            receiver: Box::new(substitute_in_expr(*receiver, map)),
+            method,
+            args: args
+                .into_iter()
+                .map(|a| substitute_in_expr(a, map))
+                .collect(),
+        },
+        AtAccess { receiver, field } => AtAccess {
+            receiver: Box::new(substitute_in_expr(*receiver, map)),
+            field,
+        },
+        DotAccess { receiver, field } => DotAccess {
+            receiver: Box::new(substitute_in_expr(*receiver, map)),
+            field,
+        },
+        StructInit { base, fields } => StructInit {
+            base: Box::new(substitute_in_expr(*base, map)),
+            fields: fields
+                .into_iter()
+                .map(|f| substitute_in_expr(f, map))
+                .collect(),
+        },
+        Add(l, r) => Add(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Sub(l, r) => Sub(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Mul(l, r) => Mul(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Div(l, r) => Div(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Neg(inner) => Neg(Box::new(substitute_in_expr(*inner, map))),
+        Eq(l, r) => Eq(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Le(l, r) => Le(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Ge(l, r) => Ge(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Lt(l, r) => Lt(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Gt(l, r) => Gt(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        BAnd(l, r) => BAnd(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        BOr(l, r) => BOr(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        BXor(l, r) => BXor(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Shl(l, r) => Shl(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        Shr(l, r) => Shr(
+            Box::new(substitute_in_expr(*l, map)),
+            Box::new(substitute_in_expr(*r, map)),
+        ),
+        other => other,
+    };
+    Spanned {
+        inner: new_inner,
+        span,
+    }
+}
+
+/// Walk a body collecting names introduced by `let` so they can be
+/// added to the substitution map (with fresh `__inl_<id>_<name>`
+/// renames).  Avoids accidental shadowing when a pure body's internal
+/// local collides with a caller's local.
+fn collect_local_let_names<'src>(
+    body: &[Spanned<Expr<'src>>],
+    map: &mut HashMap<String, &'static str>,
+    id: u32,
+) {
+    for stmt in body {
+        collect_let_names_in_expr(&stmt.inner, map, id);
+    }
+}
+
+fn collect_let_names_in_expr<'src>(
+    expr: &Expr<'src>,
+    map: &mut HashMap<String, &'static str>,
+    id: u32,
+) {
+    use Expr::*;
+    match expr {
+        Let { ident, default, .. } => {
+            let name = ident.inner.0.to_string();
+            if !map.contains_key(&name) {
+                let fresh: &'static str =
+                    Box::leak(format!("__inl_{}_{}", id, ident.inner.0).into_boxed_str());
+                map.insert(name, fresh);
+            }
+            if let Some(d) = default {
+                collect_let_names_in_expr(&d.inner, map, id);
+            }
+        }
+        Ret(inner) | Pin(inner) | Neg(inner) => {
+            collect_let_names_in_expr(&inner.inner, map, id);
+        }
+        Jump { args, .. } => {
+            for a in args {
+                collect_let_names_in_expr(&a.inner, map, id);
+            }
+        }
+        When { cond, branches } => {
+            collect_let_names_in_expr(&cond.inner, map, id);
+            for (_, body) in branches {
+                collect_local_let_names(body, map, id);
+            }
+        }
+        Wait { handlers, .. } => {
+            for h in handlers {
+                collect_local_let_names(&h.inner.body, map, id);
+            }
+        }
+        Add(l, r) | Sub(l, r) | Mul(l, r) | Div(l, r) | Eq(l, r) | Le(l, r) | Ge(l, r)
+        | Lt(l, r) | Gt(l, r) | BAnd(l, r) | BOr(l, r) | BXor(l, r) | Shl(l, r)
+        | Shr(l, r) => {
+            collect_let_names_in_expr(&l.inner, map, id);
+            collect_let_names_in_expr(&r.inner, map, id);
+        }
+        Tuple(elems) => {
+            for e in elems {
+                collect_let_names_in_expr(&e.inner, map, id);
+            }
+        }
+        TupleIndex { receiver, .. } => collect_let_names_in_expr(&receiver.inner, map, id),
+        Index { receiver, index } => {
+            collect_let_names_in_expr(&receiver.inner, map, id);
+            collect_let_names_in_expr(&index.inner, map, id);
+        }
+        _ => {}
+    }
+}
+
+/// Given a body whose last statement is `Expr::Ret(e)` (asserted by
+/// `is_simple_pure_body`), return (prior statements, the inner `e`).
+fn split_final_ret<'src>(
+    mut body: Vec<Spanned<Expr<'src>>>,
+) -> (Vec<Spanned<Expr<'src>>>, Spanned<Expr<'src>>) {
+    let last = body.pop().expect("body is non-empty for pure machine");
+    let Expr::Ret(inner) = last.inner else {
+        panic!("split_final_ret: last statement is not Ret (is_simple_pure_body should guarantee)");
+    };
+    (body, *inner)
+}
+
 // ── per-module context ─────────────────────────────────────────────────────
 
 struct LowerCx<'a, 'src> {
     registry: &'a ProgramRegistry<'src>,
     module_id: ModuleId,
     ret_machines: &'a HashMap<RetKey, String>,
+    /// Inline-eligible pure ret-machines indexed by their RetKey.  Calls
+    /// to these get expanded at the call site by `inline_pure_calls`
+    /// instead of going through spawn+wait.
+    pure_bodies: &'a HashMap<RetKey, PureBodyTemplate<'src>>,
     counter: Rc<Cell<u32>>,
 }
 
 impl<'a, 'src> LowerCx<'a, 'src> {
     fn lower_module(&self, module: ParsedModule<'src>) -> ParsedModule<'src> {
+        let module_path = module.module_path.clone();
         let ast = module
             .ast
             .into_iter()
-            .map(|item| {
+            .filter_map(|item| {
                 let span = item.span;
                 match item.inner {
                     Item::Machine(m) => {
                         let machine_span = m.span;
-                        Item::Machine(self.lower_machine(m.inner).with_span(machine_span))
-                            .with_span(span)
+                        let name = m.inner.ident.inner.0.to_string();
+                        let key = RetKey {
+                            module: module_path.clone(),
+                            name,
+                        };
+                        // Pure machines are fully inlined at their call
+                        // sites by `inline_pure_calls` — drop them from
+                        // the AST so the backend never sees their raw
+                        // `Expr::Ret(e)` bodies.  If a pure machine is
+                        // never called, it disappears with no codegen,
+                        // saving binary size.
+                        if self.pure_bodies.contains_key(&key) {
+                            None
+                        } else {
+                            Some(
+                                Item::Machine(
+                                    self.lower_machine(m.inner).with_span(machine_span),
+                                )
+                                .with_span(span),
+                            )
+                        }
                     }
-                    other => other.with_span(span),
+                    other => Some(other.with_span(span)),
                 }
             })
             .collect();
 
         ParsedModule {
-            module_path: module.module_path,
+            module_path,
             source_path: module.source_path,
             ast,
         }
+    }
+
+    /// Look up an inlineable pure ret-machine by source-visible name.
+    /// Resolves both unqualified calls (same module) and module-imported
+    /// callees.  Phase-1 conservative match: by bare name only; in
+    /// practice pure machines in stdlib have unique names.
+    fn lookup_pure(&self, name: &str) -> Option<&'a PureBodyTemplate<'src>> {
+        self.pure_bodies
+            .iter()
+            .find(|(k, _)| k.name == name)
+            .map(|(_, v)| v)
+    }
+
+    /// Run the inline-pure-calls phase recursively on a body until no
+    /// more pure calls remain.  Each iteration:
+    ///   1. Walks each statement.
+    ///   2. For `let r = pure_f(args)` (or bare `pure_f(args)` wrapped
+    ///      by Phase 1.c), expands to arg-binding lets + substituted
+    ///      body + final-`ret` rewritten to bind `r`.
+    ///   3. Substituted body may contain calls to other pure machines
+    ///      — recursive call inlines those too.
+    fn inline_pure_calls(&self, body: Vec<Spanned<Expr<'src>>>) -> Vec<Spanned<Expr<'src>>> {
+        if self.pure_bodies.is_empty() {
+            return body;
+        }
+        // Lift any nested pure (or impure) ret-machine calls into
+        // separate lets first, so each pure call is the top-level RHS
+        // of some `let r = ...`.  Without this, `let s = big_s0(x)`
+        // expands to a body containing `BXor(rotr32(x 2), rotr32(x
+        // 13), rotr32(x 22))` where the rotr32 calls are in arg
+        // position — un-inlineable until lifted.
+        let body = self.lift_nested_calls(body);
+
+        let mut out = Vec::with_capacity(body.len());
+        for stmt in body {
+            if let Some(expanded) = self.try_inline_pure_let(&stmt) {
+                // Recurse: the substituted body may itself contain
+                // pure calls.  Recursion also re-lifts after the
+                // substitution introduces fresh nested calls.
+                let recursed = self.inline_pure_calls(expanded);
+                out.extend(recursed);
+            } else {
+                out.push(stmt);
+            }
+        }
+        out
+    }
+
+    /// Attempt to expand a `let r = pure_f(args)` statement.  Returns
+    /// `None` if the statement is not a let-bound pure call.
+    fn try_inline_pure_let(
+        &self,
+        stmt: &Spanned<Expr<'src>>,
+    ) -> Option<Vec<Spanned<Expr<'src>>>> {
+        let Expr::Let {
+            ident: user_ident,
+            ty: user_ty,
+            default: Some(rhs),
+        } = &stmt.inner
+        else {
+            return None;
+        };
+        let Expr::Jump { ident: callee, args } = &rhs.inner else {
+            return None;
+        };
+        let callee_name = match &callee.inner {
+            Expr::Var(name, _) => *name,
+            Expr::Path(segs) => segs.last().map(|s| s.inner.0).unwrap_or(""),
+            _ => return None,
+        };
+        let template = self.lookup_pure(callee_name)?;
+        // Arity must match.  Otherwise downstream typeck would fail
+        // anyway; safer to leave alone.
+        if template.params.len() != args.len() {
+            return None;
+        }
+
+        let span = stmt.span;
+        let id = self.counter.get();
+        self.counter.set(id + 1);
+
+        // Build the rename map: each param's source name → a fresh
+        // `__inl_<id>_<param>` name.  Also rename any `let` bindings
+        // inside the body so they can't shadow caller's locals.
+        let mut map: HashMap<String, &'static str> = HashMap::new();
+        for pat in &template.params {
+            let param_name = pat.inner.ident.inner.0;
+            let fresh: &'static str = Box::leak(
+                format!("__inl_{}_{}", id, param_name).into_boxed_str(),
+            );
+            map.insert(param_name.to_string(), fresh);
+        }
+        collect_local_let_names(&template.body, &mut map, id);
+
+        // Emit arg-binding lets at the start of the expansion.
+        let mut out: Vec<Spanned<Expr<'src>>> = Vec::new();
+        for (pat, arg) in template.params.iter().zip(args.iter()) {
+            let param_name = pat.inner.ident.inner.0;
+            let fresh = map[&param_name.to_string()];
+            out.push(
+                Expr::Let {
+                    ident: Ident::new(fresh).with_span(span),
+                    ty: pat.inner.ty.clone(),
+                    default: Some(Box::new(arg.clone())),
+                }
+                .with_span(span),
+            );
+        }
+
+        // Substitute params + locals in body.
+        let substituted: Vec<Spanned<Expr<'src>>> = template
+            .body
+            .iter()
+            .cloned()
+            .map(|e| substitute_in_expr(e, &map))
+            .collect();
+
+        // Rewrite the final `ret <expr>` to `let <user_ident> = <expr>`
+        // so the caller sees the value bound to its target name.  All
+        // prior statements in the substituted body (rt_store etc.) are
+        // kept as-is.
+        let (prefix, ret_expr) = split_final_ret(substituted);
+        out.extend(prefix);
+        out.push(
+            Expr::Let {
+                ident: user_ident.clone(),
+                ty: user_ty.clone(),
+                default: Some(Box::new(ret_expr)),
+            }
+            .with_span(span),
+        );
+        Some(out)
     }
 
     fn lower_machine(&self, mut machine: Machine<'src>) -> Machine<'src> {
@@ -477,6 +1039,15 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             .into_iter()
             .map(|e| self.wrap_bare_ret_call_in_let(e))
             .collect();
+
+        // Phase 1.d: inline pure ret-machine calls (#78 phase 2a).
+        // Each `let r = pure_f(args)` expands to:
+        //   let __inl_K_<param> = arg                         (per param)
+        //   <substituted body, minus its `ret e`>
+        //   let r = e
+        // Phase 2 below then sees no pure calls left — only spawns
+        // for impure ret-machines.
+        let body = self.inline_pure_calls(body);
 
         // Phase 2: caller-side desugaring.  We iterate top-down; a
         // let-with-ret-call folds the remainder of the body into a wait
