@@ -342,7 +342,7 @@ pub fn expr<'t, 'src: 't>()
         let postfix = choice((call_op, at_op, dot_op));
 
         base.then(postfix.spanned().repeated().collect::<Vec<_>>())
-            .map(|(base_expr, ops)| {
+            .validate(|(base_expr, ops), _, emitter| {
                 ops.into_iter().fold(base_expr, |acc, op| {
                     let span = acc.span;
                     match op.inner {
@@ -353,6 +353,11 @@ pub fn expr<'t, 'src: 't>()
                             // hashing treats it as a process spawn target;
                             // in the Path case we keep the path as-is and
                             // let the resolver follow the module chain.
+                            // Anything else (a literal, an arithmetic result,
+                            // etc.) is not a valid callee — Lake has no
+                            // first-class machines.  Emit a parse error and
+                            // keep the original expression so the rest of the
+                            // input still parses for further diagnostics.
                             let callee = match acc.inner {
                                 Expr::Var(ident, _ty) => Expr::Var(
                                     ident,
@@ -360,9 +365,16 @@ pub fn expr<'t, 'src: 't>()
                                 )
                                 .with_span(span),
                                 Expr::Path(_) => acc,
-                                other => panic!(
-                                    "call applied to non-callable expression: {other:?}"
-                                ),
+                                ref other => {
+                                    emitter.emit(Rich::custom(
+                                        span,
+                                        format!(
+                                            "call target must be an identifier or module path, got {}",
+                                            describe_callee(other),
+                                        ),
+                                    ));
+                                    return acc;
+                                }
                             };
                             Expr::Jump {
                                 ident: Box::new(callee),
@@ -454,4 +466,25 @@ pub fn expr<'t, 'src: 't>()
                 }),
             ))
     })
+}
+
+fn describe_callee(expr: &Expr<'_>) -> &'static str {
+    match expr {
+        Expr::Num(_, _) => "a numeric literal",
+        Expr::String(_, _) => "a string literal",
+        Expr::Atom(_) => "an atom",
+        Expr::Tuple(_) => "a tuple",
+        Expr::Add(..) | Expr::Sub(..) | Expr::Mul(..) | Expr::Div(..) | Expr::Neg(_) => {
+            "an arithmetic expression"
+        }
+        Expr::Shl(..) | Expr::Shr(..) | Expr::BAnd(..) | Expr::BOr(..) | Expr::BXor(..) => {
+            "a bitwise expression"
+        }
+        Expr::Eq(..) | Expr::Lt(..) | Expr::Gt(..) | Expr::Le(..) | Expr::Ge(..) => {
+            "a comparison"
+        }
+        Expr::Jump { .. } => "another call result",
+        Expr::When { .. } => "a when expression",
+        _ => "a non-callable expression",
+    }
 }
