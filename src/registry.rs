@@ -541,10 +541,15 @@ fn branch_signature(branch: &Branch<'_>) -> Signature {
         .filter(|p| !p.inner.is_wildcard())
         .map(|p| p.inner.ty.inner.to_string())
         .collect();
-    Signature {
-        params,
-        ret: "pid".to_string(),
-    }
+    // Ret-machines (`-> ret <ty>`) propagate their declared return type so
+    // call-site let-inference (#45 buf, #66 sha256, etc.) sees the right
+    // shape.  Spawn-style branches (no `ret_ty`) fall back to "pid".
+    let ret = branch
+        .ret_ty
+        .as_ref()
+        .map(|t| t.inner.to_string())
+        .unwrap_or_else(|| "pid".to_string());
+    Signature { params, ret }
 }
 
 /// Extract `(name, signature)` from an `@ffi(name { params } { ret })`
@@ -723,7 +728,11 @@ impl<'a> Resolution<'a> {
     pub fn return_type(&self) -> &str {
         match self {
             Resolution::Rt(sig) | Resolution::Ffi(sig) => &sig.ret,
-            Resolution::Machine(_) => "pid",
+            // All branches of a single machine share the declared ret type
+            // (`pid` for spawn-style, the explicit `ret <ty>` for ret-machines).
+            // Pick branches[0] as canonical; empty-branches case is unreachable
+            // post-resolver.
+            Resolution::Machine(m) => m.branches.first().map(|b| b.ret.as_str()).unwrap_or("pid"),
             Resolution::Const(c) => &c.ty,
         }
     }

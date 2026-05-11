@@ -437,7 +437,15 @@ fn types_compatible(param: &str, arg: &str) -> bool {
     if param == arg {
         return true;
     }
-    matches!((param, arg), ("str", "i64") | ("i64", "str"))
+    // `str` and `buf` (#45) share the same fat-pointer runtime layout —
+    // `str` for immutable literals, `buf` for heap-allocated mutable buffers.
+    // Accept both directions for source-level ergonomics; the mutability
+    // distinction is enforced statically by #76 (move/copy ownership).
+    //
+    // `i64` is a pure number and is NOT interchangeable with buffer types.
+    // Code that needs to traffic raw addresses must explicitly type them as
+    // `buf` (or in escape-hatch cases, declare a `buf` param).
+    matches!((param, arg), ("buf", "str") | ("str", "buf"))
 }
 
 fn display_sig(sig: &Signature) -> String {

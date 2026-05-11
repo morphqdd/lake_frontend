@@ -1587,6 +1587,7 @@ fn type_from_string<'src>(s: &str, span: SimpleSpan) -> Type<'src> {
     let static_name: &'static str = match s {
         "i64" => "i64",
         "str" => "str",
+        "buf" => "buf",
         "bool" => "bool",
         "pid" => "pid",
         _ => return Type::Unknown,

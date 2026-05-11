@@ -430,6 +430,7 @@ fn type_from_str<'src>(s: &str, span: SimpleSpan) -> Type<'src> {
     match s {
         "i64" => static_named("i64", span),
         "str" => static_named("str", span),
+        "buf" => static_named("buf", span),
         "bool" => static_named("bool", span),
         "pid" => static_named("pid", span),
         "{}" => Type::Unit,

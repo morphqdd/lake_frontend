@@ -37,19 +37,19 @@ fn s(params: &[&'static str], ret: &'static str) -> Signature {
 pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
     vec![
         // ── stdio + raw bytes ────────────────────────────────────────────
-        ("rt_write", s(&["i64", "str", "i64"], "{}")),
+        ("rt_write", s(&["i64", "buf", "i64"], "{}")),
         ("rt_write_static", s(&["i64", "str", "i64"], "{}")),
-        ("rt_read", s(&["i64", "i64", "i64"], "{}")),
+        ("rt_read", s(&["i64", "buf", "i64"], "{}")),
 
         // ── memory ──────────────────────────────────────────────────────
-        ("rt_allocate", s(&["i64"], "i64")),
-        ("rt_free", s(&["i64"], "{}")),
-        ("rt_store", s(&["i64", "i64", "i64", "i64"], "{}")),
-        ("rt_load_u8", s(&["i64", "i64"], "i64")),
-        ("rt_load_u16", s(&["i64", "i64"], "i64")),
-        ("rt_load_u32", s(&["i64", "i64"], "i64")),
-        ("rt_load_u64", s(&["i64", "i64"], "i64")),
-        ("rt_copy_bytes", s(&["i64", "i64", "i64", "i64", "i64"], "{}")),
+        ("rt_allocate", s(&["i64"], "buf")),
+        ("rt_free", s(&["buf"], "{}")),
+        ("rt_store", s(&["buf", "i64", "i64", "i64"], "{}")),
+        ("rt_load_u8", s(&["buf", "i64"], "i64")),
+        ("rt_load_u16", s(&["buf", "i64"], "i64")),
+        ("rt_load_u32", s(&["buf", "i64"], "i64")),
+        ("rt_load_u64", s(&["buf", "i64"], "i64")),
+        ("rt_copy_bytes", s(&["buf", "i64", "buf", "i64", "i64"], "{}")),
         ("rt_mmap", s(&["i64", "i64", "i64", "i64", "i64", "i64"], "i64")),
         ("rt_munmap", s(&["i64", "i64"], "i64")),
         ("rt_init_heap", s(&[], "{}")),
