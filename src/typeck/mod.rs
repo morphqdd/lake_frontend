@@ -402,7 +402,20 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
             // surface a coarse `tuple` token.  Refine when call-arg sigs
             // gain shape awareness.
             Expr::Tuple(_) => "tuple".to_string(),
-            Expr::TupleIndex { .. } => "?".to_string(),
+            Expr::TupleIndex { receiver, index } => {
+                // Resolve the field type from the receiver's `Struct(fields)`
+                // annotation (the resolver fills `Var.ty` from let / wait-
+                // handler scope).  Without this, `tuple.idx` always reports
+                // `?` to call-arg matching, breaking Go-style error-handling
+                // pipelines that thread `{atom value}` tuples through chains
+                // of `let r = call(...)` + `when r.0 { ... call(r.1) ... }`.
+                if let Expr::Var(_, Type::Struct(fields)) = &receiver.inner {
+                    if let Some(field) = fields.get(*index) {
+                        return field.inner.to_string();
+                    }
+                }
+                "?".to_string()
+            }
             Expr::Index { .. } => "i64".to_string(),
             Expr::Jump { ident, .. } => match &ident.inner {
                 Expr::Var(name, _) => self

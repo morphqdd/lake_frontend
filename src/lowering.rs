@@ -2323,12 +2323,29 @@ fn is_caller_send(expr: &Expr<'_>) -> bool {
 }
 
 fn type_from_string<'src>(s: &str, span: SimpleSpan) -> Type<'src> {
+    let s = s.trim();
+    // Anonymous struct: `{ T1 T2 ... }` rendered by Type::Display.
+    if let Some(inner) = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return Type::Unit;
+        }
+        // Split by whitespace at top level.  Lake's current Type set is flat
+        // (no nested generics inside anonymous structs at the surface
+        // syntax), so naive whitespace splitting is sufficient.
+        let fields: Vec<_> = inner
+            .split_whitespace()
+            .map(|tok| type_from_string::<'src>(tok, span).with_span(span))
+            .collect();
+        return Type::Struct(fields);
+    }
     let static_name: &'static str = match s {
         "i64" => "i64",
         "str" => "str",
         "buf" => "buf",
         "bool" => "bool",
         "pid" => "pid",
+        "atom" => "atom",
         _ => return Type::Unknown,
     };
     Type::Named(Ident::new(static_name).with_span(span))
