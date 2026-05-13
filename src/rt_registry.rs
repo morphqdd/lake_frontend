@@ -42,7 +42,13 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         ("rt_read", s(&["i64", "buf", "i64"], "{}")),
 
         // ── memory ──────────────────────────────────────────────────────
-        ("rt_allocate", s(&["i64"], "buf")),
+        // rt_allocate returns the tuple `{atom buf}` (tuple-ABI #87):
+        // user code pattern-matches `r.0` against `:ok` / `:err`
+        // before consuming `r.1`.  rt_allocate_raw stays plain buf
+        // for scheduler internals.
+        ("rt_allocate", s(&["i64"], "{atom buf}")),
+        ("rt_allocate_raw", s(&["i64"], "buf")),
+        ("rt_die_actor", s(&[], "{}")),
         ("rt_free", s(&["buf"], "{}")),
         ("rt_store", s(&["buf", "i64", "i64", "i64"], "{}")),
         ("rt_load_u8", s(&["buf", "i64"], "i64")),
@@ -85,7 +91,7 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         ("rt_listen_tcp", s(&["i64"], "i64")),
         ("rt_accept_async", s(&["i64"], "i64")),
         ("rt_send_async", s(&["i64", "str", "i64"], "i64")),
-        ("rt_recv_async", s(&["i64", "i64", "i64"], "i64")),
+        ("rt_recv_async", s(&["i64", "buf", "i64"], "i64")),
         ("rt_close", s(&["i64"], "{}")),
     ]
 }

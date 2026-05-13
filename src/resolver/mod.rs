@@ -433,13 +433,28 @@ fn static_named<'src>(name: &'static str, span: SimpleSpan) -> Type<'src> {
 /// (i64 / str / bool / pid / unit) round-trip; richer return types stay
 /// unresolved so the caller can fall back to "user must annotate".
 fn type_from_str<'src>(s: &str, span: SimpleSpan) -> Type<'src> {
+    let s = s.trim();
+    // Anonymous struct `{ T1 T2 ... }` — round-trips the Display form
+    // used by the rt-fn signature registry (e.g. rt_allocate now
+    // returns `{atom buf}`).
+    if let Some(inner) = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return Type::Unit;
+        }
+        let fields: Vec<_> = inner
+            .split_whitespace()
+            .map(|tok| type_from_str::<'src>(tok, span).with_span(span))
+            .collect();
+        return Type::Struct(fields);
+    }
     match s {
         "i64" => static_named("i64", span),
         "str" => static_named("str", span),
         "buf" => static_named("buf", span),
         "bool" => static_named("bool", span),
         "pid" => static_named("pid", span),
-        "{}" => Type::Unit,
+        "atom" => static_named("atom", span),
         _ => Type::Unknown,
     }
 }

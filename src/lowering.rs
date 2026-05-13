@@ -150,6 +150,8 @@ fn collect_ret_machines<'src>(program: &ParsedProgram<'src>) -> HashMap<RetKey, 
 fn pure_rt_funcs() -> std::collections::HashSet<&'static str> {
     [
         "rt_allocate",
+        "rt_allocate_raw",
+        "rt_die_actor",
         "rt_free",
         "rt_store",
         "rt_load_u8",
