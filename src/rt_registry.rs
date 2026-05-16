@@ -93,5 +93,17 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         ("rt_send_async", s(&["i64", "str", "i64"], "i64")),
         ("rt_recv_async", s(&["i64", "buf", "i64"], "i64")),
         ("rt_close", s(&["i64"], "{}")),
+
+        // ── environment (argv / envp via asm shim) ─────────────────────
+        ("rt_argc_raw", s(&[], "i64")),
+        ("rt_argv_raw", s(&[], "i64")),
+        ("rt_envp_raw", s(&[], "i64")),
+        ("rt_cstr_len", s(&["i64"], "i64")),
+        ("rt_load_ptr_raw", s(&["i64", "i64"], "i64")),
+        ("rt_cstr_to_buf", s(&["i64"], "{atom buf}")),
+        ("buf_len", s(&["buf"], "i64")),
+        ("buf_ptr", s(&["buf"], "i64")),
+        ("cmp_str_buf", s(&["str", "buf"], "i64")),
+        ("buf_trim", s(&["buf", "i64"], "{}")),
     ]
 }

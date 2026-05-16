@@ -75,8 +75,17 @@ pub fn lexer<'src>()
             }),
             punct,
             nums,
-            any()
-                .and_is(one_of("\"").not())
+            // String body: any char except an unescaped `"`.  Backslash
+            // escapes (`\"`, `\\`, `\n`, …) are accepted at lex time —
+            // the byte-level translation happens later in
+            // `string_expr::unescape` once the literal reaches codegen.
+            // Without the explicit `\\.` alternative the lexer would
+            // close the string on the first `"` after a backslash and
+            // refuse to tokenise embedded double-quote escapes.
+            choice((
+                just('\\').then(any()).to_slice(),
+                any().and_is(one_of("\"\\").not()).to_slice(),
+            ))
                 .repeated()
                 .to_slice()
                 .delimited_by(just("\""), just("\""))

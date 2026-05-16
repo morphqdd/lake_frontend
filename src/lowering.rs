@@ -161,6 +161,18 @@ fn pure_rt_funcs() -> std::collections::HashSet<&'static str> {
         "rt_copy_bytes",
         "rt_mmap",
         "rt_munmap",
+        // Pointer / length helpers — pure reads of a fat-ptr header.
+        // Whitelisting these lets #78 inline the `std.bytes.addr` /
+        // `std.bytes.size` wrappers, avoiding a spawn+wait per call
+        // site.  Frontend-visible rt-fns like `len` / `rt_argc_raw`
+        // are deliberately NOT in this list — adding them caused
+        // wildcard-branch dispatch to misroute (`argc(pid)` failed
+        // to match `argc(_)`).
+        "buf_ptr",
+        "buf_len",
+        "buf_trim",
+        "cmp_str_buf",
+        "rt_envp_raw",
     ]
     .into_iter()
     .collect()

@@ -136,6 +136,12 @@ impl<'src, 'r> Resolver<'src, 'r> {
             | Expr::Shl(_, _)
             | Expr::Shr(_, _) => static_named("i64", span),
             Expr::Jump { ident, .. } => self.infer_jump_return(&ident.inner, span),
+            // `pin <call>` is the sync-await sugar for ret-machines —
+            // the value flowing back is exactly the inner Jump's
+            // return type.  Without this, `let x = pin foo(...)`
+            // leaves `x` typed `Unknown`, which trips downstream
+            // call-arg matching with `?` placeholders.
+            Expr::Pin(inner) => self.infer_expr_type(&inner.inner, inner.span),
             // Higher-order shapes (let, when, wait, method-call, …) don't
             // have a defined "value" yet — leave them unresolved.
             _ => Type::Unknown,
