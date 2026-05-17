@@ -614,6 +614,29 @@ mod tests {
     }
 
     #[test]
+    fn when_arm_pattern_tuple_atom_dispatch() {
+        // Feature #055 — `when r { { :ok v } -> body }` parses with
+        // an `Expr::Tuple` in the arm-key position; the lowering pass
+        // rewrites it into nested atom dispatch + binding lets.
+        with_branch_expr(
+            r#"m is { _ -> { when r { { :ok v } -> { v } } } }"#,
+            |expr| {
+                let Expr::When { branches, .. } = expr else {
+                    panic!("expected When, got {expr:?}")
+                };
+                assert_eq!(branches.len(), 1);
+                let (key, _body) = &branches[0];
+                let Expr::Tuple(elems) = &key.inner else {
+                    panic!("expected Tuple arm pattern, got {:?}", key.inner);
+                };
+                assert_eq!(elems.len(), 2);
+                assert!(matches!(elems[0].inner, Expr::Atom("ok")));
+                assert!(matches!(elems[1].inner, Expr::Var("v", _)));
+            },
+        );
+    }
+
+    #[test]
     fn let_with_tagged_tuple() {
         // Erlang-flavoured tagged tuple: first element is an atom, rest values.
         with_branch_expr("m is { _ -> { let r = { :ok 42 } } }", |expr| {

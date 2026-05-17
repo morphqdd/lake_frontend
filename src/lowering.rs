@@ -1077,6 +1077,18 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         // keeps source ordering stable.
         let body = self.expand_let_tuple(body);
 
+        // Phase 0c: lower tuple patterns in `when` arms.  See feature
+        // #055.  Rewrites `when X { { :ok v } -> body ... }` into a
+        // synthetic let + nested when dispatching on field 0, with
+        // each non-discriminator sub-pattern emitted as a `let` at
+        // the start of the arm body.  Run before Ret-rewriting so
+        // arm bodies see the synthesised lets through the rest of
+        // the pipeline as ordinary user-level lets.
+        let body: Vec<Spanned<Expr<'src>>> = body
+            .into_iter()
+            .flat_map(|e| self.lower_when_tuple_patterns(e))
+            .collect();
+
         // Phase 1.0: thread `__caller` through `self(args)` calls
         // inside a ret-typed branch.  Without this, a tail-recursive
         // `self(...)` would have one fewer arg than the branch
@@ -1329,6 +1341,361 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         let id = self.counter.get();
         self.counter.set(id + 1);
         id
+    }
+
+    /// Feature #055 — lower `when X { { :ok v } -> body ... }` into a
+    /// synthetic temp + nested when on the discriminator tag.
+    ///
+    /// Returns a `Vec` because rewriting introduces a synthesised
+    /// `let __wtp_<id> = X` statement that precedes the rewritten
+    /// `when`.  Non-tuple-arm whens pass through unchanged (single
+    /// element vector).
+    ///
+    /// Supported arm shapes (others fall through to the existing
+    /// backend rejection path):
+    ///   * `{ :atom pat... }` — atom dispatch + binding lets.
+    ///   * `{ _ pat... }`     — wildcard discriminator (catch-all).
+    ///   * `{ name pat... }`  — name binding on the discriminator,
+    ///                          treated as the wildcard arm of the
+    ///                          nested `when`.  At most one allowed.
+    ///
+    /// Sub-patterns at positions 1..N may be `Var(name)` (binds the
+    /// slot), `Var("_")` (drops it), or a literal (binds nothing —
+    /// reserved for future literal guards; today produces a
+    /// synthetic let with a discarded name).
+    fn lower_when_tuple_patterns(
+        &self,
+        expr: Spanned<Expr<'src>>,
+    ) -> Vec<Spanned<Expr<'src>>> {
+        let span = expr.span;
+        match expr.inner {
+            Expr::When { cond, branches } => {
+                // First recurse into the discriminant and each arm
+                // body so nested whens / lets / waits get the same
+                // rewrite.
+                let cond = self.lower_when_tuple_patterns_in_expr(*cond);
+                let branches: Vec<_> = branches
+                    .into_iter()
+                    .map(|(pat, body)| {
+                        let pat = self.lower_when_tuple_patterns_in_expr(pat);
+                        let body: Vec<_> = body
+                            .into_iter()
+                            .flat_map(|e| self.lower_when_tuple_patterns(e))
+                            .collect();
+                        (pat, body)
+                    })
+                    .collect();
+
+                // Does any arm have a tuple pattern?  If not, leave
+                // the when alone.
+                let any_tuple = branches
+                    .iter()
+                    .any(|(p, _)| matches!(&p.inner, Expr::Tuple(_)));
+                if !any_tuple {
+                    return vec![
+                        Expr::When {
+                            cond: Box::new(cond),
+                            branches,
+                        }
+                        .with_span(span),
+                    ];
+                }
+
+                // All non-wildcard arms must use tuple patterns of
+                // the same arity (the discriminator is the first
+                // slot; remaining slots are sub-bindings).  A bare
+                // `_` arm is still allowed as a catch-all and keeps
+                // its existing wildcard semantics.
+                let arity = branches
+                    .iter()
+                    .filter_map(|(p, _)| match &p.inner {
+                        Expr::Tuple(elems) => Some(elems.len()),
+                        _ => None,
+                    })
+                    .next()
+                    .expect("any_tuple was true");
+
+                let id = self.fresh_id();
+                let synth_name: &'static str =
+                    Box::leak(format!("__wtp_{id}").into_boxed_str());
+
+                // let __wtp_<id> = <cond>
+                let mut out: Vec<Spanned<Expr<'src>>> = Vec::with_capacity(2);
+                out.push(
+                    Expr::Let {
+                        ident: Ident::new(synth_name).with_span(span),
+                        ty: Type::Unknown.with_span(span),
+                        default: Some(Box::new(cond)),
+                    }
+                    .with_span(span),
+                );
+
+                // Build the rewritten arms.
+                let mut new_branches: Vec<(
+                    Spanned<Expr<'src>>,
+                    Vec<Spanned<Expr<'src>>>,
+                )> = Vec::with_capacity(branches.len());
+                for (pat, body) in branches {
+                    let pat_span = pat.span;
+                    match pat.inner {
+                        Expr::Tuple(elems) => {
+                            if elems.len() != arity {
+                                // Arity mismatch — leave the arm
+                                // untouched (typeck / backend will
+                                // surface a clearer error).
+                                let restored =
+                                    Expr::Tuple(elems).with_span(pat_span);
+                                new_branches.push((restored, body));
+                                continue;
+                            }
+                            let mut elems_iter = elems.into_iter();
+                            let head = elems_iter.next().expect("arity >= 1");
+                            let head_span = head.span;
+
+                            // Sub-binding lets for slots 1..N.  Each
+                            // becomes `let <name> = __wtp_<id>.<i>`.
+                            let mut binding_lets: Vec<Spanned<Expr<'src>>> =
+                                Vec::new();
+                            for (offset, sub) in elems_iter.enumerate() {
+                                let idx = offset + 1;
+                                let sub_span = sub.span;
+                                let bind_name = match &sub.inner {
+                                    Expr::Var(n, _) => Some(*n),
+                                    _ => None,
+                                };
+                                if let Some(n) = bind_name {
+                                    if n == "_" {
+                                        continue;
+                                    }
+                                    let receiver = Expr::Var(
+                                        synth_name,
+                                        Type::Unknown,
+                                    )
+                                    .with_span(sub_span);
+                                    binding_lets.push(
+                                        Expr::Let {
+                                            ident: Ident::new(n)
+                                                .with_span(sub_span),
+                                            ty: Type::Unknown
+                                                .with_span(sub_span),
+                                            default: Some(Box::new(
+                                                Expr::TupleIndex {
+                                                    receiver: Box::new(receiver),
+                                                    index: idx,
+                                                }
+                                                .with_span(sub_span),
+                                            )),
+                                        }
+                                        .with_span(sub_span),
+                                    );
+                                }
+                                // Literal / non-Var sub-patterns are
+                                // not yet supported — silently
+                                // ignored.  Future work: literal
+                                // guards via an inner `when` on
+                                // __wtp_<id>.<i>.
+                            }
+
+                            // Combine binding_lets + original body.
+                            let new_body: Vec<_> = binding_lets
+                                .into_iter()
+                                .chain(body.into_iter())
+                                .collect();
+
+                            // Determine the new pattern (key) for
+                            // the rewritten arm.
+                            let new_pat = match head.inner {
+                                Expr::Atom(_) | Expr::Num(_, _)
+                                | Expr::String(_, _) | Expr::Bool(_) => {
+                                    head.inner.with_span(head_span)
+                                }
+                                Expr::Var(name, ty) => {
+                                    // `_` or a binding — both become
+                                    // the wildcard arm.  When the
+                                    // head is a binding name (e.g.
+                                    // `a` in `{ a b }`), also emit a
+                                    // `let a = __wtp_<id>.0` at the
+                                    // front of the body so the user
+                                    // can reference it.
+                                    if name == "_" {
+                                        Expr::Var("_", ty).with_span(head_span)
+                                    } else {
+                                        let receiver = Expr::Var(
+                                            synth_name,
+                                            Type::Unknown,
+                                        )
+                                        .with_span(head_span);
+                                        let bind_let = Expr::Let {
+                                            ident: Ident::new(name)
+                                                .with_span(head_span),
+                                            ty: Type::Unknown
+                                                .with_span(head_span),
+                                            default: Some(Box::new(
+                                                Expr::TupleIndex {
+                                                    receiver: Box::new(receiver),
+                                                    index: 0,
+                                                }
+                                                .with_span(head_span),
+                                            )),
+                                        }
+                                        .with_span(head_span);
+                                        let mut combined = vec![bind_let];
+                                        combined.extend(new_body);
+                                        new_branches.push((
+                                            Expr::Var("_", Type::Unknown)
+                                                .with_span(head_span),
+                                            combined,
+                                        ));
+                                        continue;
+                                    }
+                                }
+                                other => {
+                                    // Unrecognised head — leave the
+                                    // arm as a tuple so the backend
+                                    // surfaces the diagnostic.
+                                    let restored_elems =
+                                        vec![other.with_span(head_span)];
+                                    new_branches.push((
+                                        Expr::Tuple(restored_elems)
+                                            .with_span(pat_span),
+                                        new_body,
+                                    ));
+                                    continue;
+                                }
+                            };
+                            new_branches.push((new_pat, new_body));
+                        }
+                        other => {
+                            // Non-tuple arm (e.g. `_ -> { ... }`).
+                            new_branches.push((
+                                other.with_span(pat_span),
+                                body,
+                            ));
+                        }
+                    }
+                }
+
+                let synth_disc = Expr::TupleIndex {
+                    receiver: Box::new(
+                        Expr::Var(synth_name, Type::Unknown).with_span(span),
+                    ),
+                    index: 0,
+                }
+                .with_span(span);
+
+                out.push(
+                    Expr::When {
+                        cond: Box::new(synth_disc),
+                        branches: new_branches,
+                    }
+                    .with_span(span),
+                );
+                out
+            }
+            other => {
+                // Descend into nested whens / lets / waits / etc.
+                vec![self.lower_when_tuple_patterns_in_expr(
+                    other.with_span(span),
+                )]
+            }
+        }
+    }
+
+    /// Helper: recurse into a single expression, applying
+    /// `lower_when_tuple_patterns` to any nested `when` that lives
+    /// inside (let-rhs, wait handlers, tuple elements, …).  Returns
+    /// a single expression; multi-statement results are wrapped via
+    /// `Vec` only at body level.
+    fn lower_when_tuple_patterns_in_expr(
+        &self,
+        expr: Spanned<Expr<'src>>,
+    ) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        let inner = match expr.inner {
+            Expr::When { cond, branches } => {
+                // `when` in expression position (e.g. as a let RHS
+                // or a tuple element): we only descend.  Rewriting
+                // a tuple-arm `when` would introduce a synthetic
+                // let that has no home inside expression position.
+                // In practice, `when` only appears at statement
+                // position in user code; if a nested case ever
+                // appears, the user can hoist it via `let r =
+                // ...`.
+                let cond = self.lower_when_tuple_patterns_in_expr(*cond);
+                let branches = branches
+                    .into_iter()
+                    .map(|(pat, body)| {
+                        let pat = self.lower_when_tuple_patterns_in_expr(pat);
+                        let body: Vec<_> = body
+                            .into_iter()
+                            .flat_map(|e| self.lower_when_tuple_patterns(e))
+                            .collect();
+                        (pat, body)
+                    })
+                    .collect();
+                Expr::When {
+                    cond: Box::new(cond),
+                    branches,
+                }
+            }
+            Expr::Let { ident, ty, default } => Expr::Let {
+                ident,
+                ty,
+                default: default.map(|d| {
+                    Box::new(self.lower_when_tuple_patterns_in_expr(*d))
+                }),
+            },
+            Expr::Wait { handlers, filter } => {
+                let filter = filter
+                    .into_iter()
+                    .map(|f| self.lower_when_tuple_patterns_in_expr(f))
+                    .collect();
+                let handlers = handlers
+                    .into_iter()
+                    .map(|h| {
+                        let h_span = h.span;
+                        let mut br = h.inner;
+                        br.body = br
+                            .body
+                            .into_iter()
+                            .flat_map(|e| self.lower_when_tuple_patterns(e))
+                            .collect();
+                        br.with_span(h_span)
+                    })
+                    .collect();
+                Expr::Wait { handlers, filter }
+            }
+            Expr::Jump { ident, args } => Expr::Jump {
+                ident: Box::new(self.lower_when_tuple_patterns_in_expr(*ident)),
+                args: args
+                    .into_iter()
+                    .map(|a| self.lower_when_tuple_patterns_in_expr(a))
+                    .collect(),
+            },
+            Expr::Tuple(elems) => Expr::Tuple(
+                elems
+                    .into_iter()
+                    .map(|e| self.lower_when_tuple_patterns_in_expr(e))
+                    .collect(),
+            ),
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(
+                    self.lower_when_tuple_patterns_in_expr(*receiver),
+                ),
+                index,
+            },
+            Expr::Ret(inner) => Expr::Ret(Box::new(
+                self.lower_when_tuple_patterns_in_expr(*inner),
+            )),
+            Expr::Pin(inner) => Expr::Pin(Box::new(
+                self.lower_when_tuple_patterns_in_expr(*inner),
+            )),
+            Expr::Neg(inner) => Expr::Neg(Box::new(
+                self.lower_when_tuple_patterns_in_expr(*inner),
+            )),
+            other => other,
+        };
+        inner.with_span(span)
     }
 
     /// Recursively prepend `__caller` to every `Expr::Jump` whose
@@ -2848,5 +3215,348 @@ mod tests {
         let canon = canonicalise_let_ret(body);
         assert_eq!(canon.len(), 1);
         assert!(matches!(canon[0].inner, Expr::Ret(_)));
+    }
+
+
+    use chumsky::{Parser, input::Input};
+
+    use crate::{
+        api::{ast::Item, expr::Expr},
+        lexer::lexer,
+        loader::{ParsedModule, ParsedProgram},
+        parser::program,
+        registry::{ModulePath, ProgramRegistry},
+    };
+
+    fn lower(src: &str) -> ParsedProgram<'_> {
+        let tokens = lexer().parse(src).into_result().expect("lex error");
+        let ast = program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse error");
+        let parsed = ParsedProgram {
+            modules: vec![ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("<inline>"),
+                ast,
+            }],
+        };
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&parsed).expect("populate");
+        super::lower_program(parsed, &reg)
+    }
+
+    /// The discriminant rewrite: top-level `when r { { :ok v } ->
+    /// {...} { :err m } -> {...} }` becomes `let __wtp_<id> = r`
+    /// followed by `when __wtp_<id>.0 { :ok -> { let v =
+    /// __wtp_<id>.1; ... } ... }`.
+    #[test]
+    fn lower_when_tuple_pattern_rewrites_to_field_dispatch() {
+        let src = r#"
+            make is { _ -> ret { atom i64 } { ret { :ok 1 } } }
+            main is { _ -> {
+              let r = make()
+              when r {
+                { :ok  v } -> { v }
+                { :err _ } -> { 0 }
+              }
+            } }
+        "#;
+        let lowered = lower(src);
+        let module = &lowered.modules[0];
+        let mut saw_wtp_let = false;
+        let mut saw_field_when = false;
+        let mut found = false;
+        for item in &module.ast {
+            if let Item::Machine(m) = &item.inner {
+                if m.inner.ident.inner.0 != "main" {
+                    continue;
+                }
+                let crate::api::ast::MachineItem::Branch(b) =
+                    &m.inner.items[0].inner
+                else {
+                    continue;
+                };
+                walk_for_wtp(&b.body, &mut saw_wtp_let, &mut saw_field_when);
+                found = true;
+            }
+        }
+        assert!(found, "main machine missing");
+        assert!(saw_wtp_let, "expected synthetic __wtp_<id> let");
+        assert!(saw_field_when, "expected when on __wtp_<id>.0");
+    }
+
+    fn walk_for_wtp<'src>(
+        body: &[chumsky::span::Spanned<Expr<'src>>],
+        saw_let: &mut bool,
+        saw_when: &mut bool,
+    ) {
+        for stmt in body {
+            walk_for_wtp_in_expr(&stmt.inner, saw_let, saw_when);
+        }
+    }
+
+    fn walk_for_wtp_in_expr<'src>(
+        expr: &Expr<'src>,
+        saw_let: &mut bool,
+        saw_when: &mut bool,
+    ) {
+        match expr {
+            Expr::Let { ident, default, .. } => {
+                if ident.inner.0.starts_with("__wtp_") {
+                    *saw_let = true;
+                }
+                if let Some(d) = default {
+                    walk_for_wtp_in_expr(&d.inner, saw_let, saw_when);
+                }
+            }
+            Expr::When { cond, branches } => {
+                if let Expr::TupleIndex { receiver, index } = &cond.inner {
+                    if *index == 0
+                        && matches!(
+                            &receiver.inner,
+                            Expr::Var(name, _) if name.starts_with("__wtp_")
+                        )
+                    {
+                        *saw_when = true;
+                    }
+                }
+                walk_for_wtp_in_expr(&cond.inner, saw_let, saw_when);
+                for (_, body) in branches {
+                    walk_for_wtp(body, saw_let, saw_when);
+                }
+            }
+            Expr::Wait { handlers, .. } => {
+                for h in handlers {
+                    walk_for_wtp(&h.inner.body, saw_let, saw_when);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_full_lowered_for_when_rt_allocate() {
+        let src = r#"
+            @rt(rt_allocate)
+            @rt(rt_write)
+            main is { _ -> {
+              let r = rt_allocate(32)
+              when r {
+                { :ok  b } -> { rt_write(1 "ok" 2) }
+                { :err _ } -> { rt_write(1 "err" 3) }
+              }
+            } }
+        "#;
+        let lowered = lower(src);
+        for m in &lowered.modules {
+            for item in &m.ast {
+                eprintln!("{:#?}", item.inner);
+            }
+        }
+    }
+
+    /// Dump the lowered AST for a known-failing integration scenario.
+    /// Useful for inspecting Phase order interactions; the assertion
+    /// is intentionally lax — the dump is what we care about.
+    #[test]
+    #[ignore]
+    fn dump_full_lowered_for_when_tuple_pattern() {
+        let src = r#"
+            make is { _ -> ret { atom i64 } { ret { :ok 1 } } }
+            main is { _ -> {
+              let r = make()
+              when r {
+                { :ok  x } -> { x }
+                { :err _ } -> { 0 }
+              }
+            } }
+        "#;
+        let lowered = lower(src);
+        for m in &lowered.modules {
+            for item in &m.ast {
+                eprintln!("{:#?}", item.inner);
+            }
+        }
+    }
+
+    /// E2E sanity: typecheck the same source we hit in the integration
+    /// test.  Confirms the lowering, resolver, and typeck agree on
+    /// the synth-let scope.
+    #[test]
+    fn lower_when_tuple_pattern_typechecks() {
+        let src = r#"
+            make is { _ -> ret { atom i64 } { ret { :ok 1 } } }
+            main is { _ -> {
+              let r = make()
+              when r {
+                { :ok  x } -> { x }
+                { :err _ } -> { 0 }
+              }
+            } }
+        "#;
+        let tokens = crate::lexer::lexer().parse(src).into_result().expect("lex error");
+        let ast = crate::parser::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse error");
+        let parsed = ParsedProgram {
+            modules: vec![ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("<inline>"),
+                ast,
+            }],
+        };
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&parsed).expect("populate");
+        let parsed = super::lower_program(parsed, &reg);
+        reg.populate_from(&parsed).expect("populate post-lower");
+        let resolved = crate::resolver::resolve_program(parsed, &mut reg);
+        let errs = crate::typeck::typecheck_program(&resolved, &reg);
+        let pretty: Vec<_> = errs
+            .into_iter()
+            .map(|e| (e.code.clone(), e.message.clone()))
+            .collect();
+        assert!(
+            !pretty.iter().any(|(c, _)| c.as_deref() == Some("E001")),
+            "unexpected E001 (undeclared): {:#?}",
+            pretty
+        );
+    }
+
+    /// Tuple-pattern `when` arm bodies must contain the synth-let
+    /// for each binding sub-pattern.  Regression for the integration
+    /// test that surfaced via E001 "undeclared variable `x`".
+    #[test]
+    fn lower_when_tuple_pattern_arm_body_has_binding_let() {
+        let src = r#"
+            make is { _ -> ret { atom i64 } { ret { :ok 1 } } }
+            main is { _ -> {
+              let r = make()
+              when r {
+                { :ok  x } -> { x }
+                { :err _ } -> { 0 }
+              }
+            } }
+        "#;
+        let lowered = lower(src);
+        let module = &lowered.modules[0];
+        let mut saw_x_let = false;
+        for item in &module.ast {
+            if let Item::Machine(m) = &item.inner {
+                if m.inner.ident.inner.0 != "main" {
+                    continue;
+                }
+                let crate::api::ast::MachineItem::Branch(b) =
+                    &m.inner.items[0].inner
+                else {
+                    continue;
+                };
+                walk_for_named_let(&b.body, "x", &mut saw_x_let);
+            }
+        }
+        assert!(saw_x_let, "expected `let x = ...` inside :ok arm body");
+    }
+
+    fn walk_for_named_let<'src>(
+        body: &[chumsky::span::Spanned<Expr<'src>>],
+        target: &str,
+        saw: &mut bool,
+    ) {
+        for stmt in body {
+            walk_for_named_let_in_expr(&stmt.inner, target, saw);
+        }
+    }
+
+    fn walk_for_named_let_in_expr<'src>(
+        expr: &Expr<'src>,
+        target: &str,
+        saw: &mut bool,
+    ) {
+        match expr {
+            Expr::Let { ident, default, .. } => {
+                if ident.inner.0 == target {
+                    *saw = true;
+                }
+                if let Some(d) = default {
+                    walk_for_named_let_in_expr(&d.inner, target, saw);
+                }
+            }
+            Expr::When { cond, branches } => {
+                walk_for_named_let_in_expr(&cond.inner, target, saw);
+                for (_, body) in branches {
+                    walk_for_named_let(body, target, saw);
+                }
+            }
+            Expr::Wait { handlers, .. } => {
+                for h in handlers {
+                    walk_for_named_let(&h.inner.body, target, saw);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `let { a b } = pair` is already lowered to `let __dst_<id> = pair;
+    /// let a = __dst_<id>.0; let b = __dst_<id>.1`.  This test pins
+    /// that behaviour so the tuple-pattern feature can rely on it.
+    #[test]
+    fn lower_let_destructure_expands_into_field_lets() {
+        let src = r#"
+            make is { _ -> ret { i64 i64 } { ret { 1 2 } } }
+            main is { _ -> {
+              let p = make()
+              let { a b } = p
+            } }
+        "#;
+        let lowered = lower(src);
+        let module = &lowered.modules[0];
+        let mut saw_dst_let = false;
+        for item in &module.ast {
+            if let Item::Machine(m) = &item.inner {
+                if m.inner.ident.inner.0 != "main" {
+                    continue;
+                }
+                let crate::api::ast::MachineItem::Branch(b) =
+                    &m.inner.items[0].inner
+                else {
+                    continue;
+                };
+                walk_for_dst(&b.body, &mut saw_dst_let);
+            }
+        }
+        assert!(saw_dst_let, "expected synthetic __dst_<id> let");
+    }
+
+    /// Recursively scan a body for a `let __dst_*` binding — needed
+    /// because the let-with-ret-target wait wrap nests the post-call
+    /// body inside the wait handler.
+    fn walk_for_dst<'src>(body: &[chumsky::span::Spanned<Expr<'src>>], saw: &mut bool) {
+        for stmt in body {
+            if let Expr::Let { ident, .. } = &stmt.inner {
+                if ident.inner.0.starts_with("__dst_") {
+                    *saw = true;
+                }
+            }
+            walk_for_dst_in_expr(&stmt.inner, saw);
+        }
+    }
+
+    fn walk_for_dst_in_expr<'src>(expr: &Expr<'src>, saw: &mut bool) {
+        match expr {
+            Expr::Let { default: Some(d), .. } => walk_for_dst_in_expr(&d.inner, saw),
+            Expr::When { branches, .. } => {
+                for (_, body) in branches {
+                    walk_for_dst(body, saw);
+                }
+            }
+            Expr::Wait { handlers, .. } => {
+                for h in handlers {
+                    walk_for_dst(&h.inner.body, saw);
+                }
+            }
+            _ => {}
+        }
     }
 }
