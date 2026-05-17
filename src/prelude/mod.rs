@@ -5,7 +5,7 @@ use chumsky::{Parser, input::Input, span::Spanned};
 use crate::api::ast::Item;
 use crate::api::token::Token;
 use crate::loader::{ParsedProgram, ProgramSources};
-use crate::lowering::lower_program;
+use crate::lowering::{lower_program, mangle_program};
 use crate::registry::ProgramRegistry;
 use crate::resolver::resolve_program;
 use crate::typeck::typecheck_program;
@@ -144,8 +144,13 @@ pub fn build_program<'src>(
         return Err(errors);
     }
 
+    // Final pass — rewrite machine definitions + call sites to canonical
+    // module-qualified symbols so the backend's flat symbol table sees no
+    // collisions and re-exports collapse to one predeclare (#097, #102).
+    let mangled = mangle_program(resolved, &registry);
+
     Ok(LakeProgram {
-        program: resolved,
+        program: mangled,
         registry,
     })
 }
