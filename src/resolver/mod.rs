@@ -94,6 +94,13 @@ impl<'src, 'r> Resolver<'src, 'r> {
                     .collect(),
             ),
             Expr::TupleIndex { receiver, index } => {
+                // Strict: type `.N` from the declared element at position
+                // N on the receiver's struct.  Covers both user-declared
+                // tuples (`ret {i64 buf}`) and the rt-synthesized
+                // `{atom buf}` shape (rt_allocate, rt_cstr_to_buf) — the
+                // latter already carries `atom` as field 0, so no special
+                // case is needed.  Receivers whose type didn't resolve
+                // stay `Unknown` rather than silently widening to atom.
                 let recv_ty = self.infer_expr_type(&receiver.inner, receiver.span);
                 if let Type::Struct(fields) = recv_ty {
                     fields.get(*index).map(|f| f.inner.clone()).unwrap_or(Type::Unknown)
@@ -792,6 +799,37 @@ m is { _ -> { let r = HELLO } }"#,
         assert!(
             matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("i64")),
             "got {ty:?}"
+        );
+    }
+
+    /// Regression: `.N` on a value returned from a ret-machine that
+    /// declares `ret {i64 buf}` must read the field types from the
+    /// declared tuple, not assume `{atom T}`.  Before the resolver
+    /// learned to thread `Var.ty` into `TupleIndex.receiver`, typeck
+    /// reported `r.0` as `atom`, breaking call-arg matching for any
+    /// non-`{atom T}` tuple shape.
+    #[test]
+    fn tuple_index_on_machine_struct_return_keeps_declared_types() {
+        let src = r#"
+parse_request is { _ buf -> ret { i64 buf } { ret { 1 b } } }
+caller is { _ -> { let r = parse_request(b) let m = r.0 let p = r.1 } }
+"#;
+        let body = resolve_with_reg(src);
+        // body[1] is `let m = r.0` — declared element type is i64.
+        let Expr::Let { ty: ty_m, .. } = &body[1] else {
+            panic!("expected second Let (m = r.0), got {:?}", body[1])
+        };
+        assert!(
+            matches!(&ty_m.inner, Type::Named(i) if i.inner == Ident::new("i64")),
+            "expected r.0 -> i64, got {ty_m:?}"
+        );
+        // body[2] is `let p = r.1` — declared element type is buf.
+        let Expr::Let { ty: ty_p, .. } = &body[2] else {
+            panic!("expected third Let (p = r.1), got {:?}", body[2])
+        };
+        assert!(
+            matches!(&ty_p.inner, Type::Named(i) if i.inner == Ident::new("buf")),
+            "expected r.1 -> buf, got {ty_p:?}"
         );
     }
 }

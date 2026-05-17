@@ -690,6 +690,35 @@ mod tests {
         typecheck_program(&resolved, &reg).0
     }
 
+    /// Mirror the production pipeline in `prelude::build_program`:
+    /// lower BEFORE resolve, then run typeck.  Needed for tests that
+    /// stress let-RHS / `.N` typing on ret-machine call results — those
+    /// only surface after lowering rewrites `let r = M(...)` into a
+    /// pid_let + wait handler that binds `r` to the declared return
+    /// shape.
+    fn run_full_pipeline(src: &str) -> Vec<crate::error_handle::LakeError> {
+        let tokens = lexer().parse(src).into_result().expect("lex error");
+        let ast = program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse error");
+
+        let parsed = ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("<inline>"),
+                ast,
+            }],
+        };
+
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&parsed).expect("populate");
+        let parsed = crate::lowering::lower_program(parsed, &reg);
+        reg.populate_from(&parsed).expect("populate post-lower");
+        let resolved = resolve_program(parsed, &mut reg);
+        typecheck_program(&resolved, &reg).0
+    }
+
     fn check(src: &str) -> Vec<String> {
         run_pipeline(src)
             .into_iter()
@@ -702,6 +731,84 @@ mod tests {
             .into_iter()
             .map(|e| e.code.unwrap_or_default())
             .collect()
+    }
+
+    /// Regression for the tuple-atom resolver bug: when a ret-machine
+    /// returns a declared tuple like `{i64 buf}`, the `.N` field
+    /// accesses on the call result must surface as the declared element
+    /// types (`i64`, `buf`) — not get steamrolled to `{atom T}`.  Before
+    /// the fix this raised E003 `no branch of \`route\` matches the
+    /// call \`route(... atom ...)\``.  The inner-when shape matches the
+    /// marine handler that motivated the bug (rt_allocate's atom guard
+    /// nested around a ret-machine call whose `.N`s are then forwarded).
+    #[test]
+    fn tuple_index_on_ret_machine_struct_keeps_declared_types() {
+        let src = r#"
+@rt(rt_allocate)
+parse_request is {
+  req buf flen i64 -> ret { i64 buf } { ret { 1 req } }
+}
+route is { m i64 path buf -> ret i64 { ret 0 } }
+caller is {
+  conn i64 -> {
+    let r = rt_allocate(4096)
+    when r.0 {
+      :ok -> {
+        let b = r.1
+        let req = parse_request(b 0)
+        let resp = route(req.0 req.1)
+      }
+      _ -> { }
+    }
+  }
+}
+"#;
+        let errs = run_full_pipeline(src);
+        let bad: Vec<_> = errs
+            .iter()
+            .filter(|e| e.message.contains("no branch") && e.message.contains("route"))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "tuple-atom resolver bug: route(req.0 req.1) should typecheck against (i64 buf), got {bad:?}"
+        );
+    }
+
+    /// Same shape as the marine bug, but with `req` shadowing an
+    /// earlier `r {atom buf}` from `rt_allocate` — guards against the
+    /// scope-leak path where the implicit-tuple shape contaminates the
+    /// later declared-tuple binding.
+    #[test]
+    fn tuple_index_shadowed_by_declared_tuple_keeps_correct_types() {
+        let src = r#"
+@rt(rt_allocate)
+parse_request is {
+  req buf -> ret { i64 buf } { ret { 1 req } }
+}
+route is { m i64 path buf -> ret i64 { ret 0 } }
+caller is {
+  conn i64 -> {
+    let r = rt_allocate(4096)
+    when r.0 {
+      :ok -> {
+        let buf2 = r.1
+        let r = parse_request(buf2)
+        let resp = route(r.0 r.1)
+      }
+      _ -> { }
+    }
+  }
+}
+"#;
+        let errs = run_full_pipeline(src);
+        let bad: Vec<_> = errs
+            .iter()
+            .filter(|e| e.message.contains("no branch") && e.message.contains("route"))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "shadowed `r` should re-bind to parse_request's `{{i64 buf}}`, got {bad:?}"
+        );
     }
 
     // ── E001: undeclared variable ─────────────────────────────────────────────
