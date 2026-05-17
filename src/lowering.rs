@@ -939,7 +939,15 @@ impl<'a, 'src> LowerCx<'a, 'src> {
 
         if is_ret_branch && !already_lowered {
             let synth_span = patterns.first().map(|p| p.span).unwrap_or((0..0).into());
-            patterns.insert(0, synth_caller_pattern(synth_span));
+            // #110: lone `_` is the no-arg wildcard. Replace it (arity 1)
+            // instead of prepending (which would give arity 2 and reject
+            // the bare-call `name()` that lowers to `name(self)`).
+            let lone_wildcard = patterns.len() == 1 && patterns[0].inner.is_wildcard();
+            if lone_wildcard {
+                patterns[0] = synth_caller_pattern(synth_span);
+            } else {
+                patterns.insert(0, synth_caller_pattern(synth_span));
+            }
         }
 
         let body = self.lower_body(body, is_ret_branch);
