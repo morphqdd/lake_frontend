@@ -96,6 +96,18 @@ impl ModulePath {
             self.0.join(".")
         }
     }
+
+    /// Canonical mangled symbol for a machine defined in this module.
+    /// Root → bare `name`; otherwise `mod_seg1_mod_seg2__name`.
+    /// Used for backend symbol emission so two `pub size` machines in
+    /// different modules don't collide (bugs #097, #102).
+    pub fn mangle(&self, name: &str) -> String {
+        if self.0.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}__{}", self.0.join("_"), name)
+        }
+    }
 }
 
 // ── per-module entries ──────────────────────────────────────────────────────
