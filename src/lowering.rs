@@ -123,6 +123,18 @@ struct RetKey {
     name: String,
 }
 
+/// #089 — Is `e` an ANF leaf for Eq / bitwise / shift operand position?
+/// Backend's `pure_expr::fold` resolves these directly without recursing
+/// through CPS blocks.  Composite operands must be lifted into a
+/// `let __anf_tmp<id> = <side>` so the backend never sees a non-leaf
+/// in Eq/bitwise side.
+fn is_anf_leaf(e: &Expr<'_>) -> bool {
+    matches!(
+        e,
+        Expr::Num(..) | Expr::Bool(..) | Expr::Var(..) | Expr::Atom(..)
+    )
+}
+
 fn collect_ret_machines<'src>(program: &ParsedProgram<'src>) -> HashMap<RetKey, String> {
     let mut out = HashMap::new();
     for module in &program.modules {
@@ -1618,55 +1630,72 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                 Box::new(self.lift_arg(*r, lifts)),
             )
             .with_span(span),
+            // #089 — Eq / bitwise compare / shift operands must be ANF
+            // leaves by the time backend's pure_expr / arith_expr sees
+            // them.  `lift_anf_side` lifts any non-leaf side (including
+            // arith / nested Eq / Jump) into a synthetic
+            // `let __anf_tmp<id> = <side>` so backend never sees a
+            // composite operand here.
             Expr::Eq(l, r) => Expr::Eq(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
             .with_span(span),
             Expr::Lt(l, r) => Expr::Lt(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
             .with_span(span),
             Expr::Gt(l, r) => Expr::Gt(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
             .with_span(span),
             Expr::Le(l, r) => Expr::Le(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
             .with_span(span),
             Expr::Ge(l, r) => Expr::Ge(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
             .with_span(span),
             Expr::BAnd(l, r) => Expr::BAnd(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
             .with_span(span),
             Expr::BOr(l, r) => Expr::BOr(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
             .with_span(span),
             Expr::BXor(l, r) => Expr::BXor(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
             .with_span(span),
             Expr::Shl(l, r) => Expr::Shl(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
             .with_span(span),
             Expr::Shr(l, r) => Expr::Shr(
-                Box::new(self.lift_arg(*l, lifts)),
-                Box::new(self.lift_arg(*r, lifts)),
+                Box::new(self.lift_anf_side(*l, lifts)),
+                Box::new(self.lift_anf_side(*r, lifts)),
             )
+            .with_span(span),
+            // #089 — descend into `when` discriminant so a nested
+            // ret-machine call / Eq / bitwise in cond position gets
+            // lifted into the OUTER body's lift list.  Arm bodies are
+            // intentionally NOT descended (their let-bindings have
+            // their own scope; Phase 4 re-enters each arm via
+            // `lower_body`, which fires this pass per-arm).
+            Expr::When { cond, branches } => Expr::When {
+                cond: Box::new(self.lift_in_expr(*cond, lifts)),
+                branches,
+            }
             .with_span(span),
             // when / wait arm bodies have their own scope; Phase 4 in
             // `lower_body` re-enters each arm by recursively calling
@@ -1677,6 +1706,38 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             // visible in).
             other => other.with_span(span),
         }
+    }
+
+    /// #089 — Lift a non-leaf side of an Eq / bitwise compare / shift
+    /// into a fresh `let __anf_tmp<id> = <side>`, returning a `Var`
+    /// reference.  Recursively descends first so a side like
+    /// `Eq(callee() , 0)` ANFs its inner Jump before being lifted
+    /// itself.  Leaves (Num / Bool / Var / Atom) pass through
+    /// unchanged so we don't bloat code for the common case.
+    fn lift_anf_side(
+        &self,
+        expr: Spanned<Expr<'src>>,
+        lifts: &mut Vec<Spanned<Expr<'src>>>,
+    ) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        // Recursively ANF the side first — a side that is itself
+        // Eq/bitwise/Jump may contain further non-leaf operands.
+        let recursed = self.lift_in_expr(expr, lifts);
+        if is_anf_leaf(&recursed.inner) {
+            return recursed;
+        }
+        let id = self.fresh_id();
+        let name: &'static str = Box::leak(format!("__anf_tmp{id}").into_boxed_str());
+        let ident = Ident::new(name).with_span(span);
+        lifts.push(
+            Expr::Let {
+                ident: ident.clone(),
+                ty: Type::Unknown.with_span(span),
+                default: Some(Box::new(recursed)),
+            }
+            .with_span(span),
+        );
+        Expr::Var(name, Type::Unknown).with_span(span)
     }
 
     /// Lift a single sub-expression that sits in a *value* position
