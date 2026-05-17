@@ -41,7 +41,9 @@ use chumsky::span::{SimpleSpan, SpanWrap, Spanned};
 use crate::api::ast::{Branch, Ident, Item, Machine, MachineItem, Pattern, Type};
 use crate::api::expr::Expr;
 use crate::loader::{ParsedModule, ParsedProgram};
-use crate::registry::{ImportBinding, ModuleId, ModulePath, ProgramRegistry};
+use crate::registry::{
+    ImportBinding, ModuleId, ModulePath, ProgramRegistry, Resolution,
+};
 
 /// Lower every machine in every loaded module.  Idempotent at the AST
 /// level: running twice on already-lowered output is a no-op (because
@@ -2432,4 +2434,260 @@ fn type_from_string<'src>(s: &str, span: SimpleSpan) -> Type<'src> {
         _ => return Type::Unknown,
     };
     Type::Named(Ident::new(static_name).with_span(span))
+}
+
+// ── module-aware machine-symbol mangling (#097, #102) ──────────────────────
+
+/// Rewrite every machine definition's `ident` and every machine call-site's
+/// callee `ident` to a module-qualified canonical symbol so two `pub size`
+/// machines in different modules no longer collide at the backend's flat
+/// symbol table.  Re-exports collapse to the same canonical symbol (the
+/// *defining* module wins) so importing the same item via two paths
+/// produces one predeclare, not two — fixes mold "duplicate symbol".
+///
+/// Root-module machines keep their bare name (so `main` stays `main`).
+/// Non-root: `<mod_seg1>_<mod_seg2>__<name>` (e.g. `std_process__die`).
+pub fn mangle_program<'src>(
+    program: ParsedProgram<'src>,
+    registry: &ProgramRegistry<'src>,
+) -> ParsedProgram<'src> {
+    let modules = program
+        .modules
+        .into_iter()
+        .map(|module| {
+            let module_id = registry
+                .module_id_for_path(&module.module_path)
+                .expect("populate_from must run before mangle_program");
+            let mc = MangleCx {
+                registry,
+                module_id,
+            };
+            let ast = module
+                .ast
+                .into_iter()
+                .map(|item| mc.mangle_item(item))
+                .collect();
+            ParsedModule {
+                module_path: module.module_path,
+                source_path: module.source_path,
+                ast,
+            }
+        })
+        .collect();
+    ParsedProgram { modules }
+}
+
+struct MangleCx<'a, 'src> {
+    registry: &'a ProgramRegistry<'src>,
+    module_id: ModuleId,
+}
+
+impl<'a, 'src> MangleCx<'a, 'src> {
+    /// Resolve `name` in this module's scope.  If it points at a Machine,
+    /// return the canonical mangled symbol for that machine; otherwise None.
+    fn canonical_for(&self, name: &str) -> Option<String> {
+        match self.registry.resolve_bare_in(self.module_id, name)? {
+            Resolution::Machine(m) => {
+                let mod_path = &self.registry.module(m.module).path;
+                Some(mod_path.mangle(m.name))
+            }
+            _ => None,
+        }
+    }
+
+    fn mangle_item(&self, item: Spanned<Item<'src>>) -> Spanned<Item<'src>> {
+        let span = item.span;
+        match item.inner {
+            Item::Machine(m) => {
+                let machine_span = m.span;
+                let mut machine = m.inner;
+                let name = machine.ident.inner.0;
+                // Definitions ALWAYS use the *defining* module — which
+                // is the module the AST item belongs to.
+                let mod_path = &self.registry.module(self.module_id).path;
+                let mangled = mod_path.mangle(name);
+                let static_name: &'static str = Box::leak(mangled.into_boxed_str());
+                let ident_span = machine.ident.span;
+                machine.ident = Ident::new(static_name).with_span(ident_span);
+                // Walk every branch body and rewrite call-site idents.
+                machine.items = machine
+                    .items
+                    .into_iter()
+                    .map(|mi| {
+                        let mi_span = mi.span;
+                        match mi.inner {
+                            MachineItem::Branch(b) => {
+                                MachineItem::Branch(self.mangle_branch(b))
+                                    .with_span(mi_span)
+                            }
+                            other => other.with_span(mi_span),
+                        }
+                    })
+                    .collect();
+                Item::Machine(machine.with_span(machine_span)).with_span(span)
+            }
+            other => other.with_span(span),
+        }
+    }
+
+    fn mangle_branch(&self, mut branch: Branch<'src>) -> Branch<'src> {
+        branch.body = branch
+            .body
+            .into_iter()
+            .map(|e| self.mangle_expr(e))
+            .collect();
+        branch
+    }
+
+    fn mangle_expr(&self, expr: Spanned<Expr<'src>>) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        let inner = match expr.inner {
+            Expr::Jump { ident, args } => {
+                // Rewrite the callee if it's a bare Var that resolves to a
+                // Machine.  `self`, rt fns, ffi, and local vars pass through.
+                let new_ident = match ident.inner {
+                    Expr::Var(name, ty) if name != "self" => {
+                        if let Some(canon) = self.canonical_for(name) {
+                            let static_name: &'static str =
+                                Box::leak(canon.into_boxed_str());
+                            Expr::Var(static_name, ty).with_span(ident.span)
+                        } else {
+                            Expr::Var(name, ty).with_span(ident.span)
+                        }
+                    }
+                    other => other.with_span(ident.span),
+                };
+                Expr::Jump {
+                    ident: Box::new(new_ident),
+                    args: args.into_iter().map(|a| self.mangle_expr(a)).collect(),
+                }
+            }
+            Expr::Let { ident, ty, default } => Expr::Let {
+                ident,
+                ty,
+                default: default.map(|d| Box::new(self.mangle_expr(*d))),
+            },
+            Expr::MethodCall { receiver, method, args } => Expr::MethodCall {
+                receiver: Box::new(self.mangle_expr(*receiver)),
+                method,
+                args: args.into_iter().map(|a| self.mangle_expr(a)).collect(),
+            },
+            Expr::AtAccess { receiver, field } => Expr::AtAccess {
+                receiver: Box::new(self.mangle_expr(*receiver)),
+                field,
+            },
+            Expr::DotAccess { receiver, field } => Expr::DotAccess {
+                receiver: Box::new(self.mangle_expr(*receiver)),
+                field,
+            },
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(self.mangle_expr(*receiver)),
+                index,
+            },
+            Expr::StructInit { base, fields } => Expr::StructInit {
+                base: Box::new(self.mangle_expr(*base)),
+                fields: fields.into_iter().map(|f| self.mangle_expr(f)).collect(),
+            },
+            Expr::Tuple(elems) => Expr::Tuple(
+                elems.into_iter().map(|e| self.mangle_expr(e)).collect(),
+            ),
+            Expr::When { cond, branches } => Expr::When {
+                cond: Box::new(self.mangle_expr(*cond)),
+                branches: branches
+                    .into_iter()
+                    .map(|(p, body)| {
+                        (
+                            self.mangle_expr(p),
+                            body.into_iter().map(|e| self.mangle_expr(e)).collect(),
+                        )
+                    })
+                    .collect(),
+            },
+            Expr::Wait { handlers, filter } => Expr::Wait {
+                handlers: handlers
+                    .into_iter()
+                    .map(|h| {
+                        let span = h.span;
+                        let mut br = h.inner;
+                        br.body = br
+                            .body
+                            .into_iter()
+                            .map(|e| self.mangle_expr(e))
+                            .collect();
+                        br.with_span(span)
+                    })
+                    .collect(),
+                filter: filter.into_iter().map(|f| self.mangle_expr(f)).collect(),
+            },
+            Expr::Ret(inner) => Expr::Ret(Box::new(self.mangle_expr(*inner))),
+            Expr::Pin(inner) => Expr::Pin(Box::new(self.mangle_expr(*inner))),
+            Expr::Neg(inner) => Expr::Neg(Box::new(self.mangle_expr(*inner))),
+            Expr::Add(l, r) => Expr::Add(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Sub(l, r) => Expr::Sub(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Mul(l, r) => Expr::Mul(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Div(l, r) => Expr::Div(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Le(l, r) => Expr::Le(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Ge(l, r) => Expr::Ge(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Eq(l, r) => Expr::Eq(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Lt(l, r) => Expr::Lt(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Gt(l, r) => Expr::Gt(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::BAnd(l, r) => Expr::BAnd(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::BOr(l, r) => Expr::BOr(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::BXor(l, r) => Expr::BXor(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Shl(l, r) => Expr::Shl(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Shr(l, r) => Expr::Shr(
+                Box::new(self.mangle_expr(*l)),
+                Box::new(self.mangle_expr(*r)),
+            ),
+            Expr::Index { receiver, index } => Expr::Index {
+                receiver: Box::new(self.mangle_expr(*receiver)),
+                index: Box::new(self.mangle_expr(*index)),
+            },
+            Expr::LetTuple { fields, default } => Expr::LetTuple {
+                fields,
+                default: Box::new(self.mangle_expr(*default)),
+            },
+            other => other,
+        };
+        inner.with_span(span)
+    }
 }
