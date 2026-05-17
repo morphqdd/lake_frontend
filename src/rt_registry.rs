@@ -87,6 +87,11 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         ("rt_io_park_current", s(&[], "{}")),
         ("rt_write_async", s(&["i64", "str", "i64"], "{}")),
 
+        // ── child process (pidfd + io_uring POLLADD) — #099 ───────────
+        ("rt_clone3_pidfd", s(&["i64"], "i64")),
+        ("rt_pidfd_poll_async", s(&["i64"], "i64")),
+        ("rt_waitid_pidfd", s(&["i64"], "i64")),
+
         // ── network ────────────────────────────────────────────────────
         ("rt_listen_tcp", s(&["i64"], "i64")),
         ("rt_accept_async", s(&["i64"], "i64")),
