@@ -35,7 +35,7 @@ use std::rc::Rc;
 
 use chumsky::{Parser, input::Input, span::Spanned};
 
-use crate::api::ast::{Import, Item};
+use crate::api::ast::{Branch, Import, Item, Machine, MachineItem};
 use crate::api::expr::Expr;
 use crate::error_handle::{LakeError, LakeErrors};
 use crate::lexer::lexer;
@@ -289,9 +289,12 @@ impl ProgramSources {
             src,
         });
 
-        // Extract imports via a temporary parse — drops at end of scope so
-        // we can mutate `self.files` later without holding a borrow.
-        let imports = {
+        // Extract imports + Path-implied modules via a temporary parse —
+        // drops at end of scope so we can mutate `self.files` later
+        // without holding a borrow.  Path pre-scan: every `Expr::Path`
+        // with >=2 segments names a module-qualified item; the owning
+        // module's file is queued for load alongside explicit imports.
+        let (imports, path_modules) = {
             let last = self
                 .files
                 .last()
@@ -313,7 +316,7 @@ impl ProgramSources {
                     return Err(LakeErrors::from_parse_errs(errs));
                 }
             };
-            collect_referenced_modules(&ast)
+            (collect_referenced_modules(&ast), prescan_path_modules(&ast))
         };
 
         for cand in imports {
@@ -347,6 +350,21 @@ impl ProgramSources {
                         &all_tried,
                     )]));
                 }
+            }
+        }
+
+        // Path pre-scan: each candidate is the owning module of an
+        // `<a>.<b>.<item>` expression.  Permissive — modules that fail
+        // to resolve are silently skipped; typeck surfaces the real
+        // error (M005 "unknown module path") with proper spans.  Loaded
+        // modules dedup via `self.loaded`, so this is idempotent and
+        // safe to invoke alongside explicit `+import` directives.
+        for cand in path_modules {
+            if self.loaded.contains(&cand) || in_progress.contains(&cand) {
+                continue;
+            }
+            if let ResolveOutcome::Found(p) = search.resolve(&cand) {
+                self.load_recursive(cand, p, search, in_progress)?;
             }
         }
 
@@ -450,6 +468,134 @@ fn collect_referenced_modules(ast: &[Spanned<Item<'_>>]) -> Vec<ImportCandidate>
     // Stable order so error messages and load sequence are deterministic.
     v.sort_by(|a, b| a.namespace.0.cmp(&b.namespace.0));
     v
+}
+
+/// Walk the AST for every `Expr::Path` (module-qualified value such as
+/// `std.bytes.set`) and return the deduplicated set of owning module
+/// paths the program references.  A Path with N>=2 segments names item
+/// `segs[N-1]` inside module `segs[..N-1]`; the loader uses this set to
+/// pull transitive modules into the load queue even when the source
+/// never spells an explicit `+import`.
+///
+/// Single-segment paths (bare `Var`) and segment lists shorter than two
+/// are skipped — those resolve to local names, not foreign modules.
+fn prescan_path_modules(ast: &[Spanned<Item<'_>>]) -> Vec<ModulePath> {
+    let mut out = HashSet::<ModulePath>::new();
+    for item in ast {
+        match &item.inner {
+            Item::Machine(m) => prescan_machine(&m.inner, &mut out),
+            Item::Const(c) => prescan_expr(&c.inner.value, &mut out),
+            Item::Import(_) | Item::Directive(_) => {}
+        }
+    }
+    let mut v: Vec<_> = out.into_iter().collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+fn prescan_machine(machine: &Machine<'_>, out: &mut HashSet<ModulePath>) {
+    for mi in &machine.items {
+        if let MachineItem::Branch(b) = &mi.inner {
+            prescan_branch(b, out);
+        }
+    }
+}
+
+fn prescan_branch(branch: &Branch<'_>, out: &mut HashSet<ModulePath>) {
+    for e in &branch.body {
+        prescan_expr(e, out);
+    }
+}
+
+fn prescan_expr(expr: &Spanned<Expr<'_>>, out: &mut HashSet<ModulePath>) {
+    match &expr.inner {
+        Expr::Path(segments) if segments.len() >= 2 => {
+            let module_segs: Vec<String> = segments[..segments.len() - 1]
+                .iter()
+                .map(|s| s.inner.0.to_string())
+                .collect();
+            out.insert(ModulePath(module_segs));
+        }
+        Expr::Path(_) => {}
+        Expr::Let { default, .. } => {
+            if let Some(d) = default {
+                prescan_expr(d, out);
+            }
+        }
+        Expr::Jump { ident, args } => {
+            prescan_expr(ident, out);
+            for a in args {
+                prescan_expr(a, out);
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            prescan_expr(receiver, out);
+            for a in args {
+                prescan_expr(a, out);
+            }
+        }
+        Expr::AtAccess { receiver, .. } | Expr::DotAccess { receiver, .. } => {
+            prescan_expr(receiver, out);
+        }
+        Expr::StructInit { base, fields } => {
+            prescan_expr(base, out);
+            for f in fields {
+                prescan_expr(f, out);
+            }
+        }
+        Expr::When { cond, branches } => {
+            prescan_expr(cond, out);
+            for (pat, body) in branches {
+                prescan_expr(pat, out);
+                for e in body {
+                    prescan_expr(e, out);
+                }
+            }
+        }
+        Expr::Wait { handlers, filter } => {
+            for f in filter {
+                prescan_expr(f, out);
+            }
+            for h in handlers {
+                prescan_branch(&h.inner, out);
+            }
+        }
+        Expr::Add(l, r)
+        | Expr::Sub(l, r)
+        | Expr::Mul(l, r)
+        | Expr::Div(l, r)
+        | Expr::Eq(l, r)
+        | Expr::Le(l, r)
+        | Expr::Ge(l, r)
+        | Expr::Lt(l, r)
+        | Expr::Gt(l, r)
+        | Expr::BAnd(l, r)
+        | Expr::BOr(l, r)
+        | Expr::BXor(l, r)
+        | Expr::Shl(l, r)
+        | Expr::Shr(l, r) => {
+            prescan_expr(l, out);
+            prescan_expr(r, out);
+        }
+        Expr::Neg(inner) | Expr::Ret(inner) | Expr::Pin(inner) => prescan_expr(inner, out),
+        Expr::Tuple(elems) => {
+            for e in elems {
+                prescan_expr(e, out);
+            }
+        }
+        Expr::TupleIndex { receiver, .. } => prescan_expr(receiver, out),
+        Expr::Index { receiver, index } => {
+            prescan_expr(receiver, out);
+            prescan_expr(index, out);
+        }
+        Expr::LetTuple { default, .. } => prescan_expr(default, out),
+        Expr::Var(_, _)
+        | Expr::Num(_, _)
+        | Expr::String(_, _)
+        | Expr::Bool(_)
+        | Expr::Atom(_)
+        | Expr::Unit => {}
+    }
 }
 
 fn collect_from_import(
@@ -695,6 +841,137 @@ mod tests {
         // Looking for `LOCAL` — only present in the project-root copy.
         let result = ProgramSources::load_with_search(&main, search);
         assert!(result.is_ok(), "project root copy should resolve");
+    }
+
+    // ── #070 Path pre-scan ─────────────────────────────────────────────
+
+    #[test]
+    fn prescan_loads_module_referenced_only_by_path_expr() {
+        // `main.lake` never writes `+std.bytes.{ set }` but calls
+        // `std:bytes:set()` via the Path form — pre-scan must queue
+        // `std/bytes.lake` so the resolver can see the item.
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "std/bytes.lake", "pub set is { _ -> { } }");
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "main is { _ -> { std:bytes:set() } }",
+        );
+        let sources = ProgramSources::load(&main).expect("loads");
+        let mods: Vec<_> = sources
+            .files()
+            .iter()
+            .map(|f| f.module_path.display())
+            .collect();
+        assert!(
+            mods.contains(&"std.bytes".to_string()),
+            "pre-scan should load std.bytes via Path expr; got {mods:?}",
+        );
+    }
+
+    #[test]
+    fn prescan_silent_when_path_module_does_not_resolve() {
+        // Unknown module referenced via Path must NOT error at load —
+        // typeck surfaces M005 with a proper span instead.
+        let dir = TempDir::new().unwrap();
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "main is { _ -> { ghost:module:fn(0) } }",
+        );
+        let result = ProgramSources::load(&main);
+        assert!(result.is_ok(), "missing Path module should not error at load");
+    }
+
+    #[test]
+    fn prescan_dedups_with_explicit_import() {
+        // `+std.bytes.{ set }` AND `std:bytes:set()` should produce
+        // exactly one load of `std.bytes`.
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "std/bytes.lake", "pub set is { _ -> { } }");
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "+std.bytes.{ set }\nmain is { _ -> { std:bytes:set() } }",
+        );
+        let sources = ProgramSources::load(&main).expect("loads");
+        let count = sources
+            .files()
+            .iter()
+            .filter(|f| f.module_path.display() == "std.bytes")
+            .count();
+        assert_eq!(count, 1, "std.bytes should load exactly once");
+    }
+
+    #[test]
+    fn prescan_loads_transitive_path_chain() {
+        // main → uses `a:b:run()` (no +import) → a/b.lake itself uses
+        // `c:d:helper()` (no +import either).  Both modules land.
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "c/d.lake", "pub helper is { _ -> { } }");
+        write_file(
+            &dir,
+            "a/b.lake",
+            "pub run is { _ -> { c:d:helper() } }",
+        );
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "main is { _ -> { a:b:run() } }",
+        );
+        let sources = ProgramSources::load(&main).expect("loads");
+        let mods: Vec<_> = sources
+            .files()
+            .iter()
+            .map(|f| f.module_path.display())
+            .collect();
+        assert!(mods.contains(&"a.b".to_string()), "got {mods:?}");
+        assert!(mods.contains(&"c.d".to_string()), "got {mods:?}");
+    }
+
+    #[test]
+    fn prescan_build_program_resolves_path_without_import() {
+        // End-to-end: build_program over a main that calls
+        // `std:bytes:set()` without `+std.bytes.{ set }`.  Pre-scan
+        // pulls std.bytes into the load queue; registry must hold
+        // the item and no E004 / M005 fires.
+        use crate::prelude::build_program;
+
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "std/bytes.lake", "pub set is { _ -> { } }");
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "main is { _ -> { std:bytes:set() } }",
+        );
+        let sources = ProgramSources::load(&main).expect("loads");
+        let prog = build_program(&sources).expect("build_program succeeds");
+        let std_bytes = ModulePath(vec!["std".to_string(), "bytes".to_string()]);
+        let id = prog
+            .registry
+            .module_id_for_path(&std_bytes)
+            .expect("std.bytes registered");
+        assert!(
+            prog.registry.module(id).machines.contains_key("set"),
+            "registry should contain std.bytes.set",
+        );
+    }
+
+    #[test]
+    fn prescan_is_idempotent_under_repeated_load() {
+        // Loading the same entry twice must produce identical file sets.
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "std/bytes.lake", "pub set is { _ -> { } }");
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "main is { _ -> { std:bytes:set() } }",
+        );
+        let s1 = ProgramSources::load(&main).expect("loads");
+        let s2 = ProgramSources::load(&main).expect("loads");
+        let mods1: Vec<_> = s1.files().iter().map(|f| f.module_path.display()).collect();
+        let mods2: Vec<_> = s2.files().iter().map(|f| f.module_path.display()).collect();
+        assert_eq!(mods1, mods2, "repeated load must produce identical module set");
     }
 
     #[test]
