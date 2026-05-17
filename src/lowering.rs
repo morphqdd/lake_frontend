@@ -63,8 +63,8 @@ pub fn lower_program<'src>(
     // mailbox roundtrip for these calls.
     let pure_ret_machines = collect_pure_ret_machines(&program, &ret_machines);
     // Restrict to "simple" pure bodies (single top-level `ret`, no nested).
-    // Multi-arm `when` bodies (`k`, `h_init`) are excluded for phase 2a;
-    // they need a "valued when" lowering to be inlineable.
+    // #121: `let v ty = when ...; ret v` form is canonicalised to `ret when`
+    // by `canonicalise_let_ret` so k-table accessors now qualify.
     let pure_bodies = if std::env::var("LAKE_NO_PURE_INLINE").is_ok() {
         HashMap::new()
     } else {
@@ -350,6 +350,56 @@ struct PureBodyTemplate<'src> {
     body: Vec<Spanned<Expr<'src>>>,
 }
 
+/// Canonicalise `[..., Let{ident:v, ty, value:e}, Ret(Var(v))]` to
+/// `[..., Ret(e)]`.  #121: lets the inline detector accept the
+/// `let v ty = when ...; ret v` form (and any other `let v = e; ret v`
+/// sugar — `e` need not be a `when`).  Safe because `v` is in scope
+/// only from the `Let` onwards and the immediately-following `Ret(Var v)`
+/// is its sole use.
+fn canonicalise_let_ret<'src>(
+    body: Vec<Spanned<Expr<'src>>>,
+) -> Vec<Spanned<Expr<'src>>> {
+    if body.len() < 2 {
+        return body;
+    }
+    let n = body.len();
+    let ret_var_name = match &body[n - 1].inner {
+        Expr::Ret(inner) => match &inner.inner {
+            Expr::Var(name, _) => Some(*name),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(ret_var) = ret_var_name else {
+        return body;
+    };
+    let let_value = match &body[n - 2].inner {
+        Expr::Let {
+            ident,
+            default: Some(_),
+            ..
+        } if ident.inner.0 == ret_var => true,
+        _ => false,
+    };
+    if !let_value {
+        return body;
+    }
+    let mut out = body;
+    let ret_span = out[n - 1].span;
+    out.pop(); // remove Ret(Var v)
+    let last_let = out.pop().expect("checked len >= 2");
+    let (let_span, value) = match last_let.inner {
+        Expr::Let { default: Some(v), .. } => (last_let.span, *v),
+        _ => unreachable!("checked above"),
+    };
+    let _ = let_span;
+    out.push(Spanned {
+        inner: Expr::Ret(Box::new(value)),
+        span: ret_span,
+    });
+    out
+}
+
 /// True when the body has exactly one `Expr::Ret` at the top level
 /// (the last statement) and none nested elsewhere.  Side-effecting
 /// statements before the final `ret` are allowed (`set(...)`, etc.).
@@ -458,14 +508,17 @@ fn collect_pure_bodies<'src>(
                     // Multi-branch — skip for phase 2a.
                     continue;
                 }
-                if !is_simple_pure_body(&branch.body) {
+                // #121: rewrite `let v = e; ret v` into `ret e` so the
+                // detector + downstream inlining see a single-Ret body.
+                let body = canonicalise_let_ret(branch.body.clone());
+                if !is_simple_pure_body(&body) {
                     continue;
                 }
                 out.insert(
                     key,
                     PureBodyTemplate {
                         params: branch.patterns.clone(),
-                        body: branch.body.clone(),
+                        body,
                     },
                 );
             }
@@ -2689,5 +2742,111 @@ impl<'a, 'src> MangleCx<'a, 'src> {
             other => other,
         };
         inner.with_span(span)
+    }
+}
+
+// ── tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ast::{Ident, Type};
+
+    fn sp() -> SimpleSpan {
+        (0..0).into()
+    }
+
+    fn num<'a>(s: &'a str) -> Spanned<Expr<'a>> {
+        Expr::Num(s, Type::Unknown).with_span(sp())
+    }
+
+    fn var<'a>(name: &'a str) -> Spanned<Expr<'a>> {
+        Expr::Var(name, Type::Unknown).with_span(sp())
+    }
+
+    fn when_const_arms<'a>(
+        cond_var: &'a str,
+        arms: Vec<(&'a str, &'a str)>,
+    ) -> Spanned<Expr<'a>> {
+        let branches = arms
+            .into_iter()
+            .map(|(pat, body)| (num(pat), vec![num(body)]))
+            .collect();
+        Expr::When {
+            cond: Box::new(var(cond_var)),
+            branches,
+        }
+        .with_span(sp())
+    }
+
+    fn let_stmt<'a>(name: &'a str, value: Spanned<Expr<'a>>) -> Spanned<Expr<'a>> {
+        Expr::Let {
+            ident: Ident::new(name).with_span(sp()),
+            ty: Type::Named(Ident::new("i64").with_span(sp())).with_span(sp()),
+            default: Some(Box::new(value)),
+        }
+        .with_span(sp())
+    }
+
+    fn ret_var<'a>(name: &'a str) -> Spanned<Expr<'a>> {
+        Expr::Ret(Box::new(var(name))).with_span(sp())
+    }
+
+    /// #121 regression: `let v = when ...; ret v` must be detected as
+    /// an inlineable simple-pure body.  The canonicaliser rewrites it
+    /// to `ret when` so `is_simple_pure_body` accepts it.
+    #[test]
+    fn canonicalise_let_when_ret() {
+        let body = vec![
+            let_stmt(
+                "v",
+                when_const_arms("i", vec![("0", "0x42"), ("1", "0x43")]),
+            ),
+            ret_var("v"),
+        ];
+        assert_eq!(body.len(), 2);
+        let canon = canonicalise_let_ret(body);
+        assert_eq!(canon.len(), 1, "canon body should collapse to 1 stmt");
+        match &canon[0].inner {
+            Expr::Ret(inner) => {
+                assert!(
+                    matches!(inner.inner, Expr::When { .. }),
+                    "ret inner should be the original `when` rhs, got {:?}",
+                    inner.inner,
+                );
+            }
+            other => panic!("expected Ret, got {:?}", other),
+        }
+        assert!(is_simple_pure_body(&canon), "must qualify as simple-pure");
+    }
+
+    /// Sugar form holds for any pure expression — not just `when`.
+    #[test]
+    fn canonicalise_let_num_ret() {
+        let body = vec![let_stmt("x", num("42")), ret_var("x")];
+        let canon = canonicalise_let_ret(body);
+        assert_eq!(canon.len(), 1);
+        assert!(matches!(canon[0].inner, Expr::Ret(_)));
+        assert!(is_simple_pure_body(&canon));
+    }
+
+    /// Negative: the `Var` in `ret` must reference the immediately
+    /// preceding `Let`.  Name mismatch leaves the body untouched.
+    #[test]
+    fn canonicalise_skips_name_mismatch() {
+        let body = vec![let_stmt("a", num("1")), ret_var("b")];
+        let len_before = body.len();
+        let canon = canonicalise_let_ret(body);
+        assert_eq!(canon.len(), len_before);
+    }
+
+    /// Negative: a body that already ends in `ret <expr>` (no let) is
+    /// returned as-is.
+    #[test]
+    fn canonicalise_passthrough_when_no_let() {
+        let body = vec![Expr::Ret(Box::new(num("7"))).with_span(sp())];
+        let canon = canonicalise_let_ret(body);
+        assert_eq!(canon.len(), 1);
+        assert!(matches!(canon[0].inner, Expr::Ret(_)));
     }
 }
