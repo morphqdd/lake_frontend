@@ -1365,18 +1365,14 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             new_body.push(expr);
         }
 
-        // Phase 3: tail wrap for ret-branches.  Skip when the last
-        // expression is already a __caller send (the user wrote `ret X`
-        // there) or when the body is empty.  Only the outermost body
-        // wraps — Phase 4 calls back into `lower_body_impl` with
-        // `is_outermost=false` for each arm, since the outer wrap
-        // already accounts for the fall-through value.
+        // Phase 3: tail wrap for ret-branches.  Recurses into
+        // When / Wait / Pin tails — see #125.
         if is_ret_branch
             && is_outermost
-            && let Some(last) = new_body.last_mut()
-            && !is_caller_send(&last.inner)
+            && !new_body.is_empty()
+            && !is_caller_send(&new_body.last().unwrap().inner)
         {
-            wrap_in_caller_send(last);
+            wrap_body_tail_in_caller_send(&mut new_body);
         }
 
         // Phase 4: re-enter `when` / `wait` arm bodies as their own
@@ -2973,15 +2969,97 @@ fn build_caller_send<'src>(span: SimpleSpan, value: Spanned<Expr<'src>>) -> Expr
     }
 }
 
-fn wrap_in_caller_send<'src>(expr: &mut Spanned<Expr<'src>>) {
-    let span = expr.span;
-    let placeholder = Expr::Unit.with_span(span);
-    let original = std::mem::replace(expr, placeholder);
-    let wrapped = build_caller_send(span, original);
-    *expr = Spanned {
-        inner: wrapped,
-        span,
-    };
+// Wrap a ret-branch body's tail in `__caller(self <tail>)`.
+// See docs/state/bugs/125_terminal_expr_in_caller_arg.md.
+fn wrap_body_tail_in_caller_send<'src>(body: &mut Vec<Spanned<Expr<'src>>>) {
+    let Some(last) = body.pop() else { return };
+    let span = last.span;
+    let (mut wrapped, extra) = wrap_tail_in_caller_send(last);
+    body.append(&mut wrapped);
+    if let Some(send) = extra {
+        body.push(send.with_span(span));
+    }
+}
+
+// Tail rewrite half of wrap_body_tail_in_caller_send: returns
+// (replacement-stmts, optional-trailing-sentinel-send).
+fn wrap_tail_in_caller_send<'src>(
+    tail: Spanned<Expr<'src>>,
+) -> (Vec<Spanned<Expr<'src>>>, Option<Expr<'src>>) {
+    let span = tail.span;
+    match tail.inner {
+        // Already wrapped (user wrote `ret X` or earlier phase
+        // rewrote into a __caller send).  Leave alone.
+        Expr::Jump { ident, args }
+            if matches!(&ident.inner, Expr::Var("__caller", _)) =>
+        {
+            (vec![Expr::Jump { ident, args }.with_span(span)], None)
+        }
+        // Recurse into each arm: wrap the arm body's own tail.
+        Expr::When { cond, branches } => {
+            let branches = branches
+                .into_iter()
+                .map(|(pat, mut body)| {
+                    wrap_body_tail_in_caller_send(&mut body);
+                    (pat, body)
+                })
+                .collect();
+            (
+                vec![Expr::When { cond, branches }.with_span(span)],
+                None,
+            )
+        }
+        // Wrap each handler body's tail; the outer Wait itself
+        // produces no value.
+        Expr::Wait { handlers, filter } => {
+            let handlers = handlers
+                .into_iter()
+                .map(|h| {
+                    let h_span = h.span;
+                    let mut br = h.inner;
+                    wrap_body_tail_in_caller_send(&mut br.body);
+                    br.with_span(h_span)
+                })
+                .collect();
+            (
+                vec![Expr::Wait { handlers, filter }.with_span(span)],
+                None,
+            )
+        }
+        // Fire-and-forget: keep the Pin, append a sentinel send
+        // so the caller's wait unblocks.
+        Expr::Pin(inner) => (
+            vec![Expr::Pin(inner).with_span(span)],
+            Some(build_caller_send(span, synth_null_pid(span))),
+        ),
+        // `let x = …` at tail has no value (Phase 1b rewrites
+        // top-level `pin` into this).  Append sentinel send.
+        Expr::Let { ident, ty, default } => (
+            vec![Expr::Let { ident, ty, default }.with_span(span)],
+            Some(build_caller_send(span, synth_null_pid(span))),
+        ),
+        // Default: any value-producing expression — wrap it.
+        other => {
+            if tail_has_no_value(&other) {
+                eprintln!(
+                    "[ERROR] function dropped: tail expression has no value, \
+                     wrap it in 'ret <value>' ({:?})",
+                    other,
+                );
+                return (vec![other.with_span(span)], None);
+            }
+            (
+                vec![build_caller_send(span, other.with_span(span)).with_span(span)],
+                None,
+            )
+        }
+    }
+}
+
+// Tail shapes that have no value but slipped past the explicit
+// match arms — hook for diagnostics (see #125).
+fn tail_has_no_value(expr: &Expr<'_>) -> bool {
+    matches!(expr, Expr::LetTuple { .. })
 }
 
 /// True when the expression is guaranteed to terminate via a `__caller`
@@ -3929,5 +4007,127 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    // ── #125: wrap_body_tail_in_caller_send recursion ────────────────
+
+    fn pin_call<'a>(name: &'a str) -> Spanned<Expr<'a>> {
+        let callee = Expr::Var(name, Type::Unknown).with_span(sp());
+        let jump = Expr::Jump {
+            ident: Box::new(callee),
+            args: vec![],
+        }
+        .with_span(sp());
+        Expr::Pin(Box::new(jump)).with_span(sp())
+    }
+
+    fn is_caller_send_to_zero(e: &Expr<'_>) -> bool {
+        let Expr::Jump { ident, args } = e else {
+            return false;
+        };
+        if !matches!(&ident.inner, Expr::Var("__caller", _)) {
+            return false;
+        }
+        // args = [self, 0]
+        args.len() == 2
+            && matches!(&args[0].inner, Expr::Var("self", _))
+            && matches!(&args[1].inner, Expr::Num("0", _))
+    }
+
+    fn is_caller_send_any(e: &Expr<'_>) -> bool {
+        matches!(e, Expr::Jump { ident, .. }
+            if matches!(&ident.inner, Expr::Var("__caller", _)))
+    }
+
+    /// Body = `[ when c { 1 -> [pin call_a()]   2 -> [pin call_b()] } ]`.
+    /// After wrap, each arm body must end in `__caller(self 0)`.
+    #[test]
+    fn wrap_recurses_into_when_arms() {
+        let when = Expr::When {
+            cond: Box::new(var("c")),
+            branches: vec![
+                (num("1"), vec![pin_call("call_a")]),
+                (num("2"), vec![pin_call("call_b")]),
+            ],
+        }
+        .with_span(sp());
+        let mut body = vec![when];
+        wrap_body_tail_in_caller_send(&mut body);
+        assert_eq!(body.len(), 1, "outer body keeps a single When tail");
+        let Expr::When { branches, .. } = &body[0].inner else {
+            panic!("expected When at tail, got {:?}", body[0].inner);
+        };
+        for (i, (_pat, arm_body)) in branches.iter().enumerate() {
+            assert_eq!(arm_body.len(), 2, "arm {i}: pin + sentinel send");
+            assert!(
+                matches!(&arm_body[0].inner, Expr::Pin(_)),
+                "arm {i} first stmt should still be Pin",
+            );
+            assert!(
+                is_caller_send_to_zero(&arm_body[1].inner),
+                "arm {i} second stmt should be __caller(self 0), got {:?}",
+                arm_body[1].inner,
+            );
+        }
+    }
+
+    /// Body = `[pin call()]`.  After wrap, body = `[pin call(), __caller(self 0)]`.
+    #[test]
+    fn wrap_seq_after_pin_tail() {
+        let mut body = vec![pin_call("call")];
+        wrap_body_tail_in_caller_send(&mut body);
+        assert_eq!(body.len(), 2, "pin tail expands to pin + sentinel send");
+        assert!(matches!(&body[0].inner, Expr::Pin(_)));
+        assert!(
+            is_caller_send_to_zero(&body[1].inner),
+            "trailing stmt must be __caller(self 0), got {:?}",
+            body[1].inner,
+        );
+    }
+
+    /// Body whose tail is an unknown value-less shape (we use
+    /// `LetTuple` as the stand-in — see `tail_has_no_value`).  Wrap
+    /// must return the body unchanged and emit the improved
+    /// "function dropped" diagnostic instead of silently producing
+    /// `__caller(self LetTuple{...})`.
+    #[test]
+    fn wrap_diagnostic_when_unknown_terminal() {
+        let lt = Expr::LetTuple {
+            fields: vec![Ident::new("a").with_span(sp())],
+            default: Box::new(num("0")),
+        }
+        .with_span(sp());
+        let mut body = vec![lt];
+        wrap_body_tail_in_caller_send(&mut body);
+        assert_eq!(body.len(), 1, "body unchanged on unknown terminal");
+        assert!(
+            matches!(&body[0].inner, Expr::LetTuple { .. }),
+            "tail must be the original LetTuple, got {:?}",
+            body[0].inner,
+        );
+        assert!(
+            !is_caller_send_any(&body[0].inner),
+            "must NOT have been wrapped in __caller send",
+        );
+    }
+
+    /// Body ending in `ret 42` (already an explicit return).  After
+    /// `rewrite_ret_in_expr` this is a `__caller(self 42)` jump, so
+    /// the wrap must leave it alone — no double-wrap.
+    #[test]
+    fn wrap_leaves_explicit_ret_unchanged() {
+        let already = build_caller_send(sp(), num("42")).with_span(sp());
+        let mut body = vec![already];
+        wrap_body_tail_in_caller_send(&mut body);
+        assert_eq!(body.len(), 1);
+        let Expr::Jump { ident, args } = &body[0].inner else {
+            panic!("expected Jump tail, got {:?}", body[0].inner);
+        };
+        assert!(
+            matches!(&ident.inner, Expr::Var("__caller", _)),
+            "ident must remain __caller",
+        );
+        assert_eq!(args.len(), 2, "args = [self, 42]");
+        assert!(matches!(&args[1].inner, Expr::Num("42", _)));
     }
 }
