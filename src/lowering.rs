@@ -477,6 +477,194 @@ fn expr_contains_ret<'src>(expr: &Expr<'src>) -> bool {
     }
 }
 
+/// #124: substitute `Var(name)` references that resolve to a module-local
+/// `const` with the const's literal value expression.  Applied at
+/// `collect_pure_bodies` time so the cached template has consts baked in
+/// — splicing into another module no longer leaks unresolved names.
+/// Conservative: only swaps bare `Var`; const values are cloned as-is
+/// (no recursive const resolution — if a const value contains another
+/// `Var`, leave it for the resolver to flag).
+fn substitute_module_consts_in_expr<'src>(
+    expr: Spanned<Expr<'src>>,
+    consts: &HashMap<&'src str, Spanned<Expr<'src>>>,
+) -> Spanned<Expr<'src>> {
+    let span = expr.span;
+    use Expr::*;
+    let new_inner = match expr.inner {
+        Var(name, ty) => {
+            if let Some(value) = consts.get(name) {
+                return value.clone();
+            }
+            Var(name, ty)
+        }
+        Let { ident, ty, default } => Let {
+            ident,
+            ty,
+            default: default.map(|d| Box::new(substitute_module_consts_in_expr(*d, consts))),
+        },
+        Ret(inner) => Ret(Box::new(substitute_module_consts_in_expr(*inner, consts))),
+        Pin(inner) => Pin(Box::new(substitute_module_consts_in_expr(*inner, consts))),
+        Neg(inner) => Neg(Box::new(substitute_module_consts_in_expr(*inner, consts))),
+        Jump { ident, args } => Jump {
+            ident: Box::new(substitute_module_consts_in_expr(*ident, consts)),
+            args: args
+                .into_iter()
+                .map(|a| substitute_module_consts_in_expr(a, consts))
+                .collect(),
+        },
+        MethodCall { receiver, method, args } => MethodCall {
+            receiver: Box::new(substitute_module_consts_in_expr(*receiver, consts)),
+            method,
+            args: args
+                .into_iter()
+                .map(|a| substitute_module_consts_in_expr(a, consts))
+                .collect(),
+        },
+        AtAccess { receiver, field } => AtAccess {
+            receiver: Box::new(substitute_module_consts_in_expr(*receiver, consts)),
+            field,
+        },
+        DotAccess { receiver, field } => DotAccess {
+            receiver: Box::new(substitute_module_consts_in_expr(*receiver, consts)),
+            field,
+        },
+        TupleIndex { receiver, index } => TupleIndex {
+            receiver: Box::new(substitute_module_consts_in_expr(*receiver, consts)),
+            index,
+        },
+        Index { receiver, index } => Index {
+            receiver: Box::new(substitute_module_consts_in_expr(*receiver, consts)),
+            index: Box::new(substitute_module_consts_in_expr(*index, consts)),
+        },
+        LetTuple { fields, default } => LetTuple {
+            fields,
+            default: Box::new(substitute_module_consts_in_expr(*default, consts)),
+        },
+        StructInit { base, fields } => StructInit {
+            base: Box::new(substitute_module_consts_in_expr(*base, consts)),
+            fields: fields
+                .into_iter()
+                .map(|f| substitute_module_consts_in_expr(f, consts))
+                .collect(),
+        },
+        Tuple(elems) => Tuple(
+            elems
+                .into_iter()
+                .map(|e| substitute_module_consts_in_expr(e, consts))
+                .collect(),
+        ),
+        When { cond, branches } => When {
+            cond: Box::new(substitute_module_consts_in_expr(*cond, consts)),
+            branches: branches
+                .into_iter()
+                .map(|(pat, body)| {
+                    (
+                        substitute_module_consts_in_expr(pat, consts),
+                        body.into_iter()
+                            .map(|e| substitute_module_consts_in_expr(e, consts))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        },
+        Wait { handlers, filter } => Wait {
+            handlers: handlers
+                .into_iter()
+                .map(|h| {
+                    let h_span = h.span;
+                    let mut br = h.inner;
+                    br.body = br
+                        .body
+                        .into_iter()
+                        .map(|e| substitute_module_consts_in_expr(e, consts))
+                        .collect();
+                    br.with_span(h_span)
+                })
+                .collect(),
+            filter: filter
+                .into_iter()
+                .map(|f| substitute_module_consts_in_expr(f, consts))
+                .collect(),
+        },
+        Add(l, r) => Add(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Sub(l, r) => Sub(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Mul(l, r) => Mul(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Div(l, r) => Div(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Eq(l, r) => Eq(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Le(l, r) => Le(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Ge(l, r) => Ge(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Lt(l, r) => Lt(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Gt(l, r) => Gt(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        BAnd(l, r) => BAnd(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        BOr(l, r) => BOr(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        BXor(l, r) => BXor(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Shl(l, r) => Shl(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        Shr(l, r) => Shr(
+            Box::new(substitute_module_consts_in_expr(*l, consts)),
+            Box::new(substitute_module_consts_in_expr(*r, consts)),
+        ),
+        other => other,
+    };
+    Spanned {
+        inner: new_inner,
+        span,
+    }
+}
+
+/// #124: build a `name → value` map of a module's `Item::Const` decls.
+/// Both `pub` and non-`pub` consts are included — the inlinee module's
+/// view of its own consts is what gets baked into the template.
+fn collect_module_consts<'src>(
+    module: &ParsedModule<'src>,
+) -> HashMap<&'src str, Spanned<Expr<'src>>> {
+    let mut out = HashMap::new();
+    for item in &module.ast {
+        if let Item::Const(c) = &item.inner {
+            out.insert(c.inner.ident.inner.0, c.inner.value.clone());
+        }
+    }
+    out
+}
+
 /// Index simple-pure ret-machines by their (module, name) key, storing
 /// the original branch parameters + body.  Only machines that pass both
 /// `collect_pure_ret_machines` AND `is_simple_pure_body` are included.
@@ -486,6 +674,9 @@ fn collect_pure_bodies<'src>(
 ) -> HashMap<RetKey, PureBodyTemplate<'src>> {
     let mut out = HashMap::new();
     for module in &program.modules {
+        // #124: capture module-local const map so cross-module inlines
+        // don't leak unresolved names into the caller's scope.
+        let module_consts = collect_module_consts(module);
         for item in &module.ast {
             if let Item::Machine(m) = &item.inner {
                 let key = RetKey {
@@ -514,6 +705,14 @@ fn collect_pure_bodies<'src>(
                 if !is_simple_pure_body(&body) {
                     continue;
                 }
+                // #124: bake module-local consts into the template now.
+                let body: Vec<_> = if module_consts.is_empty() {
+                    body
+                } else {
+                    body.into_iter()
+                        .map(|e| substitute_module_consts_in_expr(e, &module_consts))
+                        .collect()
+                };
                 out.insert(
                     key,
                     PureBodyTemplate {
@@ -3554,6 +3753,178 @@ mod tests {
             Expr::Wait { handlers, .. } => {
                 for h in handlers {
                     walk_for_dst(&h.inner.body, saw);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── #124 module-local const baking in pure-body templates ──────────────
+
+    use crate::api::ast::{Branch, ConstDecl, Machine, MachineItem, Pattern};
+
+    /// Build a single-branch pure ret-machine: `name is { param i64 -> ret i64 { <body> } }`
+    fn pure_machine<'a>(
+        name: &'a str,
+        param: &'a str,
+        body: Vec<Spanned<Expr<'a>>>,
+    ) -> Spanned<Item<'a>> {
+        let i64_ty = || Type::Named(Ident::new("i64").with_span(sp())).with_span(sp());
+        let pat = Pattern::new(Ident::new(param).with_span(sp()), i64_ty()).with_span(sp());
+        let branch = Branch::new(None, vec![pat], Some(i64_ty()), body);
+        let mi = MachineItem::Branch(branch).with_span(sp());
+        let m = Machine::new(
+            vec![],
+            true,
+            Ident::new(name).with_span(sp()),
+            vec![],
+            vec![mi],
+        );
+        Item::Machine(m.with_span(sp())).with_span(sp())
+    }
+
+    fn const_item<'a>(name: &'a str, value: Spanned<Expr<'a>>) -> Spanned<Item<'a>> {
+        let decl = ConstDecl::new(false, Ident::new(name).with_span(sp()), value);
+        Item::Const(decl.with_span(sp())).with_span(sp())
+    }
+
+    /// `Var(name)` references resolving to a module-local `const` get
+    /// substituted with the literal value before the template is cached.
+    /// This is the core fix for bug #124.
+    #[test]
+    fn inline_pure_substitutes_module_const() {
+        // module a: const MAX_FOO = 1024; pub helper is { x i64 -> ret i64 { ret x * MAX_FOO } }
+        let body = vec![
+            Expr::Ret(Box::new(
+                Expr::Mul(Box::new(var("x")), Box::new(var("MAX_FOO"))).with_span(sp()),
+            ))
+            .with_span(sp()),
+        ];
+        let mod_a = ParsedModule {
+            module_path: ModulePath(vec!["a".to_string()]),
+            source_path: std::path::PathBuf::from("a.lake"),
+            ast: vec![
+                const_item("MAX_FOO", num("1024")),
+                pure_machine("helper", "x", body),
+            ],
+        };
+        // module b: empty (helper would be imported in real code).
+        let mod_b = ParsedModule {
+            module_path: ModulePath(vec!["b".to_string()]),
+            source_path: std::path::PathBuf::from("b.lake"),
+            ast: vec![],
+        };
+        let program = ParsedProgram {
+            modules: vec![mod_a, mod_b],
+        };
+        let ret_machines = super::collect_ret_machines(&program);
+        let pure_set = super::collect_pure_ret_machines(&program, &ret_machines);
+        let bodies = super::collect_pure_bodies(&program, &pure_set);
+
+        let key = super::RetKey {
+            module: ModulePath(vec!["a".to_string()]),
+            name: "helper".to_string(),
+        };
+        let tmpl = bodies.get(&key).expect("helper must be in pure-body table");
+        // The single statement is `Ret(Mul(Var("x"), Num("1024")))` — the
+        // `Var("MAX_FOO")` should have been substituted.
+        assert_eq!(tmpl.body.len(), 1);
+        let Expr::Ret(inner) = &tmpl.body[0].inner else {
+            panic!("expected Ret, got {:?}", tmpl.body[0].inner);
+        };
+        let Expr::Mul(l, r) = &inner.inner else {
+            panic!("expected Mul, got {:?}", inner.inner);
+        };
+        assert!(matches!(l.inner, Expr::Var("x", _)));
+        match &r.inner {
+            Expr::Num(s, _) => assert_eq!(*s, "1024"),
+            other => panic!("expected Num(1024) after const sub, got {:?}", other),
+        }
+        // Walk to be sure no Var("MAX_FOO") survived.
+        let mut leaked = false;
+        walk_for_var(&tmpl.body, "MAX_FOO", &mut leaked);
+        assert!(!leaked, "Var(MAX_FOO) must not survive in cached template");
+    }
+
+    /// Sanity: a pure body without any const refs is cached unchanged.
+    #[test]
+    fn inline_pure_unchanged_when_no_consts() {
+        // module a: pub helper is { x i64 -> ret i64 { ret x } } — no consts.
+        let body = vec![Expr::Ret(Box::new(var("x"))).with_span(sp())];
+        let mod_a = ParsedModule {
+            module_path: ModulePath(vec!["a".to_string()]),
+            source_path: std::path::PathBuf::from("a.lake"),
+            ast: vec![pure_machine("helper", "x", body)],
+        };
+        let program = ParsedProgram {
+            modules: vec![mod_a],
+        };
+        let ret_machines = super::collect_ret_machines(&program);
+        let pure_set = super::collect_pure_ret_machines(&program, &ret_machines);
+        let bodies = super::collect_pure_bodies(&program, &pure_set);
+
+        let key = super::RetKey {
+            module: ModulePath(vec!["a".to_string()]),
+            name: "helper".to_string(),
+        };
+        let tmpl = bodies.get(&key).expect("helper must be in pure-body table");
+        assert_eq!(tmpl.body.len(), 1);
+        let Expr::Ret(inner) = &tmpl.body[0].inner else {
+            panic!("expected Ret");
+        };
+        assert!(
+            matches!(inner.inner, Expr::Var("x", _)),
+            "Var(x) param ref should pass through unchanged"
+        );
+    }
+
+    fn walk_for_var<'src>(
+        body: &[chumsky::span::Spanned<Expr<'src>>],
+        target: &str,
+        saw: &mut bool,
+    ) {
+        for stmt in body {
+            walk_for_var_in_expr(&stmt.inner, target, saw);
+        }
+    }
+
+    fn walk_for_var_in_expr<'src>(expr: &Expr<'src>, target: &str, saw: &mut bool) {
+        match expr {
+            Expr::Var(name, _) => {
+                if *name == target {
+                    *saw = true;
+                }
+            }
+            Expr::Ret(inner) | Expr::Pin(inner) | Expr::Neg(inner) => {
+                walk_for_var_in_expr(&inner.inner, target, saw)
+            }
+            Expr::Let { default: Some(d), .. } => walk_for_var_in_expr(&d.inner, target, saw),
+            Expr::Add(l, r)
+            | Expr::Sub(l, r)
+            | Expr::Mul(l, r)
+            | Expr::Div(l, r)
+            | Expr::Eq(l, r)
+            | Expr::Le(l, r)
+            | Expr::Ge(l, r)
+            | Expr::Lt(l, r)
+            | Expr::Gt(l, r)
+            | Expr::BAnd(l, r)
+            | Expr::BOr(l, r)
+            | Expr::BXor(l, r)
+            | Expr::Shl(l, r)
+            | Expr::Shr(l, r) => {
+                walk_for_var_in_expr(&l.inner, target, saw);
+                walk_for_var_in_expr(&r.inner, target, saw);
+            }
+            Expr::Jump { args, .. } => {
+                for a in args {
+                    walk_for_var_in_expr(&a.inner, target, saw);
+                }
+            }
+            Expr::When { cond, branches } => {
+                walk_for_var_in_expr(&cond.inner, target, saw);
+                for (_, body) in branches {
+                    walk_for_var(body, target, saw);
                 }
             }
             _ => {}
