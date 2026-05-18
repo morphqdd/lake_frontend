@@ -232,7 +232,12 @@ impl ProgramSources {
             let tokens = match lexer().parse(f.src.as_str()).into_result() {
                 Ok(t) => t,
                 Err(errs) => {
-                    errors.push(&f.source_path, LakeErrors::from_lex_errs(errs));
+                    // Bug #126: tag per-file so multi-file rendering routes
+                    // diagnostics to the correct source.
+                    errors.push(
+                        &f.source_path,
+                        LakeErrors::from_lex_errs(errs).tag_source_path(&f.source_path),
+                    );
                     continue;
                 }
             };
@@ -242,7 +247,10 @@ impl ProgramSources {
             {
                 Ok(a) => a,
                 Err(errs) => {
-                    errors.push(&f.source_path, LakeErrors::from_parse_errs(errs));
+                    errors.push(
+                        &f.source_path,
+                        LakeErrors::from_parse_errs(errs).tag_source_path(&f.source_path),
+                    );
                     continue;
                 }
             };
@@ -303,7 +311,9 @@ impl ProgramSources {
                 Ok(t) => t,
                 Err(errs) => {
                     in_progress.remove(&module_path);
-                    return Err(LakeErrors::from_lex_errs(errs));
+                    // Bug #126: tag with the file the error came from.
+                    return Err(LakeErrors::from_lex_errs(errs)
+                        .tag_source_path(&source_path));
                 }
             };
             let ast = match program()
@@ -313,7 +323,8 @@ impl ProgramSources {
                 Ok(a) => a,
                 Err(errs) => {
                     in_progress.remove(&module_path);
-                    return Err(LakeErrors::from_parse_errs(errs));
+                    return Err(LakeErrors::from_parse_errs(errs)
+                        .tag_source_path(&source_path));
                 }
             };
             (collect_referenced_modules(&ast), prescan_path_modules(&ast))
@@ -990,5 +1001,49 @@ mod tests {
         assert!(parsed
             .by_path(&ModulePath(vec!["core".to_string(), "io".to_string()]))
             .is_some());
+    }
+
+    /// Bug #126: a parse error in module B must be tagged with B's
+    /// path, never A's.  Without the tag the multi-file renderer
+    /// would slice B's span into A's bytes and panic on a non-char
+    /// boundary.
+    #[test]
+    fn parse_errors_tagged_with_owning_file() {
+        let dir = TempDir::new().unwrap();
+        // Module `core.io` has a deliberate syntax error after a
+        // comment.  The comment is to validate spans don't drift.
+        write_file(
+            &dir,
+            "core/io.lake",
+            "// some comment that takes bytes\npub println is { @@@ }",
+        );
+        let main = write_file(
+            &dir,
+            "main.lake",
+            "+core.io.println\nmain is { _ -> { } }",
+        );
+        // Load may surface parse errors itself (it parses each file to
+        // discover transitive imports), or parse_all may later.  Either
+        // way every error must be tagged with `core/io.lake`.
+        let io_path = dir.path().join("core/io.lake");
+        let errs = match ProgramSources::load(&main) {
+            Ok(sources) => {
+                let perr = sources.parse_all().expect_err("parse should fail");
+                let mut bag = LakeErrors::default();
+                for (_, e) in perr.per_file {
+                    bag.extend(e);
+                }
+                bag
+            }
+            Err(e) => e,
+        };
+        assert!(!errs.is_empty(), "must have at least one parse error");
+        for e in &errs.0 {
+            assert_eq!(
+                e.source_path.as_deref(),
+                Some(io_path.as_path()),
+                "every LakeError tagged with owning source path"
+            );
+        }
     }
 }

@@ -433,6 +433,8 @@ impl<'src> ProgramRegistry<'src> {
         }
 
         // Pass 2: register items + imports.
+        // Bug #126: tag every error with the module's source path so
+        // the multi-file renderer routes diagnostics to the right file.
         let mut errors: Vec<LakeError> = Vec::new();
         for module in &program.modules {
             let id = self
@@ -440,6 +442,13 @@ impl<'src> ProgramRegistry<'src> {
                 .get(&module.module_path)
                 .copied()
                 .expect("module registered in pass 1");
+            let mp = module.source_path.clone();
+            let tag = |mut e: LakeError| -> LakeError {
+                if e.source_path.is_none() {
+                    e.source_path = Some(mp.clone());
+                }
+                e
+            };
             for item in &module.ast {
                 match &item.inner {
                     Item::Machine(m) => {
@@ -453,7 +462,7 @@ impl<'src> ProgramRegistry<'src> {
                             Ok((name, sig)) => {
                                 self.module_mut(id).ffi_fns.insert(name, sig);
                             }
-                            Err(e) => errors.push(e),
+                            Err(e) => errors.push(tag(e)),
                         }
                     }
                     Item::Directive(_) => {
@@ -468,14 +477,16 @@ impl<'src> ProgramRegistry<'src> {
                                     .consts
                                     .insert(name, entry);
                             }
-                            Err(e) => errors.push(e),
+                            Err(e) => errors.push(tag(e)),
                         }
                     }
                     Item::Import(rc) => {
-                        if let Err(mut errs) =
+                        if let Err(errs) =
                             register_import_bindings(rc, &[], id, self)
                         {
-                            errors.append(&mut errs);
+                            for e in errs {
+                                errors.push(tag(e));
+                            }
                         }
                     }
                 }

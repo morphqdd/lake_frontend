@@ -1,4 +1,4 @@
-use std::{fmt, path::Path};
+use std::{fmt, path::{Path, PathBuf}};
 
 use ariadne::{Color, Label, Report, ReportKind, sources};
 use chumsky::{error::Rich, span::SimpleSpan};
@@ -38,6 +38,10 @@ pub struct LakeError {
     pub notes: Vec<String>,
     /// A `help:` suggestion appended below the snippet.
     pub help: Option<String>,
+    /// Path to the source file this span belongs to.  When `Some`,
+    /// the multi-file renderer routes the diagnostic to the matching
+    /// source — never against an unrelated module (see bug #126).
+    pub source_path: Option<PathBuf>,
 }
 
 impl LakeError {
@@ -53,6 +57,7 @@ impl LakeError {
             secondary: vec![],
             notes: vec![],
             help: None,
+            source_path: None,
         }
     }
 
@@ -70,7 +75,17 @@ impl LakeError {
             secondary: vec![],
             notes: vec![],
             help: None,
+            source_path: None,
         }
+    }
+
+    /// Tag this error with the source file its span refers to.  Used
+    /// by multi-file callers (loader / typeck / populate) so the
+    /// renderer can route the diagnostic to the right source — see
+    /// docs/state/bugs/126_comment_span_offset_drift.md.
+    pub fn with_source_path<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.source_path = Some(path.as_ref().to_path_buf());
+        self
     }
 
     /// Attach an error code (e.g. `"E001"`).
@@ -108,13 +123,23 @@ impl LakeError {
 
     /// Render this diagnostic to stderr with full source context.
     pub fn display<P: AsRef<Path>>(&self, src: &str, path: P) {
+        // Bug #126 defensive: if this error is tagged with a file
+        // other than the one we're being rendered against, skip — a
+        // span valid for module B would otherwise be sliced into
+        // module A's bytes, panicking on a mid-multibyte boundary.
+        if let Some(tag) = &self.source_path {
+            if tag != path.as_ref() {
+                return;
+            }
+        }
         let fname: &'static str = path.as_ref().display().to_string().leak();
 
-        let mut builder = Report::build(ReportKind::Error, (fname, self.span.into_range()))
+        let primary = clamp_span(self.span, src);
+        let mut builder = Report::build(ReportKind::Error, (fname, primary.clone()))
             .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
             .with_message(&self.message)
             .with_label(
-                Label::new((fname, self.span.into_range()))
+                Label::new((fname, primary))
                     .with_message(&self.label)
                     .with_color(Color::Red),
             );
@@ -125,7 +150,7 @@ impl LakeError {
 
         for sec in &self.secondary {
             builder = builder.with_label(
-                Label::new((fname, sec.span.into_range()))
+                Label::new((fname, clamp_span(sec.span, src)))
                     .with_message(&sec.message)
                     .with_color(Color::Yellow),
             );
@@ -145,6 +170,29 @@ impl LakeError {
             eprintln!("error while printing diagnostic: {io_err}");
         }
     }
+}
+
+/// Snap a byte span to valid char boundaries within `src` and clamp it
+/// to the source length.  Prevents ariadne panics ("end byte index is
+/// not a char boundary") when a span drifts past the end of the file
+/// or lands inside a multi-byte UTF-8 sequence.  See bug #126.
+fn clamp_span(span: SimpleSpan, src: &str) -> std::ops::Range<usize> {
+    let len = src.len();
+    let mut start = span.start.min(len);
+    let mut end = span.end.min(len);
+    if end < start {
+        end = start;
+    }
+    while start < len && !src.is_char_boundary(start) {
+        start += 1;
+    }
+    while end < len && !src.is_char_boundary(end) {
+        end += 1;
+    }
+    if end == len {
+        // Already at file end — guaranteed boundary.
+    }
+    start..end
 }
 
 /// A collection of `LakeError`s from a single compilation unit.
@@ -176,6 +224,41 @@ impl LakeErrors {
     pub fn display<P: AsRef<Path>>(&self, src: &str, path: P) {
         for err in &self.0 {
             err.display(src, &path);
+        }
+    }
+
+    /// Tag every untagged error with `path` so later multi-file
+    /// rendering routes them to the correct source.  Errors already
+    /// carrying a `source_path` are left alone.
+    pub fn tag_source_path<P: AsRef<Path>>(mut self, path: P) -> Self {
+        let p = path.as_ref();
+        for e in &mut self.0 {
+            if e.source_path.is_none() {
+                e.source_path = Some(p.to_path_buf());
+            }
+        }
+        self
+    }
+
+    /// Render every diagnostic against the file its `source_path`
+    /// points at.  `files` maps file paths to their source text.
+    /// Errors with no tag — or tagged with a path not in `files` —
+    /// are rendered against the first file as a fallback.  Bug #126.
+    pub fn display_multi<P: AsRef<Path>>(&self, files: &[(P, &str)]) {
+        for err in &self.0 {
+            let (path, src) = match &err.source_path {
+                Some(tag) => files
+                    .iter()
+                    .find(|(p, _)| p.as_ref() == tag.as_path())
+                    .map(|(p, s)| (p.as_ref(), *s))
+                    .or_else(|| files.first().map(|(p, s)| (p.as_ref(), *s)))
+                    .unwrap_or_else(|| (Path::new("<unknown>"), "")),
+                None => files
+                    .first()
+                    .map(|(p, s)| (p.as_ref(), *s))
+                    .unwrap_or_else(|| (Path::new("<unknown>"), "")),
+            };
+            err.display(src, path);
         }
     }
 
@@ -227,4 +310,51 @@ pub fn parse_failure<P: AsRef<Path>>(errs: Vec<Rich<impl fmt::Display>>, src: &s
     let errors = LakeErrors::from_rich_vec(errs);
     errors.display(src, path);
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bug #126: a span past EOF must not panic ariadne — clamp_span
+    /// must snap end to len.  Also catches mid-multibyte-char drift.
+    #[test]
+    fn clamp_span_past_eof_does_not_panic() {
+        let src = "abc";
+        let span = SimpleSpan::from(5..47);
+        let r = clamp_span(span, src);
+        assert!(r.end <= src.len());
+        assert!(r.start <= r.end);
+    }
+
+    /// Bug #126: a span landing inside a multi-byte char (e.g. the
+    /// box-drawing `─` glyph from ariadne output reused as source)
+    /// must snap to the nearest char boundary, never panic.
+    #[test]
+    fn clamp_span_snaps_to_char_boundary() {
+        // `─` is 3 bytes (E2 94 80).  Span ending at byte 1 lands
+        // inside the codepoint.
+        let src = "a─b"; // bytes: 61 E2 94 80 62
+        assert_eq!(src.len(), 5);
+        let span = SimpleSpan::from(0..2); // mid-`─`
+        let r = clamp_span(span, src);
+        assert!(src.is_char_boundary(r.start));
+        assert!(src.is_char_boundary(r.end));
+    }
+
+    /// Bug #126: display() against an unrelated file is a no-op when
+    /// the error is tagged with a different source path — ariadne is
+    /// never handed an out-of-range span to slice.
+    #[test]
+    fn display_skips_unrelated_source() {
+        // We can't easily intercept ariadne's writer here, but we can
+        // at least exercise the early-return path without panicking
+        // when the error span is far past the unrelated source's len.
+        let err = LakeError::new("oops", SimpleSpan::from(5000..5010))
+            .with_source_path("/tmp/file_b.lake");
+        // Pass file A's source — much shorter than the span.  Without
+        // routing this would have panicked.  With it, display returns
+        // before touching the bytes.
+        err.display("short source", "/tmp/file_a.lake");
+    }
 }
