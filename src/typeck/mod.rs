@@ -650,7 +650,14 @@ pub fn typecheck_program<'src>(
             .expect("registry must be populated before typecheck");
         let mut checker = TypeChecker::new(registry, id);
         checker.check_module(&module.ast);
-        all.extend(checker.into_errors());
+        // Bug #126: tag each error with its module's source file so
+        // the multi-file renderer doesn't slice a foreign source.
+        for mut e in checker.into_errors() {
+            if e.source_path.is_none() {
+                e.source_path = Some(module.source_path.clone());
+            }
+            all.push(e);
+        }
     }
     LakeErrors::new(all)
 }

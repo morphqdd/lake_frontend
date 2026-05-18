@@ -116,11 +116,12 @@ pub fn build_program<'src>(
     sources: &'src ProgramSources,
 ) -> Result<LakeProgram<'src>, LakeErrors> {
     let parsed = sources.parse_all().map_err(|errs| {
-        // Flatten per-file ParseErrors into a single LakeErrors bag so
-        // callers handle one shape.
+        // Flatten per-file ParseErrors into a single LakeErrors bag,
+        // tagging each error with the file its span belongs to so the
+        // multi-file renderer routes it correctly (bug #126).
         let mut bag = LakeErrors::default();
-        for (_, e) in errs.per_file {
-            bag.extend(e);
+        for (path, e) in errs.per_file {
+            bag.extend(e.tag_source_path(&path));
         }
         bag
     })?;
