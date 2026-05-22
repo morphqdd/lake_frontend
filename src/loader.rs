@@ -123,10 +123,22 @@ impl SearchPaths {
         // segment is *consumed* by the var name — module path
         // `std.io.println` under `STD_PATH=/x` resolves to `/x/io.lake`,
         // not `/x/std/io.lake`.
+        //
+        // #133: when the path is a single segment (`+lash.{ parser }`
+        // with item_fallback module path = `lash`), try
+        // `<LIB_ROOT>/<first>.lake` so single-file packages whose
+        // entry name matches the package name resolve via their env
+        // var instead of requiring users to thread `LAKE_PATH`.
         if let Some(first) = module.0.first() {
             if let Some(root) = self.lib_roots.get(first) {
                 let rest = ModulePath(module.0.iter().skip(1).cloned().collect());
-                if !rest.0.is_empty() {
+                if rest.0.is_empty() {
+                    let candidate = root.join(format!("{first}.lake"));
+                    if candidate.is_file() {
+                        return ResolveOutcome::Found(candidate);
+                    }
+                    tried.push(candidate);
+                } else {
                     let candidate = root.join(rest.to_filesystem());
                     if candidate.is_file() {
                         return ResolveOutcome::Found(candidate);
