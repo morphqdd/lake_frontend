@@ -68,7 +68,7 @@ pub fn lower_program<'src>(
     let pure_bodies = if std::env::var("LAKE_NO_PURE_INLINE").is_ok() {
         HashMap::new()
     } else {
-        collect_pure_bodies(&program, &pure_ret_machines)
+        collect_pure_bodies(&program, &pure_ret_machines, registry)
     };
     if std::env::var("LAKE_DUMP_PURE").is_ok() {
         let mut sorted: Vec<_> = pure_ret_machines.iter().collect();
@@ -348,6 +348,11 @@ fn first_ret_ty(machine: &Machine<'_>) -> Option<String> {
 struct PureBodyTemplate<'src> {
     params: Vec<Spanned<Pattern<'src>>>,
     body: Vec<Spanned<Expr<'src>>>,
+    /// Module that owns this template.  Used during recursive
+    /// inlining: nested bare-name calls inside the substituted body
+    /// must resolve against this module's scope (where they were
+    /// originally written), NOT the outer caller's — see #131.
+    origin_module: ModuleId,
 }
 
 /// Canonicalise `[..., Let{ident:v, ty, value:e}, Ret(Var(v))]` to
@@ -671,12 +676,16 @@ fn collect_module_consts<'src>(
 fn collect_pure_bodies<'src>(
     program: &ParsedProgram<'src>,
     pure_set: &std::collections::HashSet<RetKey>,
+    registry: &ProgramRegistry<'src>,
 ) -> HashMap<RetKey, PureBodyTemplate<'src>> {
     let mut out = HashMap::new();
     for module in &program.modules {
         // #124: capture module-local const map so cross-module inlines
         // don't leak unresolved names into the caller's scope.
         let module_consts = collect_module_consts(module);
+        let origin_module = registry
+            .module_id_for_path(&module.module_path)
+            .expect("populate_from must run before collect_pure_bodies");
         for item in &module.ast {
             if let Item::Machine(m) = &item.inner {
                 let key = RetKey {
@@ -718,6 +727,7 @@ fn collect_pure_bodies<'src>(
                     PureBodyTemplate {
                         params: branch.patterns.clone(),
                         body,
+                        origin_module,
                     },
                 );
             }
@@ -1041,15 +1051,40 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         }
     }
 
-    /// Look up an inlineable pure ret-machine by source-visible name.
-    /// Resolves both unqualified calls (same module) and module-imported
-    /// callees.  Phase-1 conservative match: by bare name only; in
-    /// practice pure machines in stdlib have unique names.
-    fn lookup_pure(&self, name: &str) -> Option<&'a PureBodyTemplate<'src>> {
-        self.pure_bodies
-            .iter()
-            .find(|(k, _)| k.name == name)
-            .map(|(_, v)| v)
+    /// Look up an inlineable pure ret-machine by source-visible name,
+    /// resolving against `scope` (the module whose imports are in
+    /// effect at the callsite).  Returns the template *and* the
+    /// module that owns it; callers should pass the owning module
+    /// back in as `scope` when recursively inlining nested calls
+    /// inside the substituted body.
+    ///
+    /// #131: a name-only HashMap search picks the first matching key
+    /// in non-deterministic iteration order.  When two modules define
+    /// pure helpers with the same source name (e.g. lake-house has
+    /// `slice_packed` / `nth_token` in `manifest.lake`, `cmd/lock.lake`
+    /// and `registry.lake`, each with a different module-local
+    /// `MAX_*` constant baked into the body), the inliner used to
+    /// substitute a foreign module's template into the caller, leaving
+    /// the decoder reading bytes encoded against a different scale.
+    /// ~40% of lake-house builds inlined `cmd/lock`'s `slice_packed`
+    /// (MAX_LOCK = 16384) into `manifest__project_token`
+    /// (MAX_MANIFEST = 4096), tripping rt_copy_bytes' src bound.
+    fn lookup_pure(
+        &self,
+        name: &str,
+        scope: ModuleId,
+    ) -> Option<&'a PureBodyTemplate<'src>> {
+        use crate::registry::Resolution;
+        let resolution = self.registry.resolve_bare_in(scope, name)?;
+        let Resolution::Machine(entry) = resolution else {
+            return None;
+        };
+        let module_path = self.registry.module(entry.module).path.clone();
+        let key = RetKey {
+            module: module_path,
+            name: name.to_string(),
+        };
+        self.pure_bodies.get(&key)
     }
 
     /// Run the inline-pure-calls phase recursively on a body until no
@@ -1061,6 +1096,26 @@ impl<'a, 'src> LowerCx<'a, 'src> {
     ///   3. Substituted body may contain calls to other pure machines
     ///      — recursive call inlines those too.
     fn inline_pure_calls(&self, body: Vec<Spanned<Expr<'src>>>) -> Vec<Spanned<Expr<'src>>> {
+        self.inline_pure_calls_in_scope(body, self.module_id)
+    }
+
+    /// Worker for `inline_pure_calls` that threads the resolution
+    /// scope through recursive expansions.  Top-level callers use
+    /// `self.module_id`; when a template owned by module M is
+    /// substituted in, the substituted body is re-walked with `M`
+    /// as the scope so nested bare-name calls resolve against M's
+    /// imports (where they were originally written), not the outer
+    /// caller's.  Without this distinction, transitive helpers that
+    /// were visible in the donor module but not in the caller cause
+    /// "no callable named ..." errors after substitution (e.g.
+    /// lake-house's `cache.lake::buf_concat` body calls non-`pub`
+    /// `concat_bb`; `cmd/gh_pr.lake` imports buf_concat but not
+    /// concat_bb).
+    fn inline_pure_calls_in_scope(
+        &self,
+        body: Vec<Spanned<Expr<'src>>>,
+        scope: ModuleId,
+    ) -> Vec<Spanned<Expr<'src>>> {
         if self.pure_bodies.is_empty() {
             return body;
         }
@@ -1074,11 +1129,11 @@ impl<'a, 'src> LowerCx<'a, 'src> {
 
         let mut out = Vec::with_capacity(body.len());
         for stmt in body {
-            if let Some(expanded) = self.try_inline_pure_let(&stmt) {
-                // Recurse: the substituted body may itself contain
-                // pure calls.  Recursion also re-lifts after the
-                // substitution introduces fresh nested calls.
-                let recursed = self.inline_pure_calls(expanded);
+            if let Some((expanded, donor)) = self.try_inline_pure_let(&stmt, scope) {
+                // Recurse with the DONOR module as the new scope so
+                // helper calls inside the substituted body resolve
+                // against the module that originally wrote them.
+                let recursed = self.inline_pure_calls_in_scope(expanded, donor);
                 out.extend(recursed);
             } else {
                 out.push(stmt);
@@ -1088,11 +1143,15 @@ impl<'a, 'src> LowerCx<'a, 'src> {
     }
 
     /// Attempt to expand a `let r = pure_f(args)` statement.  Returns
-    /// `None` if the statement is not a let-bound pure call.
+    /// the expanded statements and the donor module of the inlined
+    /// template (so the caller can use it as the resolution scope
+    /// for the next recursion).  Returns `None` if the statement is
+    /// not a let-bound pure call.
     fn try_inline_pure_let(
         &self,
         stmt: &Spanned<Expr<'src>>,
-    ) -> Option<Vec<Spanned<Expr<'src>>>> {
+        scope: ModuleId,
+    ) -> Option<(Vec<Spanned<Expr<'src>>>, ModuleId)> {
         let Expr::Let {
             ident: user_ident,
             ty: user_ty,
@@ -1109,12 +1168,13 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             Expr::Path(segs) => segs.last().map(|s| s.inner.0).unwrap_or(""),
             _ => return None,
         };
-        let template = self.lookup_pure(callee_name)?;
+        let template = self.lookup_pure(callee_name, scope)?;
         // Arity must match.  Otherwise downstream typeck would fail
         // anyway; safer to leave alone.
         if template.params.len() != args.len() {
             return None;
         }
+        let donor = template.origin_module;
 
         let span = stmt.span;
         let id = self.counter.get();
@@ -1170,7 +1230,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             }
             .with_span(span),
         );
-        Some(out)
+        Some((out, donor))
     }
 
     fn lower_machine(&self, mut machine: Machine<'src>) -> Machine<'src> {
@@ -3897,7 +3957,9 @@ mod tests {
         };
         let ret_machines = super::collect_ret_machines(&program);
         let pure_set = super::collect_pure_ret_machines(&program, &ret_machines);
-        let bodies = super::collect_pure_bodies(&program, &pure_set);
+        let mut registry = crate::registry::ProgramRegistry::with_rt();
+        registry.populate_from(&program).expect("registry populate");
+        let bodies = super::collect_pure_bodies(&program, &pure_set, &registry);
 
         let key = super::RetKey {
             module: ModulePath(vec!["a".to_string()]),
@@ -3939,7 +4001,9 @@ mod tests {
         };
         let ret_machines = super::collect_ret_machines(&program);
         let pure_set = super::collect_pure_ret_machines(&program, &ret_machines);
-        let bodies = super::collect_pure_bodies(&program, &pure_set);
+        let mut registry = crate::registry::ProgramRegistry::with_rt();
+        registry.populate_from(&program).expect("registry populate");
+        let bodies = super::collect_pure_bodies(&program, &pure_set, &registry);
 
         let key = super::RetKey {
             module: ModulePath(vec!["a".to_string()]),
