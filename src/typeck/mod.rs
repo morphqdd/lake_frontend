@@ -307,6 +307,9 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
                     .code("E004"),
                 );
             }
+            Some(Resolution::Record(_)) => {
+                // Constructor call validation lands in T7/T8.
+            }
             None => {
                 // Unknown name — surface as an explicit "no such callable"
                 // error.  Cheaper than waiting for codegen to fail.
