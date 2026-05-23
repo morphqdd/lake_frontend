@@ -8,12 +8,12 @@ use chumsky::{
 
 use crate::{
     api::{
-        ast::{ConstDecl, Directive, Item, Machine},
+        ast::{ConstDecl, Directive, Item, Machine, RecordDecl},
         token::Token,
     },
     parser::{
         const_item::const_item, directive::directive, helpers::TokenInput, import::import,
-        machine::machine,
+        machine::machine, record::record,
     },
 };
 
@@ -25,6 +25,7 @@ mod helpers;
 mod import;
 mod machine;
 mod pattern;
+mod record;
 
 /// Top-level parser.  Returns a flat list of `Item`s: imports, standalone
 /// directives, and machines.
@@ -34,6 +35,11 @@ mod pattern;
 /// Attaching directives to machines is left to a later semantic pass.
 pub fn program<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Vec<Spanned<Item<'src>>>, Err<Rich<'t, Token<'src>>>> {
+    let record_item = record().map(|r: Spanned<RecordDecl>| {
+        let span = r.span;
+        Item::Record(r).with_span(span)
+    });
+
     let machine_item = machine().map(|m: Spanned<Machine>| {
         let span = m.span;
         Item::Machine(m).with_span(span)
@@ -54,7 +60,7 @@ pub fn program<'t, 'src: 't>()
         Item::Const(c).with_span(span)
     });
 
-    choice((import_item, directive_item, const_item_node, machine_item))
+    choice((import_item, directive_item, const_item_node, record_item, machine_item))
         .repeated()
         .collect::<Vec<_>>()
 }
@@ -651,5 +657,72 @@ mod tests {
             assert!(matches!(elems[0].inner, Expr::Atom("ok")));
             assert!(matches!(elems[1].inner, Expr::Num("42", _)));
         });
+    }
+
+    // ── record parser helpers ────────────────────────────────────────────────
+
+    fn try_parse_one_item(src: &str) -> Result<chumsky::span::Spanned<Item<'_>>, String> {
+        let tokens = lexer()
+            .parse(src)
+            .into_result()
+            .map_err(|e| format!("lex error: {e:?}"))?;
+        let mut items = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .map_err(|e| format!("parse error: {e:?}"))?;
+        if items.is_empty() {
+            return Err("no items parsed".to_string());
+        }
+        Ok(items.remove(0))
+    }
+
+    fn parse_one_item(src: &str) -> chumsky::span::Spanned<Item<'_>> {
+        try_parse_one_item(src).expect("expected successful parse")
+    }
+
+    // ── record parser tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parses_record_declaration() {
+        let src = "Request is { method buf  path buf  body buf }";
+        let parsed = parse_one_item(src);
+        let Item::Record(rec) = &parsed.inner else { panic!("not a record: {parsed:?}") };
+        assert_eq!(rec.inner.ident.inner.0, "Request");
+        assert_eq!(rec.inner.fields.len(), 3);
+        assert_eq!(rec.inner.fields[0].inner.name.inner.0, "method");
+    }
+
+    #[test]
+    fn rejects_mixed_record_machine_body() {
+        // A body that mixes field-only items with a branch `->` must not parse
+        // as a record.  It may parse as a machine or fail entirely — both OK.
+        let src = "Bad is { x i64  y i64 -> ret i64 { ret x } }";
+        let parsed_or_err = try_parse_one_item(src);
+        match parsed_or_err {
+            Ok(chumsky::span::Spanned { inner: Item::Record(_), .. }) => {
+                panic!("mixed body must NOT parse as a record");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn rejects_empty_record_body() {
+        // `at_least(1)` on fields means an empty `{ }` must NOT be a record.
+        let src = "Empty is { }";
+        let parsed_or_err = try_parse_one_item(src);
+        match parsed_or_err {
+            Ok(chumsky::span::Spanned { inner: Item::Record(_), .. }) => {
+                panic!("empty body must NOT parse as a record");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn machine_still_parses_after_record_added() {
+        let src = "echo is { x i64 -> ret i64 { ret x } }";
+        let parsed = parse_one_item(src);
+        assert!(matches!(&parsed.inner, Item::Machine(_)));
     }
 }
