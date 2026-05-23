@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use chumsky::span::Spanned;
 
-use crate::api::ast::{Branch, Directive, Import, Item, Machine, MachineItem, Type};
+use crate::api::ast::{Branch, Directive, Ident, Import, Item, Machine, MachineItem, Type};
 use crate::error_handle::{LakeError, LakeErrors};
 use crate::loader::ParsedProgram;
 
@@ -142,6 +142,17 @@ impl<'src> MachineEntry<'src> {
     }
 }
 
+/// A `Name is { field Type ... }` record type declaration belonging to some module.
+#[derive(Debug, Clone)]
+pub struct RecordEntry<'src> {
+    pub name: &'src str,
+    pub module: ModuleId,
+    pub is_pub: bool,
+    /// Declared fields in source order; field N's offset in the tuple
+    /// ABI is N * 8 bytes (each slot is a fat-pointer-sized i64).
+    pub fields: Vec<(Spanned<Ident<'src>>, Spanned<Type<'src>>)>,
+}
+
 /// All callable items declared in a single `.lake` file, plus the local
 /// `+import` bindings that bring foreign names into scope.
 #[derive(Debug, Default)]
@@ -159,6 +170,8 @@ pub struct ModuleScope<'src> {
     pub ffi_fns: HashMap<String, Signature>,
     /// `const` declarations defined in this file, keyed by source name.
     pub consts: HashMap<&'src str, ConstEntry>,
+    /// Record type declarations defined in this file, keyed by source name.
+    pub records: HashMap<&'src str, RecordEntry<'src>>,
     /// Aliases brought into scope by `+import` lines.
     /// Key = local binding name (alias or last path segment).
     /// Value = (target module, target item's source name).
@@ -313,6 +326,9 @@ impl<'src> ProgramRegistry<'src> {
         if let Some(c) = cur.consts.get(name) {
             return Some(Resolution::Const(c));
         }
+        if let Some(r) = cur.records.get(name) {
+            return Some(Resolution::Record(r));
+        }
         if let Some(binding) = cur.imports.get(name) {
             if let Some(item) = &binding.target_item {
                 return self.resolve_in_module(binding.target_module, item);
@@ -401,6 +417,9 @@ impl<'src> ProgramRegistry<'src> {
         if let Some(c) = scope.consts.get(name) {
             return Some(Resolution::Const(c));
         }
+        if let Some(r) = scope.records.get(name) {
+            return Some(Resolution::Record(r));
+        }
         None
     }
 
@@ -452,10 +471,21 @@ impl<'src> ProgramRegistry<'src> {
             for item in &module.ast {
                 match &item.inner {
                     Item::Machine(m) => {
+                        let name = m.inner.ident.inner.0;
+                        if self.module(id).records.contains_key(name) {
+                            errors.push(tag(
+                                LakeError::new(
+                                    format!("duplicate symbol `{name}` in module"),
+                                    m.inner.ident.span,
+                                )
+                                .code("E028"),
+                            ));
+                            continue;
+                        }
                         let entry = build_machine_entry(&m.inner, id);
                         self.module_mut(id)
                             .machines
-                            .insert(m.inner.ident.inner.0, entry);
+                            .insert(name, entry);
                     }
                     Item::Directive(d) if d.inner.name.inner.0 == "ffi" => {
                         match build_ffi_signature(&d.inner) {
@@ -488,6 +518,52 @@ impl<'src> ProgramRegistry<'src> {
                                 errors.push(tag(e));
                             }
                         }
+                    }
+                    Item::Record(decl) => {
+                        let name = decl.inner.ident.inner.0;
+                        let cur = self.module(id);
+                        // Cross-namespace collisions are always errors.
+                        if cur.machines.contains_key(name)
+                            || cur.ffi_fns.contains_key(name)
+                            || cur.consts.contains_key(name)
+                        {
+                            errors.push(tag(
+                                LakeError::new(
+                                    format!("duplicate symbol `{name}` in module"),
+                                    decl.inner.ident.span,
+                                )
+                                .code("E028"),
+                            ));
+                            continue;
+                        }
+                        // populate_from is invoked twice (pre- and post-
+                        // lowering); a record from round 1 sits in
+                        // `records` when round 2 sees the same item.
+                        // Treat idempotent re-insert as a no-op; a genuine
+                        // duplicate-in-source would have been caught by
+                        // the first round.
+                        let new_fields: Vec<_> = decl.inner.fields.iter().map(|f| {
+                            (f.inner.name.clone(), f.inner.ty.clone())
+                        }).collect();
+                        if let Some(existing) = cur.records.get(name) {
+                            if existing.fields != new_fields {
+                                errors.push(tag(
+                                    LakeError::new(
+                                        format!("duplicate symbol `{name}` in module"),
+                                        decl.inner.ident.span,
+                                    )
+                                    .code("E028"),
+                                ));
+                            }
+                            continue;
+                        }
+                        let entry = RecordEntry {
+                            name,
+                            module: id,
+                            is_pub: decl.inner.vis,
+                            fields: new_fields,
+                        };
+                        self.module_mut(id).records.insert(name, entry);
                     }
                 }
             }
@@ -744,6 +820,8 @@ pub enum Resolution<'a> {
     /// Compile-time constant.  Use sites look up the entry to inline its
     /// value at codegen — never a call.
     Const(&'a ConstEntry),
+    /// Nominal record type.  Constructor lowering lands in T7/T8.
+    Record(&'a RecordEntry<'a>),
 }
 
 impl<'a> Resolution<'a> {
@@ -757,6 +835,8 @@ impl<'a> Resolution<'a> {
             // post-resolver.
             Resolution::Machine(m) => m.branches.first().map(|b| b.ret.as_str()).unwrap_or("pid"),
             Resolution::Const(c) => &c.ty,
+            // Constructor return type is the record's own name; real typing lands in T7/T8.
+            Resolution::Record(r) => r.name,
         }
     }
 }
@@ -908,6 +988,62 @@ mod tests {
             Resolution::Machine(m) => assert_eq!(m.name, "println"),
             _ => panic!("expected machine"),
         }
+    }
+
+    #[test]
+    fn registry_populates_record() {
+        let src = "Request is { method buf  path buf }";
+        let ast = parse_one(src);
+        let program = crate::loader::ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("main.lake"),
+                ast,
+            }],
+        };
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&program).expect("populate");
+        let entry = reg.module(ModuleId::ROOT).records.get("Request").expect("registered");
+        assert_eq!(entry.fields.len(), 2);
+        assert_eq!(entry.fields[0].0.inner.0, "method");
+    }
+
+    #[test]
+    fn registry_rejects_record_machine_collision_e028() {
+        let src = "Foo is { x i64 }\nFoo is { _ -> ret i64 { ret 0 } }";
+        let ast = parse_one(src);
+        let program = crate::loader::ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("main.lake"),
+                ast,
+            }],
+        };
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        let res = reg.populate_from(&program);
+        let errs: Vec<LakeError> = res.err().expect("collision must produce an error").into_iter().collect();
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E028")),
+            "expected E028, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn registry_resolves_record_by_bare_name() {
+        let src = "Request is { method buf }";
+        let ast = parse_one(src);
+        let program = crate::loader::ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("main.lake"),
+                ast,
+            }],
+        };
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&program).expect("populate");
+        let resolution = reg.resolve_bare_in(ModuleId::ROOT, "Request");
+        assert!(matches!(resolution, Some(Resolution::Record(_))));
     }
 
     #[test]

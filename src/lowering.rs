@@ -322,6 +322,9 @@ fn expr_is_pure<'src>(
                 && expr_is_pure(&r.inner, pure_machines, pure_rt, ret_machines)
         }
         Neg(inner) => expr_is_pure(&inner.inner, pure_machines, pure_rt, ret_machines),
+        RecordLiteral { fields, .. } => fields
+            .iter()
+            .all(|(_, v)| expr_is_pure(&v.inner, pure_machines, pure_rt, ret_machines)),
     }
 }
 
@@ -479,6 +482,9 @@ fn expr_contains_ret<'src>(expr: &Expr<'src>) -> bool {
             expr_contains_ret(&l.inner) || expr_contains_ret(&r.inner)
         }
         Num(_, _) | String(_, _) | Bool(_) | Unit | Atom(_) | Var(_, _) | Path(_) => false,
+        RecordLiteral { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_contains_ret(&v.inner))
+        }
     }
 }
 
@@ -1319,6 +1325,20 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             .map(|e| self.flatten_paths(e))
             .collect();
 
+        // Phase 1.a: rewrite record forms into plain tuple ops so every
+        // downstream phase sees only Tuple / TupleIndex.
+        //   * Jump { Var(record_name), args } → Tuple(args)
+        //   * RecordLiteral { name, fields }  → Tuple (declaration order)
+        //   * DotAccess { Var(bound), field } → TupleIndex when `bound`
+        //     is in scope as a record-typed variable.
+        // Must fire before inline_consts (which would otherwise see
+        // Jump nodes whose callees happen to be record names) and before
+        // inline_pure_calls (inliner expects plain Tuples at call sites).
+        let body = {
+            let mut scope: HashMap<&'src str, &'src str> = HashMap::new();
+            self.rewrite_record_forms_body(body, &mut scope)
+        };
+
         // Phase 0a: inline `const` values.  Every `Expr::Var(name, _)` whose
         // bare-name resolution lands on a `Resolution::Const(_)` is
         // replaced by the literal expression encoded by the const.
@@ -1541,6 +1561,9 @@ impl<'a, 'src> LowerCx<'a, 'src> {
     /// into a synthetic temporary binding plus one ordinary `Let`
     /// per field.  Run after const inlining so the destructured
     /// expression has already had any const folded into a literal.
+    ///
+    /// Supports arbitrary arity, wildcards (`_` — emits no binding),
+    /// and nested tuple patterns (recursed on the slot receiver).
     fn expand_let_tuple(
         &self,
         body: Vec<Spanned<Expr<'src>>>,
@@ -1566,30 +1589,88 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                         .with_span(span),
                     );
 
-                    // let <field_i> = __dst_<id>.<i>
-                    for (i, fname) in fields.into_iter().enumerate() {
-                        let receiver =
-                            Expr::Var(synth_name, Type::Unknown).with_span(span);
-                        out.push(
-                            Expr::Let {
-                                ident: fname.clone(),
-                                ty: Type::Unknown.with_span(fname.span),
-                                default: Some(Box::new(
-                                    Expr::TupleIndex {
-                                        receiver: Box::new(receiver),
-                                        index: i,
-                                    }
-                                    .with_span(span),
-                                )),
-                            }
-                            .with_span(fname.span),
-                        );
-                    }
+                    // Expand each pattern element into the output.
+                    self.expand_pat_fields(
+                        &fields,
+                        synth_name,
+                        span,
+                        &mut out,
+                    );
                 }
                 other => out.push(other.with_span(span)),
             }
         }
         out
+    }
+
+    /// Recursively expand pattern fields of a single destructure level.
+    /// `receiver_name` is the synthetic temp holding the tuple value at
+    /// this level; `out` accumulates ordinary `Let` statements.
+    fn expand_pat_fields(
+        &self,
+        fields: &[Spanned<crate::api::ast::Pattern<'src>>],
+        receiver_name: &'static str,
+        span: chumsky::span::SimpleSpan,
+        out: &mut Vec<Spanned<Expr<'src>>>,
+    ) {
+        use crate::api::ast::PatternKind;
+        for (i, pat) in fields.iter().enumerate() {
+            let receiver =
+                Expr::Var(receiver_name, Type::Unknown).with_span(span);
+            let slot = Expr::TupleIndex {
+                receiver: Box::new(receiver),
+                index: i,
+            }
+            .with_span(span);
+
+            match &pat.inner.kind {
+                PatternKind::Wildcard => {
+                    // `_` slot — emit nothing.
+                }
+                PatternKind::Var => {
+                    let name_ident = pat.inner.ident.clone();
+                    out.push(
+                        Expr::Let {
+                            ident: name_ident.clone(),
+                            ty: Type::Unknown.with_span(name_ident.span),
+                            default: Some(Box::new(slot)),
+                        }
+                        .with_span(pat.span),
+                    );
+                }
+                PatternKind::Tuple(nested) => {
+                    // Bind the slot to a fresh temp then recurse.
+                    let sub_id = self.fresh_id();
+                    let sub_name: &'static str =
+                        Box::leak(format!("__dst_{sub_id}").into_boxed_str());
+                    let sub_ident = Ident::new(sub_name).with_span(span);
+                    out.push(
+                        Expr::Let {
+                            ident: sub_ident,
+                            ty: Type::Unknown.with_span(span),
+                            default: Some(Box::new(slot)),
+                        }
+                        .with_span(span),
+                    );
+                    self.expand_pat_fields(nested, sub_name, span, out);
+                }
+                // Guards in let-position are a type-error (E031); leave the
+                // slot as a plain Var binding so typeck can reject it.
+                PatternKind::NumGuard(_)
+                | PatternKind::StrGuard(_)
+                | PatternKind::AtomGuard(_) => {
+                    let name_ident = pat.inner.ident.clone();
+                    out.push(
+                        Expr::Let {
+                            ident: name_ident.clone(),
+                            ty: Type::Unknown.with_span(name_ident.span),
+                            default: Some(Box::new(slot)),
+                        }
+                        .with_span(pat.span),
+                    );
+                }
+            }
+        }
     }
 
     fn fresh_id(&self) -> u32 {
@@ -2444,6 +2525,356 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         } else {
             self.lift_in_expr(expr, lifts)
         }
+    }
+
+    // ── Phase 1.a: record forms → tuples ──────────────────────────────────
+
+    /// Peek at an expression (BEFORE lowering) and return the record's
+    /// source name if it is:
+    ///   * `Jump { Var(name), _ }` where `name` resolves to a Record, OR
+    ///   * `RecordLiteral { name, _ }`.
+    ///
+    /// Returns `None` for any other shape.  Used by
+    /// `rewrite_record_forms_body` to populate the scope map when it
+    /// encounters a `let` binding.
+    fn infer_record_name(&self, expr: &Expr<'src>) -> Option<&'src str> {
+        match expr {
+            Expr::Jump { ident, .. } => {
+                if let Expr::Var(name, _) = &ident.inner {
+                    if matches!(
+                        self.registry.resolve_bare_in(self.module_id, name),
+                        Some(Resolution::Record(_))
+                    ) {
+                        // Return the source-level name from the AST node
+                        // (`*name` is `&'src str`), not from the registry
+                        // entry (which would give `&'a str`).
+                        return Some(name);
+                    }
+                }
+                None
+            }
+            Expr::RecordLiteral { name, .. } => Some(name.inner.0),
+            _ => None,
+        }
+    }
+
+    /// Phase 1.a body-level walker.  Processes statements in order,
+    /// maintaining a scope map from variable name → record type name so
+    /// that `Expr::DotAccess` receivers can be resolved to field indices.
+    ///
+    /// The caller passes an inherited scope (cloned from the enclosing
+    /// body) so that arm bodies can see outer bindings; modifications
+    /// inside an arm body do NOT propagate back to sibling arms.
+    fn rewrite_record_forms_body(
+        &self,
+        body: Vec<Spanned<Expr<'src>>>,
+        scope: &mut HashMap<&'src str, &'src str>,
+    ) -> Vec<Spanned<Expr<'src>>> {
+        let mut out = Vec::with_capacity(body.len());
+        for stmt in body {
+            let span = stmt.span;
+            match stmt.inner {
+                Expr::Let { ident, ty, default } => {
+                    // Peek at the original default to determine whether this
+                    // let binds a record-typed value.  We do this BEFORE
+                    // rewriting so we can read the Jump callee name / the
+                    // RecordLiteral name.  Also check an explicit declared
+                    // type on the let.
+                    let record_name: Option<&'src str> = default
+                        .as_ref()
+                        .and_then(|d| self.infer_record_name(&d.inner))
+                        .or_else(|| match &ty.inner {
+                            Type::Named(n) => {
+                                if matches!(
+                                    self.registry
+                                        .resolve_bare_in(self.module_id, n.inner.0),
+                                    Some(Resolution::Record(_))
+                                ) {
+                                    // Use the source-level name from the AST
+                                    // (n.inner.0 is &'src str).
+                                    Some(n.inner.0)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        });
+
+                    let lowered_default = default
+                        .map(|d| Box::new(self.rewrite_record_forms_expr(*d, scope)));
+
+                    if let Some(rname) = record_name {
+                        scope.insert(ident.inner.0, rname);
+                    }
+
+                    out.push(
+                        Expr::Let { ident, ty, default: lowered_default }.with_span(span),
+                    );
+                }
+                other => {
+                    out.push(
+                        self.rewrite_record_forms_expr(other.with_span(span), scope),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Phase 1.a expression-level rewriter.  Rewrites:
+    ///   * `Jump { Var(record_name), args }` → `Tuple(args)`
+    ///   * `RecordLiteral { name, fields }` → `Tuple` (declaration order)
+    ///   * `DotAccess { Var(bound_name), field }` where `scope[bound_name]`
+    ///     is a record → `TupleIndex { receiver, index }`
+    ///
+    /// Recurses into all child expressions, threading the scope as an
+    /// immutable borrow (arm bodies get their own mutable clone).
+    fn rewrite_record_forms_expr(
+        &self,
+        expr: Spanned<Expr<'src>>,
+        scope: &HashMap<&'src str, &'src str>,
+    ) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        let inner = match expr.inner {
+            // ── record constructor call → Tuple ───────────────────────
+            Expr::Jump { ident, args } => {
+                if let Expr::Var(name, _) = &ident.inner {
+                    if let Some(Resolution::Record(_)) =
+                        self.registry.resolve_bare_in(self.module_id, name)
+                    {
+                        let lowered: Vec<_> = args
+                            .into_iter()
+                            .map(|a| self.rewrite_record_forms_expr(a, scope))
+                            .collect();
+                        return Expr::Tuple(lowered).with_span(span);
+                    }
+                }
+                // Not a record ctor — recurse normally.
+                Expr::Jump {
+                    ident: Box::new(self.rewrite_record_forms_expr(*ident, scope)),
+                    args: args
+                        .into_iter()
+                        .map(|a| self.rewrite_record_forms_expr(a, scope))
+                        .collect(),
+                }
+            }
+
+            // ── named-field literal → reordered Tuple ─────────────────
+            Expr::RecordLiteral { name, fields } => {
+                let entry_fields =
+                    match self.registry.resolve_bare_in(self.module_id, name.inner.0) {
+                        Some(Resolution::Record(e)) => e.fields.clone(),
+                        _ => {
+                            // Typeck already surfaced the error; emit empty
+                            // tuple to keep the compiler running.
+                            return Expr::Tuple(vec![]).with_span(span);
+                        }
+                    };
+
+                // Recursively lower each field value first so nested
+                // record forms inside field expressions are handled.
+                let lowered_fields: Vec<(Spanned<Ident<'src>>, Spanned<Expr<'src>>)> = fields
+                    .into_iter()
+                    .map(|(fname, fval)| {
+                        (fname, self.rewrite_record_forms_expr(fval, scope))
+                    })
+                    .collect();
+
+                // Emit fields in declaration order.
+                let mut reordered: Vec<Spanned<Expr<'src>>> =
+                    Vec::with_capacity(entry_fields.len());
+                for (decl_name, _) in &entry_fields {
+                    if let Some((_, val)) = lowered_fields
+                        .iter()
+                        .find(|(n, _)| n.inner.0 == decl_name.inner.0)
+                    {
+                        reordered.push(val.clone());
+                    }
+                }
+                return Expr::Tuple(reordered).with_span(span);
+            }
+
+            // ── dot access → TupleIndex (when receiver is record-typed) ──
+            Expr::DotAccess { receiver, field } => {
+                let recv_lowered = self.rewrite_record_forms_expr(*receiver, scope);
+                // Can we resolve the receiver's record type?
+                let maybe_idx: Option<usize> = (|| {
+                    let recv_name = match &recv_lowered.inner {
+                        Expr::Var(n, _) => *n,
+                        _ => return None,
+                    };
+                    let record_ty_name = scope.get(recv_name)?;
+                    let entry = match self
+                        .registry
+                        .resolve_bare_in(self.module_id, record_ty_name)
+                    {
+                        Some(Resolution::Record(e)) => e,
+                        _ => return None,
+                    };
+                    entry
+                        .fields
+                        .iter()
+                        .position(|(d, _)| d.inner.0 == field.inner.0)
+                })();
+
+                if let Some(idx) = maybe_idx {
+                    return Expr::TupleIndex {
+                        receiver: Box::new(recv_lowered),
+                        index: idx,
+                    }
+                    .with_span(span);
+                }
+                // Receiver not a known record-typed var — leave unchanged.
+                Expr::DotAccess {
+                    receiver: Box::new(recv_lowered),
+                    field,
+                }
+            }
+
+            // ── recursive cases ───────────────────────────────────────
+            Expr::Let { ident, ty, default } => Expr::Let {
+                ident,
+                ty,
+                default: default.map(|d| {
+                    Box::new(self.rewrite_record_forms_expr(*d, scope))
+                }),
+            },
+            Expr::MethodCall { receiver, method, args } => Expr::MethodCall {
+                receiver: Box::new(self.rewrite_record_forms_expr(*receiver, scope)),
+                method,
+                args: args
+                    .into_iter()
+                    .map(|a| self.rewrite_record_forms_expr(a, scope))
+                    .collect(),
+            },
+            Expr::AtAccess { receiver, field } => Expr::AtAccess {
+                receiver: Box::new(self.rewrite_record_forms_expr(*receiver, scope)),
+                field,
+            },
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(self.rewrite_record_forms_expr(*receiver, scope)),
+                index,
+            },
+            Expr::StructInit { base, fields } => Expr::StructInit {
+                base: Box::new(self.rewrite_record_forms_expr(*base, scope)),
+                fields: fields
+                    .into_iter()
+                    .map(|f| self.rewrite_record_forms_expr(f, scope))
+                    .collect(),
+            },
+            Expr::Tuple(elems) => Expr::Tuple(
+                elems
+                    .into_iter()
+                    .map(|e| self.rewrite_record_forms_expr(e, scope))
+                    .collect(),
+            ),
+            Expr::When { cond, branches } => {
+                let cond = Box::new(self.rewrite_record_forms_expr(*cond, scope));
+                let branches = branches
+                    .into_iter()
+                    .map(|(pat, body)| {
+                        let pat = self.rewrite_record_forms_expr(pat, scope);
+                        // Each arm gets a fresh scope clone so arm-local
+                        // bindings don't bleed into sibling arms.
+                        let mut arm_scope = scope.clone();
+                        let body =
+                            self.rewrite_record_forms_body(body, &mut arm_scope);
+                        (pat, body)
+                    })
+                    .collect();
+                Expr::When { cond, branches }
+            }
+            Expr::Wait { handlers, filter } => {
+                let filter = filter
+                    .into_iter()
+                    .map(|f| self.rewrite_record_forms_expr(f, scope))
+                    .collect();
+                let handlers = handlers
+                    .into_iter()
+                    .map(|h| {
+                        let h_span = h.span;
+                        let mut br = h.inner;
+                        let mut arm_scope = scope.clone();
+                        br.body =
+                            self.rewrite_record_forms_body(br.body, &mut arm_scope);
+                        br.with_span(h_span)
+                    })
+                    .collect();
+                Expr::Wait { handlers, filter }
+            }
+            Expr::Ret(inner) => {
+                Expr::Ret(Box::new(self.rewrite_record_forms_expr(*inner, scope)))
+            }
+            Expr::Pin(inner) => {
+                Expr::Pin(Box::new(self.rewrite_record_forms_expr(*inner, scope)))
+            }
+            Expr::Neg(inner) => {
+                Expr::Neg(Box::new(self.rewrite_record_forms_expr(*inner, scope)))
+            }
+            Expr::Add(l, r) => Expr::Add(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Sub(l, r) => Expr::Sub(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Mul(l, r) => Expr::Mul(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Div(l, r) => Expr::Div(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Le(l, r) => Expr::Le(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Ge(l, r) => Expr::Ge(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Eq(l, r) => Expr::Eq(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Lt(l, r) => Expr::Lt(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Gt(l, r) => Expr::Gt(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::BAnd(l, r) => Expr::BAnd(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::BOr(l, r) => Expr::BOr(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::BXor(l, r) => Expr::BXor(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Shl(l, r) => Expr::Shl(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Shr(l, r) => Expr::Shr(
+                Box::new(self.rewrite_record_forms_expr(*l, scope)),
+                Box::new(self.rewrite_record_forms_expr(*r, scope)),
+            ),
+            Expr::Index { receiver, index } => Expr::Index {
+                receiver: Box::new(self.rewrite_record_forms_expr(*receiver, scope)),
+                index: Box::new(self.rewrite_record_forms_expr(*index, scope)),
+            },
+            // Leaf nodes: pass through unchanged.
+            other => other,
+        };
+        inner.with_span(span)
     }
 
     /// Replace every `Expr::Var(name, _)` whose bare-name resolution
@@ -4157,7 +4588,13 @@ mod tests {
     #[test]
     fn wrap_diagnostic_when_unknown_terminal() {
         let lt = Expr::LetTuple {
-            fields: vec![Ident::new("a").with_span(sp())],
+            fields: vec![
+                crate::api::ast::Pattern::new(
+                    Ident::new("a").with_span(sp()),
+                    Type::Unknown.with_span(sp()),
+                )
+                .with_span(sp()),
+            ],
             default: Box::new(num("0")),
         }
         .with_span(sp());
@@ -4193,5 +4630,196 @@ mod tests {
         );
         assert_eq!(args.len(), 2, "args = [self, 42]");
         assert!(matches!(&args[1].inner, Expr::Num("42", _)));
+    }
+
+    // ── Phase 1.a tests — record forms → tuples ───────────────────────────
+
+    /// Walk the lowered program, find machine `mname`, and return the
+    /// default expression of the first `Let` binding named `vname`.
+    fn find_let_default<'src>(
+        program: &'src crate::loader::ParsedProgram<'src>,
+        mname: &str,
+        vname: &str,
+    ) -> &'src Expr<'src> {
+        for module in &program.modules {
+            for item in &module.ast {
+                if let Item::Machine(m) = &item.inner {
+                    if m.inner.ident.inner.0 != mname {
+                        continue;
+                    }
+                    for mi in &m.inner.items {
+                        if let crate::api::ast::MachineItem::Branch(b) = &mi.inner {
+                            for stmt in &b.body {
+                                if let Expr::Let { ident, default, .. } = &stmt.inner {
+                                    if ident.inner.0 == vname {
+                                        if let Some(d) = default {
+                                            return &d.inner;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("let {vname} not found in machine {mname}");
+    }
+
+    /// `Request(\"x\" \"y\")` — positional record constructor — lowers to
+    /// a plain `Tuple` with 2 elements.
+    #[test]
+    fn lowering_record_ctor_becomes_tuple() {
+        let lowered = lower(
+            r#"Request is { a buf  b buf }
+               main is { _ -> { let r = Request("x" "y") } }"#,
+        );
+        let expr = find_let_default(&lowered, "main", "r");
+        let Expr::Tuple(elems) = expr else {
+            panic!("expected Tuple, got {:?}", expr);
+        };
+        assert_eq!(elems.len(), 2, "tuple should have 2 elements");
+    }
+
+    /// Named-field literal `Request { path = \"/\" method = \"GET\" }` must be
+    /// reordered to declaration order (`method` first, then `path`).
+    #[test]
+    fn lowering_named_literal_reorders_fields() {
+        let lowered = lower(
+            r#"Request is { method buf  path buf }
+               main is { _ -> {
+                 let r = Request { path = "/" method = "GET" }
+               } }"#,
+        );
+        let expr = find_let_default(&lowered, "main", "r");
+        let Expr::Tuple(elems) = expr else {
+            panic!("expected Tuple, got {:?}", expr);
+        };
+        assert_eq!(elems.len(), 2);
+        // Declaration order: method first, path second.
+        let Expr::String(s, _) = &elems[0].inner else {
+            panic!("first elem not a String: {:?}", elems[0].inner);
+        };
+        assert_eq!(*s, "GET", "method field must be first (declaration order)");
+    }
+
+    /// `r.path` where `r` is bound to `Request(\"GET\" \"/\")` — `path` is
+    /// field 1 in declaration order, so this must become `TupleIndex { index: 1 }`.
+    #[test]
+    fn lowering_dot_access_becomes_tuple_index() {
+        let lowered = lower(
+            r#"Request is { method buf  path buf }
+               main is { _ -> {
+                 let r = Request("GET" "/")
+                 let m = r.path
+               } }"#,
+        );
+        let expr = find_let_default(&lowered, "main", "m");
+        let Expr::TupleIndex { index, .. } = expr else {
+            panic!("expected TupleIndex, got {:?}", expr);
+        };
+        assert_eq!(*index, 1, "path is field index 1");
+    }
+
+    // ── Task 10: generalized expand_let_tuple ─────────────────────────────
+
+    /// Returns true when the lowered program contains a `let <name> = ...`
+    /// anywhere inside machine `mname` (scans all branches recursively).
+    fn has_let_in_machine(program: &crate::loader::ParsedProgram<'_>, mname: &str, name: &str) -> bool {
+        fn scan_body(body: &[chumsky::span::Spanned<Expr<'_>>], name: &str) -> bool {
+            for stmt in body {
+                if scan_expr(&stmt.inner, name) {
+                    return true;
+                }
+            }
+            false
+        }
+        fn scan_expr(expr: &Expr<'_>, name: &str) -> bool {
+            match expr {
+                Expr::Let { ident, default, .. } => {
+                    if ident.inner.0 == name {
+                        return true;
+                    }
+                    default.as_ref().map_or(false, |d| scan_expr(&d.inner, name))
+                }
+                Expr::When { cond, branches } => {
+                    scan_expr(&cond.inner, name)
+                        || branches.iter().any(|(_, b)| scan_body(b, name))
+                }
+                Expr::Wait { handlers, .. } => {
+                    handlers.iter().any(|h| scan_body(&h.inner.body, name))
+                }
+                _ => false,
+            }
+        }
+
+        for module in &program.modules {
+            for item in &module.ast {
+                if let Item::Machine(m) = &item.inner {
+                    if m.inner.ident.inner.0 != mname {
+                        continue;
+                    }
+                    for mi in &m.inner.items {
+                        if let crate::api::ast::MachineItem::Branch(b) = &mi.inner {
+                            if scan_body(&b.body, name) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `let { a b c } = r` — arity-3 destructure — must emit let-bindings
+    /// for all three names.
+    #[test]
+    fn destructure_arity_3_binds_all() {
+        let lowered = lower(
+            r#"Req is { a buf  b buf  c buf }
+               main is { _ -> {
+                 let r = Req("x" "y" "z")
+                 let { a b c } = r
+               } }"#,
+        );
+        assert!(has_let_in_machine(&lowered, "main", "a"), "expected let a");
+        assert!(has_let_in_machine(&lowered, "main", "b"), "expected let b");
+        assert!(has_let_in_machine(&lowered, "main", "c"), "expected let c");
+    }
+
+    /// `let { _ b _ } = r` — wildcard slots must produce NO let binding;
+    /// the named slot `b` must still be bound.
+    #[test]
+    fn destructure_wildcard_skips_binding() {
+        let lowered = lower(
+            r#"Req is { a buf  b buf  c buf }
+               main is { _ -> {
+                 let r = Req("x" "y" "z")
+                 let { _ b _ } = r
+               } }"#,
+        );
+        assert!(
+            !has_let_in_machine(&lowered, "main", "_"),
+            "wildcard must not emit a let binding"
+        );
+        assert!(has_let_in_machine(&lowered, "main", "b"), "expected let b");
+    }
+
+    /// `let { { x y } z } = o` — nested tuple pattern — must bind `x`, `y`,
+    /// and `z` through the synthetic sub-temps.
+    #[test]
+    fn destructure_nested_binds_through() {
+        let lowered = lower(
+            r#"Inner is { x i64  y i64 }
+               Outer is { inner Inner  z i64 }
+               main is { _ -> {
+                 let o = Outer(Inner(1 2) 3)
+                 let { { x y } z } = o
+               } }"#,
+        );
+        assert!(has_let_in_machine(&lowered, "main", "x"), "expected let x");
+        assert!(has_let_in_machine(&lowered, "main", "y"), "expected let y");
+        assert!(has_let_in_machine(&lowered, "main", "z"), "expected let z");
     }
 }

@@ -8,12 +8,12 @@ use chumsky::{
 
 use crate::{
     api::{
-        ast::{ConstDecl, Directive, Item, Machine},
+        ast::{ConstDecl, Directive, Item, Machine, RecordDecl},
         token::Token,
     },
     parser::{
         const_item::const_item, directive::directive, helpers::TokenInput, import::import,
-        machine::machine,
+        machine::machine, record::record,
     },
 };
 
@@ -25,6 +25,7 @@ mod helpers;
 mod import;
 mod machine;
 mod pattern;
+mod record;
 
 /// Top-level parser.  Returns a flat list of `Item`s: imports, standalone
 /// directives, and machines.
@@ -34,6 +35,11 @@ mod pattern;
 /// Attaching directives to machines is left to a later semantic pass.
 pub fn program<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Vec<Spanned<Item<'src>>>, Err<Rich<'t, Token<'src>>>> {
+    let record_item = record().map(|r: Spanned<RecordDecl>| {
+        let span = r.span;
+        Item::Record(r).with_span(span)
+    });
+
     let machine_item = machine().map(|m: Spanned<Machine>| {
         let span = m.span;
         Item::Machine(m).with_span(span)
@@ -54,7 +60,7 @@ pub fn program<'t, 'src: 't>()
         Item::Const(c).with_span(span)
     });
 
-    choice((import_item, directive_item, const_item_node, machine_item))
+    choice((import_item, directive_item, const_item_node, record_item, machine_item))
         .repeated()
         .collect::<Vec<_>>()
 }
@@ -65,7 +71,7 @@ mod tests {
 
     use crate::{
         api::{
-            ast::{Directive, Ident, Item, Pattern, Type},
+            ast::{Directive, Ident, Item, Pattern, PatternKind, Type},
             expr::Expr,
         },
         lexer::lexer,
@@ -519,8 +525,8 @@ mod tests {
                     panic!("expected LetTuple, got {expr:?}")
                 };
                 assert_eq!(fields.len(), 2);
-                assert_eq!(fields[0].inner, Ident::new("a"));
-                assert_eq!(fields[1].inner, Ident::new("b"));
+                assert_eq!(fields[0].inner.ident.inner, Ident::new("a"));
+                assert_eq!(fields[1].inner.ident.inner, Ident::new("b"));
                 assert!(matches!(default.inner, Expr::Tuple(_)));
             },
         );
@@ -651,5 +657,187 @@ mod tests {
             assert!(matches!(elems[0].inner, Expr::Atom("ok")));
             assert!(matches!(elems[1].inner, Expr::Num("42", _)));
         });
+    }
+
+    // ── expr parser helpers ─────────────────────────────────────────────────
+
+    fn try_parse_one_expr(src: &str) -> Result<chumsky::span::Spanned<Expr<'_>>, String> {
+        let tokens = lexer()
+            .parse(src)
+            .into_result()
+            .map_err(|e| format!("lex error: {e:?}"))?;
+        crate::parser::expr::expr()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .map_err(|e| format!("parse error: {e:?}"))
+    }
+
+    fn parse_one_expr(src: &str) -> chumsky::span::Spanned<Expr<'_>> {
+        try_parse_one_expr(src).expect("expected successful parse")
+    }
+
+    // ── record literal tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parses_record_literal() {
+        let src = r#"Request { method = "GET"  path = "/" }"#;
+        let parsed = parse_one_expr(src);
+        let Expr::RecordLiteral { name, fields } = parsed.inner else {
+            panic!("not a literal: {:?}", parsed)
+        };
+        assert_eq!(name.inner.0, "Request");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0.inner.0, "method");
+    }
+
+    #[test]
+    fn record_literal_does_not_collide_with_jump() {
+        // `Foo(args)` is a Jump, NOT a literal — confirm
+        let src = "Foo(1 2)";
+        let parsed = parse_one_expr(src);
+        assert!(matches!(parsed.inner, Expr::Jump { .. }));
+    }
+
+    #[test]
+    fn record_literal_does_not_collide_with_bare_var() {
+        let src = "Foo";
+        let parsed = parse_one_expr(src);
+        assert!(matches!(parsed.inner, Expr::Var(_, _)));
+    }
+
+    #[test]
+    fn rejects_empty_record_literal() {
+        let src = "Empty { }";
+        // Should EITHER not parse as a literal OR error out.
+        let parsed_or_err = try_parse_one_expr(src);
+        match parsed_or_err {
+            Ok(p) if matches!(p.inner, Expr::RecordLiteral { .. }) => {
+                panic!("empty literal must not parse as RecordLiteral");
+            }
+            _ => {}
+        }
+    }
+
+    // ── record parser helpers ────────────────────────────────────────────────
+
+    fn try_parse_one_item(src: &str) -> Result<chumsky::span::Spanned<Item<'_>>, String> {
+        let tokens = lexer()
+            .parse(src)
+            .into_result()
+            .map_err(|e| format!("lex error: {e:?}"))?;
+        let mut items = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .map_err(|e| format!("parse error: {e:?}"))?;
+        if items.is_empty() {
+            return Err("no items parsed".to_string());
+        }
+        Ok(items.remove(0))
+    }
+
+    fn parse_one_item(src: &str) -> chumsky::span::Spanned<Item<'_>> {
+        try_parse_one_item(src).expect("expected successful parse")
+    }
+
+    // ── record parser tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parses_record_declaration() {
+        let src = "Request is { method buf  path buf  body buf }";
+        let parsed = parse_one_item(src);
+        let Item::Record(rec) = &parsed.inner else { panic!("not a record: {parsed:?}") };
+        assert_eq!(rec.inner.ident.inner.0, "Request");
+        assert_eq!(rec.inner.fields.len(), 3);
+        assert_eq!(rec.inner.fields[0].inner.name.inner.0, "method");
+    }
+
+    #[test]
+    fn rejects_mixed_record_machine_body() {
+        // A body that mixes field-only items with a branch `->` must not parse
+        // as a record.  It may parse as a machine or fail entirely — both OK.
+        let src = "Bad is { x i64  y i64 -> ret i64 { ret x } }";
+        let parsed_or_err = try_parse_one_item(src);
+        match parsed_or_err {
+            Ok(chumsky::span::Spanned { inner: Item::Record(_), .. }) => {
+                panic!("mixed body must NOT parse as a record");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn rejects_empty_record_body() {
+        // `at_least(1)` on fields means an empty `{ }` must NOT be a record.
+        let src = "Empty is { }";
+        let parsed_or_err = try_parse_one_item(src);
+        match parsed_or_err {
+            Ok(chumsky::span::Spanned { inner: Item::Record(_), .. }) => {
+                panic!("empty body must NOT parse as a record");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn machine_still_parses_after_record_added() {
+        let src = "echo is { x i64 -> ret i64 { ret x } }";
+        let parsed = parse_one_item(src);
+        assert!(matches!(&parsed.inner, Item::Machine(_)));
+    }
+
+    // ── tuple pattern helpers ────────────────────────────────────────────────
+
+    fn parse_one_pattern(src: &str) -> chumsky::span::Spanned<Pattern<'_>> {
+        parse_pattern(src).expect("expected successful parse")
+    }
+
+    // ── tuple pattern tests (#055) ───────────────────────────────────────────
+
+    #[test]
+    fn parses_arity_2_tuple_pattern() {
+        let src = "{ a b }";
+        let p = parse_one_pattern(src);
+        let PatternKind::Tuple(elems) = &p.inner.kind else {
+            panic!("not a tuple: {:?}", p)
+        };
+        assert_eq!(elems.len(), 2);
+    }
+
+    #[test]
+    fn parses_wildcard_in_tuple_pattern() {
+        let src = "{ _ x _ }";
+        let p = parse_one_pattern(src);
+        let PatternKind::Tuple(elems) = &p.inner.kind else {
+            panic!()
+        };
+        assert_eq!(elems.len(), 3);
+        assert!(matches!(elems[0].inner.kind, PatternKind::Wildcard));
+        assert!(matches!(elems[1].inner.kind, PatternKind::Var));
+        assert!(matches!(elems[2].inner.kind, PatternKind::Wildcard));
+    }
+
+    #[test]
+    fn parses_nested_tuple_pattern() {
+        let src = "{ a { b c } _ }";
+        let p = parse_one_pattern(src);
+        let PatternKind::Tuple(outer) = &p.inner.kind else {
+            panic!()
+        };
+        assert_eq!(outer.len(), 3);
+        assert!(matches!(outer[1].inner.kind, PatternKind::Tuple(_)));
+    }
+
+    #[test]
+    fn parses_atom_in_tuple_pattern() {
+        let src = "{ :ok x }";
+        let p = parse_one_pattern(src);
+        let PatternKind::Tuple(elems) = &p.inner.kind else {
+            panic!()
+        };
+        assert!(!matches!(
+            elems[0].inner.kind,
+            PatternKind::Var | PatternKind::Wildcard
+        ));
+        assert!(matches!(elems[1].inner.kind, PatternKind::Var));
     }
 }

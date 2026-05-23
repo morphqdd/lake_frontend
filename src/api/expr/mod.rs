@@ -2,7 +2,7 @@ use std::hash::Hash;
 
 use chumsky::span::Spanned;
 
-use crate::api::ast::{Branch, Ident, Type};
+use crate::api::ast::{Branch, Ident, Pattern, Type};
 
 /// Parse an integer literal slice — `42`, `0xff`, `0b1010`.
 ///
@@ -104,7 +104,7 @@ pub enum Expr<'src> {
     /// (`let a = __dst_<id>.0`, `let b = __dst_<id>.1`, …).  Resolver
     /// and codegen never see this variant.
     LetTuple {
-        fields: Vec<Spanned<Ident<'src>>>,
+        fields: Vec<Spanned<Pattern<'src>>>,
         default: Box<Spanned<Self>>,
     },
 
@@ -167,6 +167,14 @@ pub enum Expr<'src> {
     Shl(Box<Spanned<Self>>, Box<Spanned<Self>>),
     /// Logical / unsigned right shift (Cranelift `ushr`).
     Shr(Box<Spanned<Self>>, Box<Spanned<Self>>),
+
+    // ── Records ───────────────────────────────────────────────────────────
+    /// `Name { field = expr ... }` — named-field constructor.
+    /// Lowering reorders to declaration order and emits Tuple.
+    RecordLiteral {
+        name: Spanned<Ident<'src>>,
+        fields: Vec<(Spanned<Ident<'src>>, Spanned<Self>)>,
+    },
 
 }
 
