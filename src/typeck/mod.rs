@@ -197,6 +197,159 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
             // Atoms are bare literal tags — nothing to validate at this layer.
             Expr::Atom(_) => {}
 
+            // ── record checks ────────────────────────────────────────────────
+
+            Expr::RecordLiteral { name, fields } => {
+                let resolution = self.registry.resolve_bare_in(self.current_module, name.inner.0);
+                let Some(Resolution::Record(entry)) = resolution else {
+                    self.errors.push(
+                        LakeError::new(
+                            format!("`{}` is not a record", name.inner.0),
+                            name.span,
+                        )
+                        .code("E004"),
+                    );
+                    return;
+                };
+                // Clone what we need out of the borrow so we can later call
+                // self.expr_type_str without a live borrow on self.registry.
+                let entry_name = entry.name.to_string();
+                let decl_fields: Vec<(String, String)> = entry
+                    .fields
+                    .iter()
+                    .map(|(n, t)| (n.inner.0.to_string(), t.inner.to_string()))
+                    .collect();
+
+                // E024: duplicate field in literal.
+                let mut seen = std::collections::HashSet::new();
+                for (fname, _) in fields.iter() {
+                    if !seen.insert(fname.inner.0) {
+                        self.errors.push(
+                            LakeError::new(
+                                format!(
+                                    "duplicate field `{}` in `{}` literal",
+                                    fname.inner.0, entry_name,
+                                ),
+                                fname.span,
+                            )
+                            .code("E024"),
+                        );
+                    }
+                }
+
+                // E023: unknown field.
+                for (fname, _) in fields.iter() {
+                    if !decl_fields.iter().any(|(d, _)| d == fname.inner.0) {
+                        self.errors.push(
+                            LakeError::new(
+                                format!(
+                                    "unknown field `{}` on record `{}`",
+                                    fname.inner.0, entry_name,
+                                ),
+                                fname.span,
+                            )
+                            .code("E023"),
+                        );
+                    }
+                }
+
+                // E022: missing field.
+                for (decl_name, _) in &decl_fields {
+                    if !fields.iter().any(|(f, _)| f.inner.0 == decl_name.as_str()) {
+                        self.errors.push(
+                            LakeError::new(
+                                format!(
+                                    "missing field `{}` in `{}` literal",
+                                    decl_name, entry_name,
+                                ),
+                                span,
+                            )
+                            .code("E022"),
+                        );
+                    }
+                }
+
+                // E021: per-field type mismatch.
+                for (fname, fval) in fields.iter() {
+                    let arg_ty = self.expr_type_str(&fval.inner);
+                    if let Some((_, decl_ty_str)) =
+                        decl_fields.iter().find(|(d, _)| d == fname.inner.0)
+                    {
+                        if !types_compatible(decl_ty_str, &arg_ty) {
+                            self.errors.push(
+                                LakeError::new(
+                                    format!(
+                                        "field `{}` of `{}` expects {}, got {}",
+                                        fname.inner.0, entry_name, decl_ty_str, arg_ty,
+                                    ),
+                                    fval.span,
+                                )
+                                .code("E021"),
+                            );
+                        }
+                    }
+                }
+
+                // Recurse into field values.
+                for (_, fval) in fields.iter() {
+                    self.check_expr(machine_name, scope, &fval.inner, fval.span);
+                }
+            }
+
+            Expr::DotAccess { receiver, field } => {
+                self.check_expr(machine_name, scope, &receiver.inner, receiver.span);
+                // E025: unknown field on record type.
+                let recv_ty_str = self.expr_type_str(&receiver.inner);
+                let resolution = self.registry.resolve_bare_in(self.current_module, &recv_ty_str);
+                if let Some(Resolution::Record(entry)) = resolution {
+                    if !entry.fields.iter().any(|(d, _)| d.inner.0 == field.inner.0) {
+                        let rec_name = entry.name.to_string();
+                        self.errors.push(
+                            LakeError::new(
+                                format!(
+                                    "unknown field `{}` on record `{}`",
+                                    field.inner.0, rec_name,
+                                ),
+                                field.span,
+                            )
+                            .code("E025"),
+                        );
+                    }
+                }
+            }
+
+            Expr::LetTuple { fields, default } => {
+                self.check_expr(machine_name, scope, &default.inner, default.span);
+                // E026: destructure arity mismatch.
+                // Resolve the receiver's type via scope first (the resolver may
+                // not have rewritten the Var's inline annotation yet if LetTuple
+                // fell through the resolver's catch-all).
+                let recv_ty_str = match &default.inner {
+                    Expr::Var(name, ty) if is_unknown(ty) => {
+                        scope.get(name).map(|t| t.to_string()).unwrap_or_else(|| "?".to_string())
+                    }
+                    other => self.expr_type_str(other),
+                };
+                let resolution = self.registry.resolve_bare_in(self.current_module, &recv_ty_str);
+                if let Some(Resolution::Record(entry)) = resolution {
+                    if fields.len() != entry.fields.len() {
+                        let rec_name = entry.name.to_string();
+                        self.errors.push(
+                            LakeError::new(
+                                format!(
+                                    "destructure of `{}` has {} binder(s), but the record has {} field(s)",
+                                    rec_name,
+                                    fields.len(),
+                                    entry.fields.len(),
+                                ),
+                                span,
+                            )
+                            .code("E026"),
+                        );
+                    }
+                }
+            }
+
             _ => {}
         }
     }
@@ -307,8 +460,40 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
                     .code("E004"),
                 );
             }
-            Some(Resolution::Record(_)) => {
-                // Constructor call validation lands in T7/T8.
+            Some(Resolution::Record(entry)) => {
+                // E020: ctor arity mismatch.
+                if arg_types.len() != entry.fields.len() {
+                    self.errors.push(
+                        LakeError::new(
+                            format!(
+                                "`{display_name}` expects {} field(s), got {}",
+                                entry.fields.len(),
+                                arg_types.len(),
+                            ),
+                            call_span,
+                        )
+                        .code("E020"),
+                    );
+                    return;
+                }
+                // E021: per-field type mismatch.
+                for ((field_name, decl_ty), arg_ty) in entry.fields.iter().zip(arg_types.iter()) {
+                    let field_ty_str = decl_ty.inner.to_string();
+                    if !types_compatible(&field_ty_str, arg_ty) {
+                        self.errors.push(
+                            LakeError::new(
+                                format!(
+                                    "field `{}` of `{display_name}` expects {}, got {}",
+                                    field_name.inner.0,
+                                    field_ty_str,
+                                    arg_ty,
+                                ),
+                                call_span,
+                            )
+                            .code("E021"),
+                        );
+                    }
+                }
             }
             None => {
                 // Unknown name — surface as an explicit "no such callable"
@@ -918,5 +1103,100 @@ caller is {
         "#;
         let errs = check(src);
         assert!(errs.is_empty(), "unexpected: {errs:?}");
+    }
+
+    // ── record diagnostics E020..E027 ─────────────────────────────────────────
+
+    /// Run parse → populate → resolve → typecheck and return the full error
+    /// list (with codes).  Does not run lowering, so `LetTuple` is still
+    /// visible to typeck.
+    fn typeck_errors(src: &str) -> Vec<crate::error_handle::LakeError> {
+        run_pipeline(src)
+    }
+
+    #[test]
+    fn record_ctor_arity_mismatch_e020() {
+        let errs = typeck_errors(
+            "Request is { a buf  b buf  c buf }\nmain is { _ -> { let r = Request(\"x\" \"y\") } }",
+        );
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E020")),
+            "expected E020, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn record_ctor_field_type_mismatch_e021() {
+        let errs = typeck_errors(
+            "Request is { method buf }\nmain is { _ -> { let r = Request(1) } }",
+        );
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E021")),
+            "expected E021, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn record_named_missing_field_e022() {
+        let errs = typeck_errors(
+            "Request is { a buf  b buf }\nmain is { _ -> { let r = Request { a = \"x\" } } }",
+        );
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E022")),
+            "expected E022, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn record_named_unknown_field_e023() {
+        let errs = typeck_errors(
+            "Request is { a buf }\nmain is { _ -> { let r = Request { a = \"x\"\nb = \"y\" } } }",
+        );
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E023")),
+            "expected E023, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn record_named_duplicate_field_e024() {
+        let errs = typeck_errors(
+            "Request is { a buf }\nmain is { _ -> { let r = Request { a = \"x\"\na = \"y\" } } }",
+        );
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E024")),
+            "expected E024, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn record_dot_unknown_field_e025() {
+        // `r.nope` where Request only has field `a`.
+        let errs = typeck_errors(
+            "Request is { a buf }\nmain is { _ -> { let r = Request(\"x\")\nlet m = r.nope } }",
+        );
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E025")),
+            "expected E025, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn destructure_arity_mismatch_e026() {
+        // Record has 3 fields; destructure binds only 2.
+        let errs = typeck_errors(
+            "Req is { a buf  b buf  c buf }\nmain is { _ -> { let r = Req(\"\" \"\" \"\")\nlet { a b } = r } }",
+        );
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E026")),
+            "expected E026, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
     }
 }
