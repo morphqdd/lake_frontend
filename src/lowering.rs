@@ -1282,7 +1282,28 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             }
         }
 
-        let body = self.lower_body(body, is_ret_branch);
+        // Phase 1.a init: branch parameters whose declared type is a
+        // record become record-typed locals so `srv.port` inside the
+        // body lowers to TupleIndex.  Without this, the rewrite walker
+        // started with an empty scope and missed record-typed
+        // parameters (the let-binding fallback never fires for
+        // patterns).  See #58 followup.
+        let mut record_param_scope: HashMap<&'src str, &'src str> = HashMap::new();
+        for pat in &patterns {
+            if pat.inner.is_wildcard() || pat.inner.is_literal_guard() {
+                continue;
+            }
+            if let Type::Named(n) = &pat.inner.ty.inner {
+                if matches!(
+                    self.registry.resolve_bare_in(self.module_id, n.inner.0),
+                    Some(Resolution::Record(_))
+                ) {
+                    record_param_scope.insert(pat.inner.ident.inner.0, n.inner.0);
+                }
+            }
+        }
+
+        let body = self.lower_body_with_scope(body, is_ret_branch, record_param_scope);
 
         Branch::new(branch.label, patterns, branch.ret_ty, body)
     }
@@ -1296,7 +1317,20 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         body: Vec<Spanned<Expr<'src>>>,
         is_ret_branch: bool,
     ) -> Vec<Spanned<Expr<'src>>> {
-        self.lower_body_impl(body, is_ret_branch, /* is_outermost */ true)
+        self.lower_body_impl(body, is_ret_branch, /* is_outermost */ true, HashMap::new())
+    }
+
+    /// Like [`lower_body`] but seeds the Phase 1.a record-scope with
+    /// the caller-supplied param map.  Used by [`lower_branch`] so
+    /// record-typed branch parameters resolve in subsequent
+    /// DotAccess sites.
+    fn lower_body_with_scope(
+        &self,
+        body: Vec<Spanned<Expr<'src>>>,
+        is_ret_branch: bool,
+        init_scope: HashMap<&'src str, &'src str>,
+    ) -> Vec<Spanned<Expr<'src>>> {
+        self.lower_body_impl(body, is_ret_branch, /* is_outermost */ true, init_scope)
     }
 
     /// Internal worker — `is_outermost` controls whether Phase 3 (tail
@@ -1311,6 +1345,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         body: Vec<Spanned<Expr<'src>>>,
         is_ret_branch: bool,
         is_outermost: bool,
+        init_record_scope: HashMap<&'src str, &'src str>,
     ) -> Vec<Spanned<Expr<'src>>> {
         // Phase -1: collapse module-qualified Path callees into bare
         // Var references.  Backend's jump_expr only knows how to call
@@ -1335,7 +1370,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         // Jump nodes whose callees happen to be record names) and before
         // inline_pure_calls (inliner expects plain Tuples at call sites).
         let body = {
-            let mut scope: HashMap<&'src str, &'src str> = HashMap::new();
+            let mut scope: HashMap<&'src str, &'src str> = init_record_scope;
             self.rewrite_record_forms_body(body, &mut scope)
         };
 
@@ -1490,7 +1525,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                     .into_iter()
                     .map(|(pat, body)| {
                         let pat = self.lower_arm_bodies_in_expr(pat, is_ret_branch);
-                        let body = self.lower_body_impl(body, is_ret_branch, false);
+                        let body = self.lower_body_impl(body, is_ret_branch, false, HashMap::new());
                         (pat, body)
                     })
                     .collect();
@@ -1506,7 +1541,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                     .map(|h| {
                         let h_span = h.span;
                         let mut br = h.inner;
-                        br.body = self.lower_body_impl(br.body, is_ret_branch, false);
+                        br.body = self.lower_body_impl(br.body, is_ret_branch, false, HashMap::new());
                         br.with_span(h_span)
                     })
                     .collect();
