@@ -522,10 +522,10 @@ impl<'src> ProgramRegistry<'src> {
                     Item::Record(decl) => {
                         let name = decl.inner.ident.inner.0;
                         let cur = self.module(id);
+                        // Cross-namespace collisions are always errors.
                         if cur.machines.contains_key(name)
                             || cur.ffi_fns.contains_key(name)
                             || cur.consts.contains_key(name)
-                            || cur.records.contains_key(name)
                         {
                             errors.push(tag(
                                 LakeError::new(
@@ -536,13 +536,32 @@ impl<'src> ProgramRegistry<'src> {
                             ));
                             continue;
                         }
+                        // populate_from is invoked twice (pre- and post-
+                        // lowering); a record from round 1 sits in
+                        // `records` when round 2 sees the same item.
+                        // Treat idempotent re-insert as a no-op; a genuine
+                        // duplicate-in-source would have been caught by
+                        // the first round.
+                        let new_fields: Vec<_> = decl.inner.fields.iter().map(|f| {
+                            (f.inner.name.clone(), f.inner.ty.clone())
+                        }).collect();
+                        if let Some(existing) = cur.records.get(name) {
+                            if existing.fields != new_fields {
+                                errors.push(tag(
+                                    LakeError::new(
+                                        format!("duplicate symbol `{name}` in module"),
+                                        decl.inner.ident.span,
+                                    )
+                                    .code("E028"),
+                                ));
+                            }
+                            continue;
+                        }
                         let entry = RecordEntry {
                             name,
                             module: id,
                             is_pub: decl.inner.vis,
-                            fields: decl.inner.fields.iter().map(|f| {
-                                (f.inner.name.clone(), f.inner.ty.clone())
-                            }).collect(),
+                            fields: new_fields,
                         };
                         self.module_mut(id).records.insert(name, entry);
                     }
