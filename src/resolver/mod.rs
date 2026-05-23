@@ -714,6 +714,59 @@ mod tests {
         );
     }
 
+    /// Regression: declared `{i64 buf}` type on a let binding must flow into scope
+    /// so that `.N` indexing on the bound variable resolves to the declared field
+    /// types rather than `Unknown`.  Without the re-bind after default inference the
+    /// scope entry stayed `Unknown` and r.0 / r.1 both resolved to `Unknown`.
+    /// See docs/state/bugs/tuple_field_atom_assumption.md in the outer repo.
+    #[test]
+    fn let_struct_annotation_propagates_to_tuple_index() {
+        // Explicit annotation: `let r {i64 buf} = { 1 "x" }`.
+        // The declared type must win; r.0 → i64, r.1 → buf.
+        let body = first_branch_body(r#"m is { _ -> { let r {i64 buf} = { 1 "x" } r.0 r.1 } }"#);
+
+        // body[0] is the let — confirm declared type is preserved.
+        let Expr::Let { ty: let_ty, .. } = &body[0] else {
+            panic!("expected Let, got {:?}", body[0])
+        };
+        assert!(
+            matches!(&let_ty.inner, Type::Struct(_)),
+            "expected Struct on let ty, got {:?}", let_ty.inner
+        );
+
+        // body[1] is `r.0` — receiver must carry {i64 buf} after resolution.
+        let Expr::TupleIndex { receiver: recv0, index: idx0 } = &body[1] else {
+            panic!("expected TupleIndex for r.0, got {:?}", body[1])
+        };
+        assert_eq!(*idx0, 0);
+        let Expr::Var(_, ty0) = &recv0.inner else {
+            panic!("expected Var inside r.0 receiver, got {:?}", recv0.inner)
+        };
+        let Type::Struct(fields0) = ty0 else {
+            panic!("expected Struct in resolved r for r.0, got {:?}", ty0)
+        };
+        assert!(
+            matches!(&fields0[0].inner, Type::Named(i) if i.inner == Ident::new("i64")),
+            "expected r.0 field type = i64, got {:?}", fields0[0].inner
+        );
+
+        // body[2] is `r.1` — field 1 must resolve to buf.
+        let Expr::TupleIndex { receiver: recv1, index: idx1 } = &body[2] else {
+            panic!("expected TupleIndex for r.1, got {:?}", body[2])
+        };
+        assert_eq!(*idx1, 1);
+        let Expr::Var(_, ty1) = &recv1.inner else {
+            panic!("expected Var inside r.1 receiver, got {:?}", recv1.inner)
+        };
+        let Type::Struct(fields1) = ty1 else {
+            panic!("expected Struct in resolved r for r.1, got {:?}", ty1)
+        };
+        assert!(
+            matches!(&fields1[1].inner, Type::Named(i) if i.inner == Ident::new("buf")),
+            "expected r.1 field type = buf, got {:?}", fields1[1].inner
+        );
+    }
+
     #[test]
     fn resolves_var_in_wait_handler() {
         // `n` from the outer branch pattern should be accessible inside wait handler body
