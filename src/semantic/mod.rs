@@ -298,7 +298,7 @@ impl SemanticAnalyzer {
                 Item::Const(_) => {
                     // C3 will register const symbols here.  Placeholder.
                 }
-                Item::Import(_) => {}
+                Item::Import(_) | Item::Record(_) => {}
             }
         }
     }
@@ -315,6 +315,7 @@ impl<'src> Visit<'src> for SemanticAnalyzer {
                 // identifier resolution needed here.  Symbol registration
                 // belongs to C3 (resolver pass).
             }
+            Item::Record(_) => {}
         }
     }
 

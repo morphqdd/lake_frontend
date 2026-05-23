@@ -322,6 +322,9 @@ fn expr_is_pure<'src>(
                 && expr_is_pure(&r.inner, pure_machines, pure_rt, ret_machines)
         }
         Neg(inner) => expr_is_pure(&inner.inner, pure_machines, pure_rt, ret_machines),
+        RecordLiteral { fields, .. } => fields
+            .iter()
+            .all(|(_, v)| expr_is_pure(&v.inner, pure_machines, pure_rt, ret_machines)),
     }
 }
 
@@ -479,6 +482,9 @@ fn expr_contains_ret<'src>(expr: &Expr<'src>) -> bool {
             expr_contains_ret(&l.inner) || expr_contains_ret(&r.inner)
         }
         Num(_, _) | String(_, _) | Bool(_) | Unit | Atom(_) | Var(_, _) | Path(_) => false,
+        RecordLiteral { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_contains_ret(&v.inner))
+        }
     }
 }
 

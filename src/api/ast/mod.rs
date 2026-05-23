@@ -315,6 +315,22 @@ impl<'src> Directive<'src> {
     }
 }
 
+/// Named field in a record declaration: `name Type`.
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub struct RecordField<'src> {
+    pub name: Spanned<Ident<'src>>,
+    pub ty: Spanned<Type<'src>>,
+}
+
+/// `[pub] record Name { field Type ... }` — nominal record type declaration.
+// See docs/state/features/058_record_via_is.md
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub struct RecordDecl<'src> {
+    pub vis: bool,
+    pub ident: Spanned<Ident<'src>>,
+    pub fields: Vec<Spanned<RecordField<'src>>>,
+}
+
 /// A top-level item in a Lake program.  These constructs only appear at the
 /// program root, never as values inside an expression body.
 #[derive(Debug, PartialEq, PartialOrd, Clone)]
@@ -329,6 +345,8 @@ pub enum Item<'src> {
     /// RHS is restricted to literal expressions (Num/String/Bool); inlined at
     /// every use-site, no runtime cost.
     Const(Spanned<ConstDecl<'src>>),
+    /// `[pub] record Name { field Type ... }` — nominal record type.
+    Record(Spanned<RecordDecl<'src>>),
 }
 
 /// `[pub] const NAME = <literal>`.

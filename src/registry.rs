@@ -489,6 +489,9 @@ impl<'src> ProgramRegistry<'src> {
                             }
                         }
                     }
+                    Item::Record(_) => {
+                        // T7: record type registration not yet implemented.
+                    }
                 }
             }
         }

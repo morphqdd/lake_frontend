@@ -49,7 +49,7 @@ pub fn walk_item<'src, V: Visit<'src> + ?Sized>(v: &mut V, item: &Spanned<Item<'
     match &item.inner {
         Item::Machine(m) => v.visit_machine(m),
         Item::Const(c) => v.visit_expr(&c.inner.value),
-        Item::Import(_) | Item::Directive(_) => {}
+        Item::Import(_) | Item::Directive(_) | Item::Record(_) => {}
     }
 }
 
@@ -148,5 +148,10 @@ pub fn walk_expr<'src, V: Visit<'src> + ?Sized>(v: &mut V, expr: &Spanned<Expr<'
         | Expr::Bool(_)
         | Expr::Atom(_)
         | Expr::Unit => {}
+        Expr::RecordLiteral { fields, .. } => {
+            for (_, val) in fields {
+                v.visit_expr(val);
+            }
+        }
     }
 }

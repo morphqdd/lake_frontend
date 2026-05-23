@@ -168,6 +168,14 @@ pub enum Expr<'src> {
     /// Logical / unsigned right shift (Cranelift `ushr`).
     Shr(Box<Spanned<Self>>, Box<Spanned<Self>>),
 
+    // ── Records ───────────────────────────────────────────────────────────
+    /// `Name { field = expr ... }` — named-field constructor.
+    /// Lowering reorders to declaration order and emits Tuple.
+    RecordLiteral {
+        name: Spanned<Ident<'src>>,
+        fields: Vec<(Spanned<Ident<'src>>, Spanned<Self>)>,
+    },
+
 }
 
 impl Hash for Expr<'_> {
