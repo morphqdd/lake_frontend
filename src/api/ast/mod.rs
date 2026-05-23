@@ -1,6 +1,6 @@
 use std::{cell::RefCell, hash::Hash, rc::Rc};
 
-use chumsky::span::Spanned;
+use chumsky::span::{SimpleSpan, SpanWrap, Spanned};
 
 use crate::api::expr::Expr;
 
@@ -129,6 +129,12 @@ pub enum PatternKind<'src> {
     /// content; needed because string content is indistinguishable from a
     /// normal ident once the surrounding quotes are stripped.
     StrGuard(&'src str),
+    /// `:ok`, `:err` — atom guard.  Matches when the argument equals the
+    /// interned atom with this name.
+    AtomGuard(&'src str),
+    /// `{ a b _ }` — tuple destructure.  Each element is a sub-pattern.
+    /// See docs/state/features/058_records.md for lowering plan.
+    Tuple(Vec<Spanned<Pattern<'src>>>),
 }
 
 /// A branch parameter: `n i32`, `_`, `0 i64`, `"hello" str`
@@ -174,6 +180,30 @@ impl<'src> Pattern<'src> {
             ident,
             ty,
             kind: PatternKind::StrGuard(s),
+        }
+    }
+
+    /// Build an atom-guard pattern: `:ok`, `:err`, etc.
+    /// `name` is the atom identifier (without the leading `:`).
+    pub fn new_atom_guard(name: &'src str, span: SimpleSpan) -> Self {
+        let ident = Ident::new("__atom_guard").with_span(span);
+        let ty = Type::Unit.with_span(span);
+        Self {
+            ident,
+            ty,
+            kind: PatternKind::AtomGuard(name),
+        }
+    }
+
+    /// Build a tuple-destructure pattern: `{ a b _ }`.
+    /// `ident` / `ty` are synthetic placeholders; only `kind` is meaningful.
+    pub fn new_tuple(elems: Vec<Spanned<Pattern<'src>>>, span: SimpleSpan) -> Self {
+        let ident = Ident::new("__tuple_pat").with_span(span);
+        let ty = Type::Unit.with_span(span);
+        Self {
+            ident,
+            ty,
+            kind: PatternKind::Tuple(elems),
         }
     }
 

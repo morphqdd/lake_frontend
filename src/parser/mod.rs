@@ -71,7 +71,7 @@ mod tests {
 
     use crate::{
         api::{
-            ast::{Directive, Ident, Item, Pattern, Type},
+            ast::{Directive, Ident, Item, Pattern, PatternKind, Type},
             expr::Expr,
         },
         lexer::lexer,
@@ -783,5 +783,61 @@ mod tests {
         let src = "echo is { x i64 -> ret i64 { ret x } }";
         let parsed = parse_one_item(src);
         assert!(matches!(&parsed.inner, Item::Machine(_)));
+    }
+
+    // ── tuple pattern helpers ────────────────────────────────────────────────
+
+    fn parse_one_pattern(src: &str) -> chumsky::span::Spanned<Pattern<'_>> {
+        parse_pattern(src).expect("expected successful parse")
+    }
+
+    // ── tuple pattern tests (#055) ───────────────────────────────────────────
+
+    #[test]
+    fn parses_arity_2_tuple_pattern() {
+        let src = "{ a b }";
+        let p = parse_one_pattern(src);
+        let PatternKind::Tuple(elems) = &p.inner.kind else {
+            panic!("not a tuple: {:?}", p)
+        };
+        assert_eq!(elems.len(), 2);
+    }
+
+    #[test]
+    fn parses_wildcard_in_tuple_pattern() {
+        let src = "{ _ x _ }";
+        let p = parse_one_pattern(src);
+        let PatternKind::Tuple(elems) = &p.inner.kind else {
+            panic!()
+        };
+        assert_eq!(elems.len(), 3);
+        assert!(matches!(elems[0].inner.kind, PatternKind::Wildcard));
+        assert!(matches!(elems[1].inner.kind, PatternKind::Var));
+        assert!(matches!(elems[2].inner.kind, PatternKind::Wildcard));
+    }
+
+    #[test]
+    fn parses_nested_tuple_pattern() {
+        let src = "{ a { b c } _ }";
+        let p = parse_one_pattern(src);
+        let PatternKind::Tuple(outer) = &p.inner.kind else {
+            panic!()
+        };
+        assert_eq!(outer.len(), 3);
+        assert!(matches!(outer[1].inner.kind, PatternKind::Tuple(_)));
+    }
+
+    #[test]
+    fn parses_atom_in_tuple_pattern() {
+        let src = "{ :ok x }";
+        let p = parse_one_pattern(src);
+        let PatternKind::Tuple(elems) = &p.inner.kind else {
+            panic!()
+        };
+        assert!(!matches!(
+            elems[0].inner.kind,
+            PatternKind::Var | PatternKind::Wildcard
+        ));
+        assert!(matches!(elems[1].inner.kind, PatternKind::Var));
     }
 }
