@@ -261,14 +261,34 @@ pub fn expr<'t, 'src: 't>()
             .ignore_then(expr.clone())
             .map(|inner| Expr::Pin(Box::new(inner)));
 
+        // `Name { field = expr ... }` — named-field record constructor.
+        // Must appear before `atom` (which contains the bare-var parser) so
+        // that `Foo { ... }` is claimed here instead of being parsed as
+        // `Foo` (Var) followed by a stray tuple literal.  Requires at least
+        // one field so `Foo { }` does NOT match and falls through to `atom`.
+        let record_literal = ident_parser()
+            .then(
+                ident_parser()
+                    .then_ignore(just(Token::Eq))
+                    .then(expr.clone())
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>()
+                    .nested_in(
+                        select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span())),
+                    ),
+            )
+            .map(|(name, fields)| Expr::RecordLiteral { name, fields });
+
         let base = choice((
             ret_expr.spanned().boxed(),
             pin_expr.spanned().boxed(),
             wait_expr.spanned().boxed(),
             let_destructure.spanned().boxed(),
             let_expr.spanned().boxed(),
-            when_expr.spanned(),
-            atom.spanned(),
+            when_expr.spanned().boxed(),
+            record_literal.spanned().boxed(),
+            atom.spanned().boxed(),
         ));
 
         // Postfix is represented as a local enum.  We collect them with

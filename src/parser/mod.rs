@@ -659,6 +659,65 @@ mod tests {
         });
     }
 
+    // ── expr parser helpers ─────────────────────────────────────────────────
+
+    fn try_parse_one_expr(src: &str) -> Result<chumsky::span::Spanned<Expr<'_>>, String> {
+        let tokens = lexer()
+            .parse(src)
+            .into_result()
+            .map_err(|e| format!("lex error: {e:?}"))?;
+        crate::parser::expr::expr()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .map_err(|e| format!("parse error: {e:?}"))
+    }
+
+    fn parse_one_expr(src: &str) -> chumsky::span::Spanned<Expr<'_>> {
+        try_parse_one_expr(src).expect("expected successful parse")
+    }
+
+    // ── record literal tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parses_record_literal() {
+        let src = r#"Request { method = "GET"  path = "/" }"#;
+        let parsed = parse_one_expr(src);
+        let Expr::RecordLiteral { name, fields } = parsed.inner else {
+            panic!("not a literal: {:?}", parsed)
+        };
+        assert_eq!(name.inner.0, "Request");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0.inner.0, "method");
+    }
+
+    #[test]
+    fn record_literal_does_not_collide_with_jump() {
+        // `Foo(args)` is a Jump, NOT a literal — confirm
+        let src = "Foo(1 2)";
+        let parsed = parse_one_expr(src);
+        assert!(matches!(parsed.inner, Expr::Jump { .. }));
+    }
+
+    #[test]
+    fn record_literal_does_not_collide_with_bare_var() {
+        let src = "Foo";
+        let parsed = parse_one_expr(src);
+        assert!(matches!(parsed.inner, Expr::Var(_, _)));
+    }
+
+    #[test]
+    fn rejects_empty_record_literal() {
+        let src = "Empty { }";
+        // Should EITHER not parse as a literal OR error out.
+        let parsed_or_err = try_parse_one_expr(src);
+        match parsed_or_err {
+            Ok(p) if matches!(p.inner, Expr::RecordLiteral { .. }) => {
+                panic!("empty literal must not parse as RecordLiteral");
+            }
+            _ => {}
+        }
+    }
+
     // ── record parser helpers ────────────────────────────────────────────────
 
     fn try_parse_one_item(src: &str) -> Result<chumsky::span::Spanned<Item<'_>>, String> {
