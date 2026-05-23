@@ -149,6 +149,27 @@ impl<'src, 'r> Resolver<'src, 'r> {
             // leaves `x` typed `Unknown`, which trips downstream
             // call-arg matching with `?` placeholders.
             Expr::Pin(inner) => self.infer_expr_type(&inner.inner, inner.span),
+            // Record literal: type tag = the record's own name.  Typeck
+            // verifies field correctness; here we just name the type.
+            Expr::RecordLiteral { name, .. } => src_named(name.inner.0, span),
+            // Named field access on a record-typed receiver.
+            Expr::DotAccess { receiver, field } => {
+                let recv_ty = self.infer_expr_type(&receiver.inner, receiver.span);
+                if let Type::Named(rec_name_ident) = &recv_ty {
+                    let rec_name = rec_name_ident.inner.0;
+                    if let Some(reg) = self.registry {
+                        let scope = reg.module(self.current_module);
+                        if let Some(entry) = scope.records.get(rec_name) {
+                            if let Some((_, field_ty)) =
+                                entry.fields.iter().find(|(n, _)| n.inner.0 == field.inner.0)
+                            {
+                                return field_ty.inner.clone();
+                            }
+                        }
+                    }
+                }
+                Type::Unknown
+            }
             // Higher-order shapes (let, when, wait, method-call, …) don't
             // have a defined "value" yet — leave them unresolved.
             _ => Type::Unknown,
@@ -170,6 +191,12 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 if let Some(sig) = reg.rt_fns.get(*name) {
                     return type_from_str(&sig.ret, span);
                 }
+                // Records: check module's records map directly so we can
+                // borrow RecordEntry<'src> without going through Resolution<'r>.
+                let scope = reg.module(self.current_module);
+                if let Some(entry) = scope.records.get(*name) {
+                    return src_named(entry.name, span);
+                }
                 if let Some(r) =
                     reg.resolve_in_module(self.current_module, name)
                 {
@@ -178,9 +205,12 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 // Imported alias: walk the current module's import table.
                 // Namespace imports (target_item == None) can't be invoked
                 // bare; the path-form rule handles them via resolve_path.
-                let scope = reg.module(self.current_module);
                 if let Some(binding) = scope.imports.get(*name) {
                     if let Some(item) = &binding.target_item {
+                        let target_scope = reg.module(binding.target_module);
+                        if let Some(entry) = target_scope.records.get(item.as_str()) {
+                            return src_named(entry.name, span);
+                        }
                         if let Some(r) =
                             reg.resolve_in_module(binding.target_module, item)
                         {
@@ -325,6 +355,17 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 receiver: Box::new(self.resolve_expr(*receiver)),
                 index: Box::new(self.resolve_expr(*index)),
             },
+            Expr::DotAccess { receiver, field } => Expr::DotAccess {
+                receiver: Box::new(self.resolve_expr(*receiver)),
+                field,
+            },
+            Expr::RecordLiteral { name, fields } => Expr::RecordLiteral {
+                name,
+                fields: fields
+                    .into_iter()
+                    .map(|(k, v)| (k, self.resolve_expr(v)))
+                    .collect(),
+            },
 
             other => other,
         };
@@ -438,6 +479,12 @@ pub fn resolve_program<'src>(
 /// inference engine where the type's textual identifier is fixed at compile
 /// time (e.g. `"i64"` from arithmetic).
 fn static_named<'src>(name: &'static str, span: SimpleSpan) -> Type<'src> {
+    Type::Named(Ident::new(name).with_span(span))
+}
+
+/// Build a `Type::Named` from a source-lifetime name plus a span.  Used when
+/// the name comes from source text (e.g. a record declaration name).
+fn src_named<'src>(name: &'src str, span: SimpleSpan) -> Type<'src> {
     Type::Named(Ident::new(name).with_span(span))
 }
 
@@ -853,6 +900,71 @@ m is { _ -> { let r = HELLO } }"#,
             matches!(&ty.inner, Type::Named(i) if i.inner == Ident::new("i64")),
             "got {ty:?}"
         );
+    }
+
+    /// Collect inferred let-binding types from `main`'s first branch body.
+    /// Returns a map of variable name → display string of the inferred type.
+    fn infer_let_types_in_main(src: &str) -> std::collections::HashMap<String, String> {
+        let module = parsed_module(src);
+        let program = crate::loader::ParsedProgram { modules: vec![module] };
+        let mut reg: crate::registry::ProgramRegistry<'_> =
+            crate::registry::ProgramRegistry::with_rt();
+        reg.populate_from(&program).expect("populate");
+        let resolved = super::resolve_program(program, &mut reg);
+        let m = resolved.root();
+        let machine = m
+            .ast
+            .iter()
+            .filter_map(|it| match &it.inner {
+                Item::Machine(m) => Some(m),
+                _ => None,
+            })
+            .find(|m| m.inner.ident.inner.0 == "main")
+            .expect("no main machine");
+        let MachineItem::Branch(b) = &machine.inner.items[0].inner else {
+            panic!("expected Branch")
+        };
+        let mut map = std::collections::HashMap::new();
+        for e in &b.body {
+            if let Expr::Let { ident, ty, .. } = &e.inner {
+                map.insert(ident.inner.0.to_string(), format!("{}", ty.inner));
+            }
+        }
+        map
+    }
+
+    #[test]
+    fn record_ctor_call_types_as_record_name() {
+        let src = r#"
+            Request is { method buf  path buf }
+            main is { _ -> { let r = Request("GET" "/") } }
+        "#;
+        let types = infer_let_types_in_main(src);
+        let r_ty = types.get("r").expect("let r missing");
+        assert_eq!(r_ty, "Request");
+    }
+
+    #[test]
+    fn record_dot_access_returns_field_type() {
+        let src = r#"
+            Request is { method buf  path buf }
+            main is { _ -> {
+                let r = Request("GET" "/")
+                let m = r.method
+            } }
+        "#;
+        let types = infer_let_types_in_main(src);
+        assert_eq!(types.get("m").unwrap(), "buf");
+    }
+
+    #[test]
+    fn record_literal_types_as_record_name() {
+        let src = r#"
+            Request is { method buf  path buf }
+            main is { _ -> { let r = Request { method = "GET" path = "/" } } }
+        "#;
+        let types = infer_let_types_in_main(src);
+        assert_eq!(types.get("r").unwrap(), "Request");
     }
 
     /// Regression: `.N` on a value returned from a ret-machine that
