@@ -76,6 +76,31 @@ impl<'src, 'r> Resolver<'src, 'r> {
         }
     }
 
+    /// If `ty` is `Type::Named(<record>)`, return its expanded
+    /// `Type::Struct(field_types)` form.  All other shapes pass
+    /// through unchanged.  Lets the resolver flatten record types
+    /// into the same Struct shape the call-hash + typeck TupleIndex
+    /// paths already handle (#058 followup).
+    fn expand_record_type(&self, ty: &Type<'src>) -> Type<'src> {
+        let Type::Named(name_id) = ty else {
+            return ty.clone();
+        };
+        let Some(reg) = self.registry else {
+            return ty.clone();
+        };
+        let scope = reg.module(self.current_module);
+        let Some(entry) = scope.records.get(name_id.inner.0) else {
+            return ty.clone();
+        };
+        let span = name_id.span;
+        let fields: Vec<Spanned<Type<'src>>> = entry
+            .fields
+            .iter()
+            .map(|(_, ty)| Spanned { inner: ty.inner.clone(), span })
+            .collect();
+        Type::Struct(fields)
+    }
+
     /// Infer the static type of an already-resolved expression.  Returns
     /// [`Type::Unknown`] when the inference engine has nothing to say —
     /// callers should treat that as "user must annotate" rather than
@@ -366,10 +391,30 @@ impl<'src, 'r> Resolver<'src, 'r> {
             Expr::Tuple(elems) => Expr::Tuple(
                 elems.into_iter().map(|e| self.resolve_expr(e)).collect(),
             ),
-            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
-                receiver: Box::new(self.resolve_expr(*receiver)),
-                index,
-            },
+            Expr::TupleIndex { receiver, index } => {
+                // Resolve the receiver normally first, then — if it's a
+                // bare Var with a record type — rewrite its `ty` to the
+                // structural expansion (`Type::Named(Foo)` →
+                // `Type::Struct([fields...])`).  Only this Var instance is
+                // touched; other references to the same name (call args,
+                // self()-dispatch) keep the nominal tag they need for
+                // branch lookup.  Without this, typeck + the call-hash
+                // arg classifier see `?` for `r.0` because both code
+                // paths only know how to read `Type::Struct(fields)`.
+                let resolved_recv = self.resolve_expr(*receiver);
+                let recv_span = resolved_recv.span;
+                let rewritten_inner = match resolved_recv.inner {
+                    Expr::Var(name, ty) => {
+                        let expanded = self.expand_record_type(&ty);
+                        Expr::Var(name, expanded)
+                    }
+                    other => other,
+                };
+                Expr::TupleIndex {
+                    receiver: Box::new(rewritten_inner.with_span(recv_span)),
+                    index,
+                }
+            }
             Expr::Index { receiver, index } => Expr::Index {
                 receiver: Box::new(self.resolve_expr(*receiver)),
                 index: Box::new(self.resolve_expr(*index)),

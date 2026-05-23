@@ -2543,7 +2543,20 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         lifts: &mut Vec<Spanned<Expr<'src>>>,
     ) -> Spanned<Expr<'src>> {
         let span = expr.span;
-        if matches!(expr.inner, Expr::Jump { .. }) {
+        // Jump (ret-machine call) and Tuple (heap-allocated fat-ptr
+        // constructor) both require a slot binding before they can
+        // appear in another expression's arg / element position.
+        // Backend's tuple_expr / send_expr require pure leaves;
+        // unlifted Tuples in arg position trigger "tuple element N
+        // is not a pure expression".  Mirror the Jump-lift path so
+        // record ctor results (`Request(method)` lowers to Tuple
+        // before Phase 3 wraps it in `__caller(self, ...)`) bind
+        // into a let first.
+        let needs_lift = matches!(
+            expr.inner,
+            Expr::Jump { .. } | Expr::Tuple(_) | Expr::RecordLiteral { .. },
+        );
+        if needs_lift {
             let recursed = self.lift_in_expr(expr, lifts);
             let id = self.fresh_id();
             let name: &'static str = Box::leak(format!("__lift_{id}").into_boxed_str());
@@ -2576,14 +2589,29 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         match expr {
             Expr::Jump { ident, .. } => {
                 if let Expr::Var(name, _) = &ident.inner {
-                    if matches!(
-                        self.registry.resolve_bare_in(self.module_id, name),
-                        Some(Resolution::Record(_))
-                    ) {
-                        // Return the source-level name from the AST node
-                        // (`*name` is `&'src str`), not from the registry
-                        // entry (which would give `&'a str`).
-                        return Some(name);
+                    match self.registry.resolve_bare_in(self.module_id, name) {
+                        Some(Resolution::Record(_)) => {
+                            // Direct record constructor — type tag = name.
+                            // Source-level `&'src str` (registry's `&'a` would
+                            // not unify with the scope's lifetime).
+                            return Some(name);
+                        }
+                        Some(Resolution::Machine(m)) => {
+                            // ret-machine returning a record-typed value —
+                            // bound let inherits the record tag so subsequent
+                            // `.field` access can be lowered to TupleIndex.
+                            // First-branch ret_ty is canonical (the typeck
+                            // checks consistency across branches).
+                            for sig in &m.branches {
+                                let ret = sig.ret.as_str();
+                                let scope = self.registry.module(self.module_id);
+                                if let Some(rec) = scope.records.get(ret) {
+                                    return Some(rec.name);
+                                }
+                            }
+                            return None;
+                        }
+                        _ => return None,
                     }
                 }
                 None
@@ -3654,7 +3682,18 @@ fn type_from_string<'src>(s: &str, span: SimpleSpan) -> Type<'src> {
         "bool" => "bool",
         "pid" => "pid",
         "atom" => "atom",
-        _ => return Type::Unknown,
+        // User-defined nominal types (records — #058).  Validate the
+        // ident shape (ASCII alnum + underscore, leading non-digit)
+        // before leaking so a malformed string can't fabricate a name.
+        other => {
+            let ok = !other.is_empty()
+                && other.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && other.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !ok {
+                return Type::Unknown;
+            }
+            Box::leak(other.to_string().into_boxed_str())
+        }
     };
     Type::Named(Ident::new(static_name).with_span(span))
 }
