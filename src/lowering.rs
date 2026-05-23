@@ -1561,6 +1561,9 @@ impl<'a, 'src> LowerCx<'a, 'src> {
     /// into a synthetic temporary binding plus one ordinary `Let`
     /// per field.  Run after const inlining so the destructured
     /// expression has already had any const folded into a literal.
+    ///
+    /// Supports arbitrary arity, wildcards (`_` — emits no binding),
+    /// and nested tuple patterns (recursed on the slot receiver).
     fn expand_let_tuple(
         &self,
         body: Vec<Spanned<Expr<'src>>>,
@@ -1586,30 +1589,88 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                         .with_span(span),
                     );
 
-                    // let <field_i> = __dst_<id>.<i>
-                    for (i, fname) in fields.into_iter().enumerate() {
-                        let receiver =
-                            Expr::Var(synth_name, Type::Unknown).with_span(span);
-                        out.push(
-                            Expr::Let {
-                                ident: fname.clone(),
-                                ty: Type::Unknown.with_span(fname.span),
-                                default: Some(Box::new(
-                                    Expr::TupleIndex {
-                                        receiver: Box::new(receiver),
-                                        index: i,
-                                    }
-                                    .with_span(span),
-                                )),
-                            }
-                            .with_span(fname.span),
-                        );
-                    }
+                    // Expand each pattern element into the output.
+                    self.expand_pat_fields(
+                        &fields,
+                        synth_name,
+                        span,
+                        &mut out,
+                    );
                 }
                 other => out.push(other.with_span(span)),
             }
         }
         out
+    }
+
+    /// Recursively expand pattern fields of a single destructure level.
+    /// `receiver_name` is the synthetic temp holding the tuple value at
+    /// this level; `out` accumulates ordinary `Let` statements.
+    fn expand_pat_fields(
+        &self,
+        fields: &[Spanned<crate::api::ast::Pattern<'src>>],
+        receiver_name: &'static str,
+        span: chumsky::span::SimpleSpan,
+        out: &mut Vec<Spanned<Expr<'src>>>,
+    ) {
+        use crate::api::ast::PatternKind;
+        for (i, pat) in fields.iter().enumerate() {
+            let receiver =
+                Expr::Var(receiver_name, Type::Unknown).with_span(span);
+            let slot = Expr::TupleIndex {
+                receiver: Box::new(receiver),
+                index: i,
+            }
+            .with_span(span);
+
+            match &pat.inner.kind {
+                PatternKind::Wildcard => {
+                    // `_` slot — emit nothing.
+                }
+                PatternKind::Var => {
+                    let name_ident = pat.inner.ident.clone();
+                    out.push(
+                        Expr::Let {
+                            ident: name_ident.clone(),
+                            ty: Type::Unknown.with_span(name_ident.span),
+                            default: Some(Box::new(slot)),
+                        }
+                        .with_span(pat.span),
+                    );
+                }
+                PatternKind::Tuple(nested) => {
+                    // Bind the slot to a fresh temp then recurse.
+                    let sub_id = self.fresh_id();
+                    let sub_name: &'static str =
+                        Box::leak(format!("__dst_{sub_id}").into_boxed_str());
+                    let sub_ident = Ident::new(sub_name).with_span(span);
+                    out.push(
+                        Expr::Let {
+                            ident: sub_ident,
+                            ty: Type::Unknown.with_span(span),
+                            default: Some(Box::new(slot)),
+                        }
+                        .with_span(span),
+                    );
+                    self.expand_pat_fields(nested, sub_name, span, out);
+                }
+                // Guards in let-position are a type-error (E031); leave the
+                // slot as a plain Var binding so typeck can reject it.
+                PatternKind::NumGuard(_)
+                | PatternKind::StrGuard(_)
+                | PatternKind::AtomGuard(_) => {
+                    let name_ident = pat.inner.ident.clone();
+                    out.push(
+                        Expr::Let {
+                            ident: name_ident.clone(),
+                            ty: Type::Unknown.with_span(name_ident.span),
+                            default: Some(Box::new(slot)),
+                        }
+                        .with_span(pat.span),
+                    );
+                }
+            }
+        }
     }
 
     fn fresh_id(&self) -> u32 {
@@ -4527,7 +4588,13 @@ mod tests {
     #[test]
     fn wrap_diagnostic_when_unknown_terminal() {
         let lt = Expr::LetTuple {
-            fields: vec![Ident::new("a").with_span(sp())],
+            fields: vec![
+                crate::api::ast::Pattern::new(
+                    Ident::new("a").with_span(sp()),
+                    Type::Unknown.with_span(sp()),
+                )
+                .with_span(sp()),
+            ],
             default: Box::new(num("0")),
         }
         .with_span(sp());
@@ -4652,5 +4719,107 @@ mod tests {
             panic!("expected TupleIndex, got {:?}", expr);
         };
         assert_eq!(*index, 1, "path is field index 1");
+    }
+
+    // ── Task 10: generalized expand_let_tuple ─────────────────────────────
+
+    /// Returns true when the lowered program contains a `let <name> = ...`
+    /// anywhere inside machine `mname` (scans all branches recursively).
+    fn has_let_in_machine(program: &crate::loader::ParsedProgram<'_>, mname: &str, name: &str) -> bool {
+        fn scan_body(body: &[chumsky::span::Spanned<Expr<'_>>], name: &str) -> bool {
+            for stmt in body {
+                if scan_expr(&stmt.inner, name) {
+                    return true;
+                }
+            }
+            false
+        }
+        fn scan_expr(expr: &Expr<'_>, name: &str) -> bool {
+            match expr {
+                Expr::Let { ident, default, .. } => {
+                    if ident.inner.0 == name {
+                        return true;
+                    }
+                    default.as_ref().map_or(false, |d| scan_expr(&d.inner, name))
+                }
+                Expr::When { cond, branches } => {
+                    scan_expr(&cond.inner, name)
+                        || branches.iter().any(|(_, b)| scan_body(b, name))
+                }
+                Expr::Wait { handlers, .. } => {
+                    handlers.iter().any(|h| scan_body(&h.inner.body, name))
+                }
+                _ => false,
+            }
+        }
+
+        for module in &program.modules {
+            for item in &module.ast {
+                if let Item::Machine(m) = &item.inner {
+                    if m.inner.ident.inner.0 != mname {
+                        continue;
+                    }
+                    for mi in &m.inner.items {
+                        if let crate::api::ast::MachineItem::Branch(b) = &mi.inner {
+                            if scan_body(&b.body, name) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `let { a b c } = r` — arity-3 destructure — must emit let-bindings
+    /// for all three names.
+    #[test]
+    fn destructure_arity_3_binds_all() {
+        let lowered = lower(
+            r#"Req is { a buf  b buf  c buf }
+               main is { _ -> {
+                 let r = Req("x" "y" "z")
+                 let { a b c } = r
+               } }"#,
+        );
+        assert!(has_let_in_machine(&lowered, "main", "a"), "expected let a");
+        assert!(has_let_in_machine(&lowered, "main", "b"), "expected let b");
+        assert!(has_let_in_machine(&lowered, "main", "c"), "expected let c");
+    }
+
+    /// `let { _ b _ } = r` — wildcard slots must produce NO let binding;
+    /// the named slot `b` must still be bound.
+    #[test]
+    fn destructure_wildcard_skips_binding() {
+        let lowered = lower(
+            r#"Req is { a buf  b buf  c buf }
+               main is { _ -> {
+                 let r = Req("x" "y" "z")
+                 let { _ b _ } = r
+               } }"#,
+        );
+        assert!(
+            !has_let_in_machine(&lowered, "main", "_"),
+            "wildcard must not emit a let binding"
+        );
+        assert!(has_let_in_machine(&lowered, "main", "b"), "expected let b");
+    }
+
+    /// `let { { x y } z } = o` — nested tuple pattern — must bind `x`, `y`,
+    /// and `z` through the synthetic sub-temps.
+    #[test]
+    fn destructure_nested_binds_through() {
+        let lowered = lower(
+            r#"Inner is { x i64  y i64 }
+               Outer is { inner Inner  z i64 }
+               main is { _ -> {
+                 let o = Outer(Inner(1 2) 3)
+                 let { { x y } z } = o
+               } }"#,
+        );
+        assert!(has_let_in_machine(&lowered, "main", "x"), "expected let x");
+        assert!(has_let_in_machine(&lowered, "main", "y"), "expected let y");
+        assert!(has_let_in_machine(&lowered, "main", "z"), "expected let z");
     }
 }

@@ -525,8 +525,8 @@ mod tests {
                     panic!("expected LetTuple, got {expr:?}")
                 };
                 assert_eq!(fields.len(), 2);
-                assert_eq!(fields[0].inner, Ident::new("a"));
-                assert_eq!(fields[1].inner, Ident::new("b"));
+                assert_eq!(fields[0].inner.ident.inner, Ident::new("a"));
+                assert_eq!(fields[1].inner.ident.inner, Ident::new("b"));
                 assert!(matches!(default.inner, Expr::Tuple(_)));
             },
         );

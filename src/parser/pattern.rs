@@ -21,7 +21,7 @@ use crate::{
 
 /// Parses a bare (type-annotation-free) sub-pattern for use inside `{ }`.
 /// Grammar: atom-guard | nested-tuple | ident/num/wildcard (no type).
-fn bare_pattern<'t, 'src: 't>()
+pub(super) fn bare_pattern<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Pattern<'src>>, Err<Rich<'t, Token<'src>>>> {
     recursive(|bare| {
         // Atom guard: `:ok`, `:err`

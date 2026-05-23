@@ -15,7 +15,7 @@ use crate::{
         expr::Expr,
         token::Token,
     },
-    parser::{expr::type_expr::type_expr, helpers::TokenInput, helpers::ident_parser},
+    parser::{expr::type_expr::type_expr, helpers::TokenInput, helpers::ident_parser, pattern::bare_pattern},
 };
 
 pub mod type_expr;
@@ -216,7 +216,7 @@ pub fn expr<'t, 'src: 't>()
         // get misread as a block.
         let let_destructure = just(Token::Let)
             .ignore_then(
-                ident_parser()
+                bare_pattern()
                     .repeated()
                     .at_least(1)
                     .collect::<Vec<_>>()
