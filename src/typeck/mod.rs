@@ -562,6 +562,77 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
         self.check_expr(machine_name, scope, &operand.inner, operand.span);
     }
 
+    /// Walk a (possibly chained) `Expr::DotAccess` and resolve the
+    /// declared type at its tip.  Terminates at a `Var` whose `ty`
+    /// is a `Type::Named(<record>)`, then walks field-by-field
+    /// through the registry's record map.  Returns the field's
+    /// type as a string (lowered to backend-friendly form for
+    /// records → `buf` if the field is itself a record, etc).
+    /// Cross-module field types: scan every module's records since
+    /// nested field-type names need not be imported into the
+    /// calling module.
+    fn walk_dot_access_chain_str(&self, expr: &Expr<'_>) -> Option<String> {
+        // Returns the declared `Type` at the tip of the chain.
+        fn walk<'a, 'src>(
+            this: &'a TypeChecker<'src, '_>,
+            expr: &'a Expr<'src>,
+        ) -> Option<Type<'src>> {
+            match expr {
+                Expr::Var(_, ty) => Some(ty.clone()),
+                Expr::TupleIndex { receiver, index } => {
+                    let recv_ty = walk(this, &receiver.inner)?;
+                    if let Type::Struct(fields) = recv_ty {
+                        fields.get(*index).map(|f| f.inner.clone())
+                    } else {
+                        None
+                    }
+                }
+                Expr::DotAccess { receiver, field } => {
+                    let recv_ty = walk(this, &receiver.inner)?;
+                    let rec_name = match recv_ty {
+                        Type::Named(n) => n.inner.0,
+                        // Receiver lost its nominal tag because the
+                        // resolver structurally expanded it.  Fall
+                        // back to a name-based lookup: scan every
+                        // record's fields for `field` — records are
+                        // nominally unique so name collisions are
+                        // rare; for chained `a.b.c` where `b` is a
+                        // single-field record the lookup is
+                        // unambiguous.
+                        Type::Struct(_) => {
+                            return (0..this.registry.modules.len()).find_map(|i| {
+                                let mid = crate::registry::ModuleId(i as u32);
+                                this.registry
+                                    .module(mid)
+                                    .records
+                                    .values()
+                                    .find_map(|entry| {
+                                        entry
+                                            .fields
+                                            .iter()
+                                            .find(|(d, _)| d.inner.0 == field.inner.0)
+                                            .map(|(_, fty)| fty.inner.clone())
+                                    })
+                            });
+                        }
+                        _ => return None,
+                    };
+                    let entry = (0..this.registry.modules.len()).find_map(|i| {
+                        let mid = crate::registry::ModuleId(i as u32);
+                        this.registry.module(mid).records.get(rec_name)
+                    })?;
+                    let (_, fty) = entry
+                        .fields
+                        .iter()
+                        .find(|(d, _)| d.inner.0 == field.inner.0)?;
+                    Some(fty.inner.clone())
+                }
+                _ => None,
+            }
+        }
+        walk(self, expr).map(|t| t.to_string())
+    }
+
     /// Type-display for an expression used as a call argument.  `"?"` means
     /// the resolver / inferer hasn't decided.
     fn expr_type_str(&self, expr: &Expr<'_>) -> String {
@@ -590,21 +661,23 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
             // surface a coarse `tuple` token.  Refine when call-arg sigs
             // gain shape awareness.
             Expr::Tuple(_) => "tuple".to_string(),
-            Expr::TupleIndex { receiver, index } => {
-                // Resolve the field type from the receiver's `Struct(fields)`
-                // annotation (the resolver fills `Var.ty` from let / wait-
-                // handler scope).  Without this, `tuple.idx` always reports
-                // `?` to call-arg matching, breaking Go-style error-handling
-                // pipelines that thread `{atom value}` tuples through chains
-                // of `let r = call(...)` + `when r.0 { ... call(r.1) ... }`.
-                if let Expr::Var(_, Type::Struct(fields)) = &receiver.inner {
-                    if let Some(field) = fields.get(*index) {
-                        return field.inner.to_string();
-                    }
+            Expr::TupleIndex { .. } => {
+                // Walk the (possibly chained) receiver chain looking
+                // for the leaf Var whose `ty` is a `Type::Struct(...)`.
+                // Each TupleIndex step indexes through the corresponding
+                // field list.  Supports Go-style `{atom value}` tuples
+                // AND `r.method.inner`-style chained record dot access
+                // — the resolver deeply expands record-typed Vars so
+                // every chain step lands in a Struct.
+                if let Some(ty) = walk_tuple_index_chain(expr) {
+                    return ty.to_string();
                 }
                 "?".to_string()
             }
             Expr::Index { .. } => "i64".to_string(),
+            Expr::DotAccess { .. } => self
+                .walk_dot_access_chain_str(expr)
+                .unwrap_or_else(|| "?".to_string()),
             Expr::Jump { ident, .. } => match &ident.inner {
                 Expr::Var(name, _) => self
                     .registry
@@ -625,6 +698,29 @@ impl<'src, 'r> TypeChecker<'src, 'r> {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+/// Walk a (possibly chained) TupleIndex expression and return the
+/// declared type at the chain's end.  Terminates at a `Var` whose
+/// `ty` is `Type::Struct(fields)`; each intermediate TupleIndex
+/// step indexes through the field list.  Returns `None` when the
+/// chain breaks.  The resolver deeply expands record-typed Vars so
+/// every chain step lands in a Struct, no registry needed here.
+fn walk_tuple_index_chain<'a, 'src>(
+    expr: &'a Expr<'src>,
+) -> Option<&'a Type<'src>> {
+    match expr {
+        Expr::Var(_, ty) => Some(ty),
+        Expr::TupleIndex { receiver, index } => {
+            let recv_ty = walk_tuple_index_chain(&receiver.inner)?;
+            if let Type::Struct(fields) = recv_ty {
+                fields.get(*index).map(|f| &f.inner)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 
 fn sig_matches_args(sig: &Signature, args: &[String]) -> bool {
     if sig.params.len() != args.len() {

@@ -76,27 +76,64 @@ impl<'src, 'r> Resolver<'src, 'r> {
         }
     }
 
-    /// If `ty` is `Type::Named(<record>)`, return its expanded
-    /// `Type::Struct(field_types)` form.  All other shapes pass
-    /// through unchanged.  Lets the resolver flatten record types
-    /// into the same Struct shape the call-hash + typeck TupleIndex
-    /// paths already handle (#058 followup).
+    /// If `ty` is `Type::Named(<record>)`, return its DEEPLY expanded
+    /// `Type::Struct(field_types)` form: each field whose declared type
+    /// is itself a record gets recursively expanded too.  All other
+    /// shapes pass through unchanged.  Lets backend TupleIndex chain
+    /// walkers find a `Type::Struct` at every nesting level without
+    /// querying the registry (#058 chained dot-access followup).
     fn expand_record_type(&self, ty: &Type<'src>) -> Type<'src> {
-        let Type::Named(name_id) = ty else {
-            return ty.clone();
-        };
         let Some(reg) = self.registry else {
             return ty.clone();
         };
-        let scope = reg.module(self.current_module);
-        let Some(entry) = scope.records.get(name_id.inner.0) else {
+        self.expand_record_type_in(ty, reg, self.current_module)
+    }
+
+    /// Worker for [`expand_record_type`] that threads the OWNING
+    /// module of the parent record as the lookup scope.  Cross-module
+    /// records (e.g. `Request` imported from `http` whose field type
+    /// is `HTTPMethod` — defined in `http` but NOT imported into the
+    /// calling module) resolve through `http`'s scope, not the
+    /// current module's import set.
+    fn expand_record_type_in(
+        &self,
+        ty: &Type<'src>,
+        reg: &crate::registry::ProgramRegistry<'src>,
+        lookup_module: crate::registry::ModuleId,
+    ) -> Type<'src> {
+        let Type::Named(name_id) = ty else {
             return ty.clone();
         };
+        // Try the lookup module first, then the current module (handles
+        // both cross-module field types and current-module record refs).
+        let entry = reg
+            .module(lookup_module)
+            .records
+            .get(name_id.inner.0)
+            .or_else(|| reg.module(self.current_module).records.get(name_id.inner.0))
+            .or_else(|| {
+                // Cross-module: record name might be defined in a module
+                // that isn't `lookup_module` or `current_module` (e.g. a
+                // field type that wasn't imported into either).  Records
+                // are nominally unique across the program — fall back to
+                // a linear scan.
+                (0..reg.modules.len()).find_map(|i| {
+                    let mid = crate::registry::ModuleId(i as u32);
+                    reg.module(mid).records.get(name_id.inner.0)
+                })
+            });
+        let Some(entry) = entry else {
+            return ty.clone();
+        };
+        let owning_module = entry.module;
         let span = name_id.span;
         let fields: Vec<Spanned<Type<'src>>> = entry
             .fields
             .iter()
-            .map(|(_, ty)| Spanned { inner: ty.inner.clone(), span })
+            .map(|(_, fty)| {
+                let expanded = self.expand_record_type_in(&fty.inner, reg, owning_module);
+                Spanned { inner: expanded, span }
+            })
             .collect();
         Type::Struct(fields)
     }

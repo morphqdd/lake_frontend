@@ -2585,6 +2585,71 @@ impl<'a, 'src> LowerCx<'a, 'src> {
     /// Returns `None` for any other shape.  Used by
     /// `rewrite_record_forms_body` to populate the scope map when it
     /// encounters a `let` binding.
+    /// Walk an already-lowered receiver expression and return its
+    /// record-type name if known.  Handles bare Vars (`r`) and the
+    /// post-Phase-1.a TupleIndex chains (`r.0`, `r.0.0`) that arise
+    /// from `r.method.inner` style nested dot-access.
+    fn infer_receiver_record(
+        &self,
+        expr: &Expr<'src>,
+        scope: &HashMap<&'src str, &'src str>,
+    ) -> Option<&'src str> {
+        match expr {
+            Expr::Var(name, _) => scope.get(name).copied(),
+            Expr::TupleIndex { receiver, index } => {
+                let inner_record = self.infer_receiver_record(&receiver.inner, scope)?;
+                // Find the parent record's owning module — the field's
+                // declared type lives in that scope.  Cross-module
+                // chains (`rq.method.inner` where rq is `HTTPRequest`
+                // imported from `http`, method is `HTTPMethod` defined
+                // in `http` but NOT imported into the current module)
+                // resolve through the OWNING module's records map, not
+                // `self.module_id`'s.
+                let parent_module = self
+                    .registry
+                    .module(self.module_id)
+                    .records
+                    .get(inner_record)
+                    .or_else(|| {
+                        // Fallback: scan every module for a matching
+                        // record name.  Records are nominally unique
+                        // per name within Lake's flat type space.
+                        (0..self.registry.modules.len()).find_map(|i| {
+                            let mid = crate::registry::ModuleId(i as u32);
+                            self.registry.module(mid).records.get(inner_record)
+                        })
+                    })?
+                    .module;
+                let entry = self
+                    .registry
+                    .module(parent_module)
+                    .records
+                    .get(inner_record)?;
+                let (_, field_ty) = entry.fields.get(*index)?;
+                let Type::Named(name_id) = &field_ty.inner else {
+                    return None;
+                };
+                let ty_name = name_id.inner.0;
+                if self
+                    .registry
+                    .module(parent_module)
+                    .records
+                    .contains_key(ty_name)
+                    || self
+                        .registry
+                        .module(self.module_id)
+                        .records
+                        .contains_key(ty_name)
+                {
+                    Some(ty_name)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn infer_record_name(&self, expr: &Expr<'src>) -> Option<&'src str> {
         match expr {
             Expr::Jump { ident, .. } => {
@@ -2760,25 +2825,32 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             // ── dot access → TupleIndex (when receiver is record-typed) ──
             Expr::DotAccess { receiver, field } => {
                 let recv_lowered = self.rewrite_record_forms_expr(*receiver, scope);
-                // Can we resolve the receiver's record type?
-                let maybe_idx: Option<usize> = (|| {
-                    let recv_name = match &recv_lowered.inner {
-                        Expr::Var(n, _) => *n,
-                        _ => return None,
-                    };
-                    let record_ty_name = scope.get(recv_name)?;
+                // Walk the (possibly nested) receiver to determine its
+                // record type.  Supports chained access like
+                // `rq.method.inner`: after the inner DotAccess lowers to
+                // a TupleIndex, the outer one resolves by stepping into
+                // the receiving record's field schema at that index.
+                let recv_record_name = self.infer_receiver_record(&recv_lowered.inner, scope);
+                let maybe_idx: Option<usize> = recv_record_name.and_then(|rname| {
+                    // Look up the record in the current module first;
+                    // fall back to scanning every module since field
+                    // types need not be imported into the calling
+                    // module (#058 cross-module chained dot access).
                     let entry = match self
                         .registry
-                        .resolve_bare_in(self.module_id, record_ty_name)
+                        .resolve_bare_in(self.module_id, rname)
                     {
-                        Some(Resolution::Record(e)) => e,
-                        _ => return None,
-                    };
+                        Some(Resolution::Record(e)) => Some(e),
+                        _ => (0..self.registry.modules.len()).find_map(|i| {
+                            let mid = crate::registry::ModuleId(i as u32);
+                            self.registry.module(mid).records.get(rname)
+                        }),
+                    }?;
                     entry
                         .fields
                         .iter()
                         .position(|(d, _)| d.inner.0 == field.inner.0)
-                })();
+                });
 
                 if let Some(idx) = maybe_idx {
                     return Expr::TupleIndex {
@@ -2787,7 +2859,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                     }
                     .with_span(span);
                 }
-                // Receiver not a known record-typed var — leave unchanged.
+                // Receiver not a known record-typed expression — leave unchanged.
                 Expr::DotAccess {
                     receiver: Box::new(recv_lowered),
                     field,
@@ -3094,6 +3166,27 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             Expr::Neg(inner) => Expr::Neg(Box::new(self.inline_consts(*inner))),
             Expr::Ret(inner) => Expr::Ret(Box::new(self.inline_consts(*inner))),
             Expr::Pin(inner) => Expr::Pin(Box::new(self.inline_consts(*inner))),
+            // LetTuple's `default` typically holds a call whose args may
+            // include consts (`let {_ fd} = open(path MODE_755 ...)`);
+            // without recursing the const refs reach typeck as Unknown
+            // and the call-arg matcher rejects the otherwise-valid call.
+            Expr::LetTuple { fields, default } => Expr::LetTuple {
+                fields,
+                default: Box::new(self.inline_consts(*default)),
+            },
+            // Index (`buf[i]`) and RecordLiteral fields may also embed
+            // const refs.
+            Expr::Index { receiver, index } => Expr::Index {
+                receiver: Box::new(self.inline_consts(*receiver)),
+                index: Box::new(self.inline_consts(*index)),
+            },
+            Expr::RecordLiteral { name, fields } => Expr::RecordLiteral {
+                name,
+                fields: fields
+                    .into_iter()
+                    .map(|(n, v)| (n, self.inline_consts(v)))
+                    .collect(),
+            },
             other => other,
         };
         inner.with_span(span)
