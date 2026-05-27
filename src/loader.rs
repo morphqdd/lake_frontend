@@ -508,7 +508,7 @@ fn prescan_path_modules(ast: &[Spanned<Item<'_>>]) -> Vec<ModulePath> {
         match &item.inner {
             Item::Machine(m) => prescan_machine(&m.inner, &mut out),
             Item::Const(c) => prescan_expr(&c.inner.value, &mut out),
-            Item::Import(_) | Item::Directive(_) | Item::Record(_) => {}
+            Item::Import(_) | Item::Directive(_) | Item::Record(_) | Item::Enum(_) => {}
         }
     }
     let mut v: Vec<_> = out.into_iter().collect();

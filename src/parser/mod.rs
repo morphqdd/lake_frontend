@@ -8,18 +8,19 @@ use chumsky::{
 
 use crate::{
     api::{
-        ast::{ConstDecl, Directive, Item, Machine, RecordDecl},
+        ast::{ConstDecl, Directive, EnumDecl, Item, Machine, RecordDecl},
         token::Token,
     },
     parser::{
-        const_item::const_item, directive::directive, helpers::TokenInput, import::import,
-        machine::machine, record::record,
+        const_item::const_item, directive::directive, enum_decl::enum_decl,
+        helpers::TokenInput, import::import, machine::machine, record::record,
     },
 };
 
 mod branch;
 mod const_item;
 mod directive;
+mod enum_decl;
 mod expr;
 mod helpers;
 mod import;
@@ -38,6 +39,15 @@ pub fn program<'t, 'src: 't>()
     let record_item = record().map(|r: Spanned<RecordDecl>| {
         let span = r.span;
         Item::Record(r).with_span(span)
+    });
+
+    // Enum declarations share the `IDENT is { ... }` shape with records but
+    // insert an `enum` keyword between `is` and the body.  Tried BEFORE
+    // `record_item` in the choice so chumsky doesn't eat `enum` as a
+    // record field name.
+    let enum_item = enum_decl().map(|e: Spanned<EnumDecl>| {
+        let span = e.span;
+        Item::Enum(e).with_span(span)
     });
 
     let machine_item = machine().map(|m: Spanned<Machine>| {
@@ -60,7 +70,7 @@ pub fn program<'t, 'src: 't>()
         Item::Const(c).with_span(span)
     });
 
-    choice((import_item, directive_item, const_item_node, record_item, machine_item))
+    choice((import_item, directive_item, const_item_node, enum_item, record_item, machine_item))
         .repeated()
         .collect::<Vec<_>>()
 }
@@ -839,5 +849,95 @@ mod tests {
             PatternKind::Var | PatternKind::Wildcard
         ));
         assert!(matches!(elems[1].inner.kind, PatternKind::Var));
+    }
+
+    // ── char & byte-string literal tests ────────────────────────────────────
+
+    #[test]
+    fn char_literal_parses_to_i64_num() {
+        let parsed = parse_one_expr("'A'");
+        let Expr::Num(s, ty) = parsed.inner else {
+            panic!("expected Num, got {:?}", parsed.inner);
+        };
+        assert_eq!(s, "65");
+        let Type::Named(ref name) = ty else {
+            panic!("expected Named i64");
+        };
+        assert_eq!(name.inner.0, "i64");
+    }
+
+    #[test]
+    fn char_literal_newline_parses_to_10() {
+        let parsed = parse_one_expr("'\\n'");
+        let Expr::Num(s, _) = parsed.inner else {
+            panic!("expected Num");
+        };
+        assert_eq!(s, "10");
+    }
+
+    #[test]
+    fn char_literal_hex_ff_parses_to_255() {
+        let parsed = parse_one_expr("'\\xff'");
+        let Expr::Num(s, _) = parsed.inner else {
+            panic!("expected Num");
+        };
+        assert_eq!(s, "255");
+    }
+
+    #[test]
+    fn char_literal_escaped_single_quote() {
+        let parsed = parse_one_expr("'\\''");
+        let Expr::Num(s, _) = parsed.inner else {
+            panic!("expected Num");
+        };
+        assert_eq!(s, "39");
+    }
+
+    #[test]
+    fn unterminated_char_literal_errors() {
+        let res = try_parse_one_expr("'A");
+        assert!(res.is_err(), "unterminated char should fail without panic");
+    }
+
+    #[test]
+    fn byte_string_literal_parses_to_buf_string() {
+        let parsed = parse_one_expr("b\"abc\"");
+        let Expr::String(s, ty) = parsed.inner else {
+            panic!("expected String variant, got {:?}", parsed.inner);
+        };
+        assert_eq!(s, "abc");
+        let Type::Named(ref name) = ty else {
+            panic!("expected Named buf");
+        };
+        assert_eq!(name.inner.0, "buf");
+    }
+
+    #[test]
+    fn byte_string_empty_parses() {
+        let parsed = parse_one_expr("b\"\"");
+        let Expr::String(s, _) = parsed.inner else {
+            panic!("expected String");
+        };
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn byte_string_escapes_are_raw_until_codegen() {
+        // Raw slice carries un-decoded escapes (matches `Token::String`
+        // handling).  Backend's `unescape` resolves them at codegen.
+        let parsed = parse_one_expr("b\"\\r\\n\"");
+        let Expr::String(s, _) = parsed.inner else {
+            panic!("expected String");
+        };
+        assert_eq!(s, "\\r\\n");
+    }
+
+    #[test]
+    fn byte_string_with_embedded_dquote_escape() {
+        let parsed = parse_one_expr("b\"a\\\"b\"");
+        let Expr::String(s, _) = parsed.inner else {
+            panic!("expected String");
+        };
+        assert_eq!(s, "a\\\"b");
     }
 }

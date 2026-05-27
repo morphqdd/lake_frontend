@@ -26,7 +26,9 @@ use std::rc::Rc;
 
 use chumsky::span::Spanned;
 
-use crate::api::ast::{Branch, Directive, Ident, Import, Item, Machine, MachineItem, Type};
+use crate::api::ast::{
+    Branch, Directive, EnumDecl, Ident, Import, Item, Machine, MachineItem, Type, VariantPayload,
+};
 use crate::error_handle::{LakeError, LakeErrors};
 use crate::loader::ParsedProgram;
 
@@ -153,6 +155,37 @@ pub struct RecordEntry<'src> {
     pub fields: Vec<(Spanned<Ident<'src>>, Spanned<Type<'src>>)>,
 }
 
+/// A `Name is enum { ... }` tagged-sum type declaration belonging to
+/// some module.  Phase 1 — see docs/state/features/145_enums.md.
+#[derive(Debug, Clone)]
+pub struct EnumEntry<'src> {
+    pub name: &'src str,
+    pub module: ModuleId,
+    /// Generic type parameters.  Empty until #142 lights up enum generics.
+    pub type_params: Vec<&'src str>,
+    /// Variants in declaration order; the index doubles as the runtime tag.
+    pub variants: Vec<VariantEntry<'src>>,
+}
+
+/// One variant of an [`EnumEntry`].
+#[derive(Debug, Clone)]
+pub struct VariantEntry<'src> {
+    pub name: &'src str,
+    /// Declaration-order index; the resolver / lowering will use this as
+    /// the runtime discriminant value when the rest of phase #145 lands.
+    pub tag: u64,
+    pub payload: VariantPayloadEntry<'src>,
+}
+
+/// Registry view of [`crate::api::ast::VariantPayload`].  Types are
+/// borrowed from the parsed AST and so share its lifetime.
+#[derive(Debug, Clone)]
+pub enum VariantPayloadEntry<'src> {
+    None,
+    Tuple(Vec<Type<'src>>),
+    Record(Vec<(&'src str, Type<'src>)>),
+}
+
 /// All callable items declared in a single `.lake` file, plus the local
 /// `+import` bindings that bring foreign names into scope.
 #[derive(Debug, Default)]
@@ -172,6 +205,9 @@ pub struct ModuleScope<'src> {
     pub consts: HashMap<&'src str, ConstEntry>,
     /// Record type declarations defined in this file, keyed by source name.
     pub records: HashMap<&'src str, RecordEntry<'src>>,
+    /// Enum type declarations defined in this file, keyed by source name.
+    /// See docs/state/features/145_enums.md — resolver / typeck land later.
+    pub enums: HashMap<&'src str, EnumEntry<'src>>,
     /// Aliases brought into scope by `+import` lines.
     /// Key = local binding name (alias or last path segment).
     /// Value = (target module, target item's source name).
@@ -429,6 +465,35 @@ impl<'src> ProgramRegistry<'src> {
         self.by_path.get(path).copied()
     }
 
+    /// Look up an [`EnumEntry`] by source name in the current module first,
+    /// then any other module's pub-only enums.  Used by the resolver to
+    /// recognise variant constructors / patterns — see
+    /// `docs/state/features/145_enums.md` Phase 2.
+    pub fn lookup_enum(&self, name: &str) -> Option<&EnumEntry<'src>> {
+        if let Some(e) = self.module(self.current).enums.get(name) {
+            return Some(e);
+        }
+        for module in &self.modules {
+            if let Some(e) = module.enums.get(name) {
+                return Some(e);
+            }
+        }
+        None
+    }
+
+    /// Same as [`lookup_enum`] but pinned to a specific module's scope.
+    pub fn lookup_enum_in(&self, current: ModuleId, name: &str) -> Option<&EnumEntry<'src>> {
+        if let Some(e) = self.module(current).enums.get(name) {
+            return Some(e);
+        }
+        for module in &self.modules {
+            if let Some(e) = module.enums.get(name) {
+                return Some(e);
+            }
+        }
+        None
+    }
+
     /// Walk a [`ParsedProgram`] and populate the registry with every
     /// module's machines, ffi declarations, and import bindings.
     ///
@@ -472,7 +537,8 @@ impl<'src> ProgramRegistry<'src> {
                 match &item.inner {
                     Item::Machine(m) => {
                         let name = m.inner.ident.inner.0;
-                        if self.module(id).records.contains_key(name) {
+                        let cur = self.module(id);
+                        if cur.records.contains_key(name) || cur.enums.contains_key(name) {
                             errors.push(tag(
                                 LakeError::new(
                                     format!("duplicate symbol `{name}` in module"),
@@ -526,6 +592,7 @@ impl<'src> ProgramRegistry<'src> {
                         if cur.machines.contains_key(name)
                             || cur.ffi_fns.contains_key(name)
                             || cur.consts.contains_key(name)
+                            || cur.enums.contains_key(name)
                         {
                             errors.push(tag(
                                 LakeError::new(
@@ -564,6 +631,55 @@ impl<'src> ProgramRegistry<'src> {
                             fields: new_fields,
                         };
                         self.module_mut(id).records.insert(name, entry);
+                    }
+                    Item::Enum(decl) => {
+                        let name = decl.inner.name.inner.0;
+                        let cur = self.module(id);
+                        // Cross-namespace collisions surface as E028, same
+                        // shape as records (see above).
+                        if cur.machines.contains_key(name)
+                            || cur.ffi_fns.contains_key(name)
+                            || cur.consts.contains_key(name)
+                            || cur.records.contains_key(name)
+                        {
+                            errors.push(tag(
+                                LakeError::new(
+                                    format!("duplicate symbol `{name}` in module"),
+                                    decl.inner.name.span,
+                                )
+                                .code("E028"),
+                            ));
+                            continue;
+                        }
+                        match build_enum_entry(&decl.inner, id) {
+                            Ok(entry) => {
+                                // Idempotent re-insert if we already saw this
+                                // enum in an earlier `populate_from` round.
+                                if let Some(existing) = cur.enums.get(name) {
+                                    let variants_match = existing.variants.len()
+                                        == entry.variants.len()
+                                        && existing
+                                            .variants
+                                            .iter()
+                                            .zip(entry.variants.iter())
+                                            .all(|(a, b)| a.name == b.name);
+                                    if !variants_match {
+                                        errors.push(tag(
+                                            LakeError::new(
+                                                format!(
+                                                    "duplicate symbol `{name}` in module"
+                                                ),
+                                                decl.inner.name.span,
+                                            )
+                                            .code("E028"),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                self.module_mut(id).enums.insert(name, entry);
+                            }
+                            Err(e) => errors.push(tag(e)),
+                        }
                     }
                 }
             }
@@ -649,6 +765,50 @@ fn branch_signature(branch: &Branch<'_>) -> Signature {
         .map(|t| t.inner.to_string())
         .unwrap_or_else(|| "pid".to_string());
     Signature { params, ret }
+}
+
+/// Convert a parsed [`EnumDecl`] into its registry view.  Rejects
+/// duplicate variant names within the same enum with diagnostic E029.
+fn build_enum_entry<'src>(
+    decl: &EnumDecl<'src>,
+    module: ModuleId,
+) -> Result<EnumEntry<'src>, LakeError> {
+    let name = decl.name.inner.0;
+    let mut seen: HashMap<&'src str, ()> = HashMap::new();
+    let mut variants = Vec::with_capacity(decl.variants.len());
+    for (tag, v) in decl.variants.iter().enumerate() {
+        let vname = v.inner.name.inner.0;
+        if seen.contains_key(vname) {
+            return Err(LakeError::new(
+                format!("duplicate variant `{vname}` in enum `{name}`"),
+                v.inner.name.span,
+            )
+            .code("E029"));
+        }
+        seen.insert(vname, ());
+        let payload = match &v.inner.payload {
+            VariantPayload::None => VariantPayloadEntry::None,
+            VariantPayload::Tuple(ts) => {
+                VariantPayloadEntry::Tuple(ts.iter().map(|t| t.inner.clone()).collect())
+            }
+            VariantPayload::Record(fs) => VariantPayloadEntry::Record(
+                fs.iter()
+                    .map(|(n, t)| (n.inner.0, t.inner.clone()))
+                    .collect(),
+            ),
+        };
+        variants.push(VariantEntry {
+            name: vname,
+            tag: tag as u64,
+            payload,
+        });
+    }
+    Ok(EnumEntry {
+        name,
+        module,
+        type_params: decl.type_params.iter().map(|p| p.inner.0).collect(),
+        variants,
+    })
 }
 
 /// Extract `(name, signature)` from an `@ffi(name { params } { ret })`
@@ -1079,5 +1239,86 @@ mod tests {
 
         let r = reg.resolve_bare("out").expect("alias resolves");
         assert!(matches!(r, Resolution::Machine(m) if m.name == "println"));
+    }
+
+    #[test]
+    fn registry_populates_enum_with_sequential_tags() {
+        let src = "HTTPMethod is enum {
+          Get
+          Post(buf)
+          Delete
+          Open { from i64 }
+        }";
+        let ast = parse_one(src);
+        let program = crate::loader::ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("main.lake"),
+                ast,
+            }],
+        };
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        reg.populate_from(&program).expect("populate");
+        let entry = reg
+            .module(ModuleId::ROOT)
+            .enums
+            .get("HTTPMethod")
+            .expect("registered");
+        assert_eq!(entry.variants.len(), 4);
+        for (i, v) in entry.variants.iter().enumerate() {
+            assert_eq!(v.tag, i as u64, "tags must be declaration-order");
+        }
+        assert_eq!(entry.variants[0].name, "Get");
+        assert!(matches!(entry.variants[0].payload, VariantPayloadEntry::None));
+        assert!(matches!(
+            entry.variants[1].payload,
+            VariantPayloadEntry::Tuple(_)
+        ));
+        assert!(matches!(
+            entry.variants[3].payload,
+            VariantPayloadEntry::Record(_)
+        ));
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_variant_e029() {
+        let src = "Bad is enum { A B A }";
+        let ast = parse_one(src);
+        let program = crate::loader::ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("main.lake"),
+                ast,
+            }],
+        };
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        let res = reg.populate_from(&program);
+        let errs: Vec<LakeError> = res.err().expect("duplicate must error").into_iter().collect();
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E029")),
+            "expected E029, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn registry_rejects_enum_machine_collision_e028() {
+        let src = "Foo is enum { A B }\nFoo is { _ -> ret i64 { ret 0 } }";
+        let ast = parse_one(src);
+        let program = crate::loader::ParsedProgram {
+            modules: vec![crate::loader::ParsedModule {
+                module_path: ModulePath::root(),
+                source_path: std::path::PathBuf::from("main.lake"),
+                ast,
+            }],
+        };
+        let mut reg: ProgramRegistry<'_> = ProgramRegistry::with_rt();
+        let res = reg.populate_from(&program);
+        let errs: Vec<LakeError> = res.err().expect("collision must error").into_iter().collect();
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E028")),
+            "expected E028, got {:?}",
+            errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
     }
 }

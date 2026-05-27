@@ -361,6 +361,37 @@ pub struct RecordDecl<'src> {
     pub fields: Vec<Spanned<RecordField<'src>>>,
 }
 
+/// `Name is enum { variant ... }` — nominal tagged-sum type declaration.
+///
+/// See docs/state/features/145_enums.md.  Phase 1 covers parser / AST /
+/// registry only; resolver, typeck and lowering land in later phases.
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub struct EnumDecl<'src> {
+    pub name: Spanned<Ident<'src>>,
+    /// Generic type parameters.  Empty for phase 1 — #142 fills in
+    /// later when generic enums become reachable from the resolver.
+    pub type_params: Vec<Spanned<Ident<'src>>>,
+    pub variants: Vec<Spanned<Variant<'src>>>,
+}
+
+/// A single variant inside an `is enum { ... }` body.
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub struct Variant<'src> {
+    pub name: Spanned<Ident<'src>>,
+    pub payload: VariantPayload<'src>,
+}
+
+/// What a variant carries.  Three shapes — see #145 for examples.
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub enum VariantPayload<'src> {
+    /// Nullary variant: `Get`, `Empty`.
+    None,
+    /// Tuple-style payload: `Post(buf)`, `Bounded(i64 i64)`.
+    Tuple(Vec<Spanned<Type<'src>>>),
+    /// Record-style payload: `Open { from i64 }`.
+    Record(Vec<(Spanned<Ident<'src>>, Spanned<Type<'src>>)>),
+}
+
 /// A top-level item in a Lake program.  These constructs only appear at the
 /// program root, never as values inside an expression body.
 #[derive(Debug, PartialEq, PartialOrd, Clone)]
@@ -377,6 +408,8 @@ pub enum Item<'src> {
     Const(Spanned<ConstDecl<'src>>),
     /// `[pub] record Name { field Type ... }` — nominal record type.
     Record(Spanned<RecordDecl<'src>>),
+    /// `Name is enum { variant ... }` — nominal tagged-sum type.
+    Enum(Spanned<EnumDecl<'src>>),
 }
 
 /// `[pub] const NAME = <literal>`.
