@@ -48,6 +48,13 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         // for scheduler internals.
         ("rt_allocate", s(&["i64"], "{atom buf}")),
         ("rt_allocate_raw", s(&["i64"], "buf")),
+        // #138 per-actor arena bump allocator.  Plain `buf` ABI matching
+        // rt_allocate_raw (its fallback when the arena is exhausted /
+        // absent).  Caller never gets `{atom buf}` failure tuples — if
+        // the bucket fallback also OOMs, the rt-fn dies the actor and
+        // doesn't return.  Wrapped by stdlib `alloc` / `alloc_or_die`
+        // helpers that present the tuple-ABI surface.
+        ("rt_arena_alloc", s(&["i64"], "buf")),
         ("rt_die_actor", s(&[], "{}")),
         ("rt_free", s(&["buf"], "{}")),
         ("rt_store", s(&["buf", "i64", "i64", "i64"], "{}")),
