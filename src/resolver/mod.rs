@@ -6,8 +6,12 @@ use crate::api::{
     ast::{Branch, Ident, Item, Machine, MachineItem, Type},
     expr::Expr,
 };
+use crate::error_handle::LakeError;
 use crate::loader::ParsedProgram;
-use crate::registry::{ModuleId, ModulePath, ProgramRegistry};
+#[allow(unused_imports)]
+use crate::registry::{
+    EnumEntry, ModuleId, ModulePath, ProgramRegistry, VariantPayloadEntry,
+};
 
 /// True when the parser emitted a placeholder type that the resolver needs to
 /// fill in.  `Type::Unit` (`{}` in source) is *not* unknown — it is a legitimate
@@ -33,6 +37,11 @@ pub struct Resolver<'src, 'r> {
     /// calls in let-RHS inference.  `ModuleId::ROOT` for single-file
     /// compilation.
     current_module: ModuleId,
+    /// Diagnostics emitted by enum-aware rewrites: unknown variant
+    /// (E030), constructor arity mismatch (E031), non-exhaustive enum
+    /// match warning (E032).  See docs/state/features/145_enums.md
+    /// Phase 2.
+    errors: Vec<LakeError>,
 }
 
 impl Default for Resolver<'_, '_> {
@@ -47,6 +56,7 @@ impl<'src, 'r> Resolver<'src, 'r> {
             scope: HashMap::new(),
             registry: None,
             current_module: ModuleId::ROOT,
+            errors: Vec::new(),
         }
     }
 
@@ -61,7 +71,14 @@ impl<'src, 'r> Resolver<'src, 'r> {
             scope: HashMap::new(),
             registry: Some(registry),
             current_module,
+            errors: Vec::new(),
         }
+    }
+
+    /// Drain diagnostics accumulated by enum-aware rewrites.  Caller
+    /// owns them after the resolver pass completes.
+    pub fn take_errors(&mut self) -> Vec<LakeError> {
+        std::mem::take(&mut self.errors)
     }
 
     fn bind(&mut self, name: &'src str, ty: Type<'src>) {
@@ -315,12 +332,420 @@ impl<'src, 'r> Resolver<'src, 'r> {
         }
     }
 
+    // ── Phase 2 of #145: enum constructor / pattern rewrites ─────────────
+
+    /// Look up an enum by source name through the resolver's registry.
+    /// Returns `None` when there is no registry (single-file test mode)
+    /// or no enum with that name in scope.
+    fn lookup_enum(&self, name: &str) -> Option<&'r EnumEntry<'src>> {
+        self.registry.and_then(|r| r.lookup_enum_in(self.current_module, name))
+    }
+
+    /// Build the synthetic tagged-tuple `{ tag, payload... }` that
+    /// every variant value lowers to.  `tag` is an `i64` literal so
+    /// the existing `when` discriminator dispatch handles it without
+    /// a special pass.  Caller passes pre-resolved payload arguments
+    /// in declaration order.
+    fn build_variant_tuple(
+        &self,
+        tag: u64,
+        payload: Vec<Spanned<Expr<'src>>>,
+        span: SimpleSpan,
+    ) -> Expr<'src> {
+        let tag_str: &'static str = Box::leak(tag.to_string().into_boxed_str());
+        let i64_ty = Type::Named(Ident::new("i64").with_span(span));
+        let mut elems: Vec<Spanned<Expr<'src>>> =
+            Vec::with_capacity(1 + payload.len());
+        elems.push(Expr::Num(tag_str, i64_ty).with_span(span));
+        elems.extend(payload);
+        Expr::Tuple(elems)
+    }
+
+    /// Inspect a not-yet-resolved expression and return the enum name
+    /// when it is a variant constructor — either `Enum.Variant` (a
+    /// `DotAccess` with a Var receiver) or `Enum.Variant(args)` (a
+    /// `Jump` whose callee is that DotAccess).  Used by the Let-arm
+    /// type-inference path so `let x = Enum.Variant(...)` binds `x`
+    /// with `Type::Named(EnumName)` rather than the synthetic tagged
+    /// tuple shape.
+    fn peek_variant_ctor_enum(&self, expr: &Expr<'src>) -> Option<&'src str> {
+        let (receiver, _field) = match expr {
+            Expr::DotAccess { receiver, field } => (&receiver.inner, field),
+            Expr::Jump { ident, .. } => match &ident.inner {
+                Expr::DotAccess { receiver, field } => (&receiver.inner, field),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let Expr::Var(name, _) = receiver else { return None };
+        let entry = self.lookup_enum(name)?;
+        Some(entry.name)
+    }
+
+    /// Attempt to rewrite `Expr::DotAccess { Var(EnumName), Variant }`
+    /// into a tagged tuple.  Returns `None` when the receiver isn't a
+    /// known enum.  Variant existence and arity errors land in
+    /// `self.errors`.
+    fn try_rewrite_enum_dot_ctor(
+        &mut self,
+        receiver: &Expr<'src>,
+        field: &Spanned<Ident<'src>>,
+        whole_span: SimpleSpan,
+    ) -> Option<Expr<'src>> {
+        let Expr::Var(name, _) = receiver else {
+            return None;
+        };
+        let enum_entry = self.lookup_enum(name)?;
+        // Cloning the EnumEntry's variants is expensive; copy out just
+        // what we need to keep the immutable borrow short.
+        let enum_name: &'src str = enum_entry.name;
+        let variants_snapshot: Vec<(u64, &'src str, usize)> = enum_entry
+            .variants
+            .iter()
+            .map(|v| {
+                let arity = match &v.payload {
+                    VariantPayloadEntry::None => 0,
+                    VariantPayloadEntry::Tuple(t) => t.len(),
+                    VariantPayloadEntry::Record(r) => r.len(),
+                };
+                (v.tag, v.name, arity)
+            })
+            .collect();
+        let variant_name = field.inner.0;
+        let Some((tag, _, expected_arity)) = variants_snapshot
+            .iter()
+            .find(|(_, n, _)| *n == variant_name)
+            .copied()
+        else {
+            self.errors.push(
+                LakeError::new(
+                    format!("enum `{}` has no variant `{}`", enum_name, variant_name),
+                    field.span,
+                )
+                .code("E030"),
+            );
+            return Some(self.build_variant_tuple(0, vec![], whole_span));
+        };
+        if expected_arity != 0 {
+            self.errors.push(
+                LakeError::new(
+                    format!(
+                        "variant `{}.{}` expects {} payload value(s), got 0",
+                        enum_name, variant_name, expected_arity,
+                    ),
+                    whole_span,
+                )
+                .code("E031"),
+            );
+        }
+        Some(self.build_variant_tuple(tag, vec![], whole_span))
+    }
+
+    /// Attempt to rewrite `Expr::Jump { ident: DotAccess(Enum, Variant),
+    /// args }` into a tagged tuple.  Args are resolved before being
+    /// folded into the tuple.  Returns `None` when the callee isn't a
+    /// known enum constructor.
+    fn try_rewrite_enum_jump_ctor(
+        &mut self,
+        callee: &Spanned<Expr<'src>>,
+        args: Vec<Spanned<Expr<'src>>>,
+        whole_span: SimpleSpan,
+    ) -> Option<Result<Expr<'src>, Vec<Spanned<Expr<'src>>>>> {
+        let Expr::DotAccess { receiver, field } = &callee.inner else {
+            return None;
+        };
+        let Expr::Var(enum_name, _) = &receiver.inner else {
+            return None;
+        };
+        let enum_entry = self.lookup_enum(enum_name)?;
+        let owned_enum_name: &'src str = enum_entry.name;
+        let variants_snapshot: Vec<(u64, &'src str, usize)> = enum_entry
+            .variants
+            .iter()
+            .map(|v| {
+                let arity = match &v.payload {
+                    VariantPayloadEntry::None => 0,
+                    VariantPayloadEntry::Tuple(t) => t.len(),
+                    VariantPayloadEntry::Record(r) => r.len(),
+                };
+                (v.tag, v.name, arity)
+            })
+            .collect();
+        let variant_name = field.inner.0;
+        let Some((tag, _, expected_arity)) = variants_snapshot
+            .iter()
+            .find(|(_, n, _)| *n == variant_name)
+            .copied()
+        else {
+            self.errors.push(
+                LakeError::new(
+                    format!(
+                        "enum `{}` has no variant `{}`",
+                        owned_enum_name, variant_name,
+                    ),
+                    field.span,
+                )
+                .code("E030"),
+            );
+            return Some(Ok(self.build_variant_tuple(0, vec![], whole_span)));
+        };
+        // Resolve args first so any nested forms (literals, vars) are
+        // typed before they enter the tuple.
+        let resolved_args: Vec<Spanned<Expr<'src>>> =
+            args.into_iter().map(|a| self.resolve_expr(a)).collect();
+        if resolved_args.len() != expected_arity {
+            self.errors.push(
+                LakeError::new(
+                    format!(
+                        "variant `{}.{}` expects {} payload value(s), got {}",
+                        owned_enum_name, variant_name, expected_arity, resolved_args.len(),
+                    ),
+                    whole_span,
+                )
+                .code("E031"),
+            );
+        }
+        Some(Ok(self.build_variant_tuple(tag, resolved_args, whole_span)))
+    }
+
+    /// Infer the enum that a `when` scrutinee is matching against.
+    /// Walks the cond expression looking for a `Var` whose declared
+    /// type in scope (or inline `ty`) is a `Type::Named` matching a
+    /// known enum.  Returns the enum's source name when found.
+    fn infer_when_enum(&self, cond: &Expr<'src>) -> Option<&'src str> {
+        let ty = match cond {
+            Expr::Var(name, ty) => {
+                if let Type::Named(id) = ty {
+                    Some(id.inner.0)
+                } else {
+                    // Pattern bindings sometimes leave the inline ty
+                    // Unknown; the scope still carries the real type.
+                    self.scope.get(name).and_then(|t| match t {
+                        Type::Named(id) => Some(id.inner.0),
+                        _ => None,
+                    })
+                }
+            }
+            _ => None,
+        }?;
+        // Confirm it's actually an enum by name.
+        self.lookup_enum(ty).map(|e| e.name)
+    }
+
+    /// Rewrite a single `when` arm pattern when the scrutinee is an
+    /// enum-typed value.  Each arm `Get` becomes `{ tag }`,
+    /// `Post(body)` becomes `{ tag body }`, and the existing tuple-arm
+    /// lowering pass in `lowering.rs` then splits the discriminator
+    /// off and binds the payload via synthetic lets.
+    ///
+    /// Returns the rewritten arm pattern.  Wildcards and literal
+    /// guards pass through unchanged.
+    fn rewrite_when_arm_pattern(
+        &mut self,
+        enum_name: &'src str,
+        arm: Spanned<Expr<'src>>,
+        used_variants: &mut Vec<&'src str>,
+        has_wildcard: &mut bool,
+    ) -> Spanned<Expr<'src>> {
+        let arm_span = arm.span;
+        // #145 phase 3 — also snapshot per-variant payload types so the
+        // payload binder Vars (`Ok(n)` → `Var("n", i64)`) get the right
+        // declared type.  Without this the post-relift
+        // `let n = __wtp.<i>` keeps `Type::Unknown` and let_expr's
+        // codegen rejects the binding.
+        let variants_snapshot: Vec<(u64, &'src str, usize, Vec<Type<'src>>)> = {
+            let Some(entry) = self.lookup_enum(enum_name) else {
+                return arm;
+            };
+            entry
+                .variants
+                .iter()
+                .map(|v| {
+                    let (arity, payload_tys): (usize, Vec<Type<'src>>) = match &v.payload {
+                        VariantPayloadEntry::None => (0, Vec::new()),
+                        VariantPayloadEntry::Tuple(t) => (t.len(), t.clone()),
+                        VariantPayloadEntry::Record(r) => {
+                            (r.len(), r.iter().map(|(_, ty)| ty.clone()).collect())
+                        }
+                    };
+                    (v.tag, v.name, arity, payload_tys)
+                })
+                .collect()
+        };
+        match arm.inner {
+            // `_ -> ...` — wildcard.
+            Expr::Var("_", _) => {
+                *has_wildcard = true;
+                arm
+            }
+            // `Foo -> ...` — bare variant name (nullary) or a Var
+            // catch-all if no variant matches.  We only rewrite when
+            // the name is actually a variant of this enum.
+            Expr::Var(name, ty) => {
+                if let Some((tag, vname, expected)) = variants_snapshot
+                    .iter()
+                    .find(|(_, n, _, _)| *n == name)
+                    .map(|(t, n, e, _)| (*t, *n, *e))
+                {
+                    if expected != 0 {
+                        self.errors.push(
+                            LakeError::new(
+                                format!(
+                                    "variant `{}.{}` requires {} payload binder(s) in pattern",
+                                    enum_name, vname, expected,
+                                ),
+                                arm_span,
+                            )
+                            .code("E031"),
+                        );
+                    }
+                    used_variants.push(vname);
+                    self.build_variant_tuple(tag, vec![], arm_span).with_span(arm_span)
+                } else {
+                    // Catch-all binding — treated as a wildcard arm by
+                    // the existing tuple-arm lowering pass.
+                    *has_wildcard = true;
+                    Expr::Var(name, ty).with_span(arm_span)
+                }
+            }
+            // `Foo(payload...)` — variant pattern with binders.  We
+            // rewrite `Jump { Var("Foo"), [Var("body")] }` into a
+            // tuple pattern `{ Num(tag) Var("body") }`.
+            Expr::Jump { ident, args } => {
+                let variant_name = if let Expr::Var(n, _) = &ident.inner {
+                    Some(*n)
+                } else {
+                    None
+                };
+                let Some(name) = variant_name else {
+                    // Not a variant-shape — re-wrap and resolve normally.
+                    let restored = Expr::Jump { ident, args };
+                    return restored.with_span(arm_span);
+                };
+                let matched = variants_snapshot
+                    .iter()
+                    .find(|(_, n, _, _)| *n == name)
+                    .map(|(t, n, e, ts)| (*t, *n, *e, ts.clone()));
+                if let Some((tag, vname, expected, payload_tys)) = matched {
+                    if expected != args.len() {
+                        self.errors.push(
+                            LakeError::new(
+                                format!(
+                                    "variant `{}.{}` pattern expects {} binder(s), got {}",
+                                    enum_name, vname, expected, args.len(),
+                                ),
+                                arm_span,
+                            )
+                            .code("E031"),
+                        );
+                    }
+                    used_variants.push(vname);
+                    // Args in pattern position are binding names (or
+                    // `_`); keep them as Var so the tuple-arm lowering
+                    // pass emits `let <name> = __wtp.<i>`.  #145 phase 3:
+                    // tag each binder Var with its declared payload
+                    // type so the synth let inherits a concrete type
+                    // (let_expr's codegen rejects Type::Unknown).
+                    let payload: Vec<Spanned<Expr<'src>>> = args
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, a)| {
+                            let span = a.span;
+                            let payload_ty = payload_tys.get(i).cloned();
+                            match a.inner {
+                                Expr::Var(name, prev_ty) => {
+                                    // Wildcard `_` keeps Type::Unknown
+                                    // — lower_when_tuple_patterns omits
+                                    // the let entirely so the type
+                                    // doesn't matter.
+                                    let new_ty = if name == "_" {
+                                        prev_ty
+                                    } else if matches!(prev_ty, Type::Unknown) {
+                                        payload_ty.unwrap_or(prev_ty)
+                                    } else {
+                                        prev_ty
+                                    };
+                                    Expr::Var(name, new_ty).with_span(span)
+                                }
+                                Expr::Num(_, _) => a,
+                                other => other.with_span(span),
+                            }
+                        })
+                        .collect();
+                    self.build_variant_tuple(tag, payload, arm_span).with_span(arm_span)
+                } else {
+                    // Unknown variant name in this enum's pattern arm.
+                    self.errors.push(
+                        LakeError::new(
+                            format!("enum `{}` has no variant `{}`", enum_name, name),
+                            ident.span,
+                        )
+                        .code("E030"),
+                    );
+                    Expr::Jump { ident, args }.with_span(arm_span)
+                }
+            }
+            other => other.with_span(arm_span),
+        }
+    }
+
+    /// Emit E032 when an enum-typed `when` does not cover every
+    /// variant and lacks a wildcard arm.  Phase 2 surfaces this as a
+    /// warning by routing through the diagnostic stream (severity
+    /// upgrade is a Phase 3 task — see #145).
+    fn check_exhaustiveness(
+        &mut self,
+        enum_name: &'src str,
+        used: &[&'src str],
+        has_wildcard: bool,
+        when_span: SimpleSpan,
+    ) {
+        if has_wildcard {
+            return;
+        }
+        let Some(entry) = self.lookup_enum(enum_name) else {
+            return;
+        };
+        let missing: Vec<&'src str> = entry
+            .variants
+            .iter()
+            .map(|v| v.name)
+            .filter(|n| !used.contains(n))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let missing_str = missing.join(", ");
+        self.errors.push(
+            LakeError::new(
+                format!(
+                    "non-exhaustive `when` on enum `{}`: missing variant(s) `{}`",
+                    enum_name, missing_str,
+                ),
+                when_span,
+            )
+            .code("E032"),
+        );
+    }
+
     fn resolve_expr(&mut self, expr: Spanned<Expr<'src>>) -> Spanned<Expr<'src>> {
         let span = expr.span;
         let inner = match expr.inner {
             Expr::Var(name, ty) => Expr::Var(name, self.resolve_var_ty(name, ty)),
 
             Expr::Let { ident, ty, default } => {
+                // #145 phase 3 — if the default is a variant constructor
+                // (`Enum.Variant` or `Enum.Variant(args)`), peek the
+                // pre-resolved AST for the enum name so the let infers
+                // as `Type::Named(EnumName)`.  Without this, the
+                // post-rewrite `Tuple([...])` infers as
+                // `Type::Struct([i64, …])` and subsequent calls
+                // (`unwrap(good)` where `unwrap` takes a `Result`) fail
+                // typeck with a "no branch matches" error.
+                let variant_enum_name = default
+                    .as_ref()
+                    .and_then(|d| self.peek_variant_ctor_enum(&d.inner));
+
                 // Pre-bind so the default can reference the binding (matches
                 // existing semantics).
                 self.bind(ident.inner.0, ty.inner.clone());
@@ -330,7 +755,11 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 // from the default's resolved expression.  Registry-aware
                 // inference covers literals, arithmetic, and call returns.
                 let final_ty_inner = if is_unknown(&ty.inner) {
-                    if let Some(d) = &default {
+                    if let Some(enum_name) = variant_enum_name {
+                        // Variant constructor — type is the enum itself,
+                        // not the synthetic tagged tuple shape.
+                        src_named(enum_name, ty.span)
+                    } else if let Some(d) = &default {
                         self.infer_expr_type(&d.inner, d.span)
                     } else {
                         ty.inner.clone()
@@ -352,9 +781,33 @@ impl<'src, 'r> Resolver<'src, 'r> {
             }
 
             Expr::Jump { ident, args } => {
-                let ident = Box::new(self.resolve_expr(*ident));
-                let args = args.into_iter().map(|a| self.resolve_expr(a)).collect();
-                Expr::Jump { ident, args }
+                // Enum constructor call: `HTTPMethod.Post("body")`.  We
+                // rewrite into a tagged tuple BEFORE the args are
+                // resolved (try_rewrite_enum_jump_ctor resolves them
+                // itself so it can validate arity against the variant's
+                // declared payload).  Non-enum callees fall through to
+                // the normal Jump path.
+                if let Some(rewritten) =
+                    self.try_rewrite_enum_jump_ctor(&ident, args.clone(), span)
+                {
+                    match rewritten {
+                        Ok(e) => e,
+                        // The Err variant is unused today; reserved for
+                        // future "rewrite refused" paths.
+                        Err(restored_args) => Expr::Jump {
+                            ident: Box::new(self.resolve_expr(*ident)),
+                            args: restored_args
+                                .into_iter()
+                                .map(|a| self.resolve_expr(a))
+                                .collect(),
+                        },
+                    }
+                } else {
+                    let ident = Box::new(self.resolve_expr(*ident));
+                    let args =
+                        args.into_iter().map(|a| self.resolve_expr(a)).collect();
+                    Expr::Jump { ident, args }
+                }
             }
 
             Expr::Add(l, r) => Expr::Add(
@@ -399,14 +852,45 @@ impl<'src, 'r> Resolver<'src, 'r> {
 
             Expr::When { cond, branches } => {
                 let cond = Box::new(self.resolve_expr(*cond));
-                let branches = branches
+                // Did the scrutinee resolve to an enum-typed value?
+                // If so, arms with bare variant names (`Get -> …`) or
+                // variant call shapes (`Post(body) -> …`) get
+                // rewritten into the tagged-tuple form the existing
+                // tuple-arm lowering pass already understands.
+                let enum_name = self.infer_when_enum(&cond.inner);
+                let mut used_variants: Vec<&'src str> = Vec::new();
+                let mut has_wildcard = false;
+                let branches: Vec<_> = branches
                     .into_iter()
                     .map(|(pat, body)| {
-                        let pat = self.resolve_expr(pat);
-                        let body = body.into_iter().map(|e| self.resolve_expr(e)).collect();
+                        let pat = if let Some(en) = enum_name {
+                            // First resolve sub-expressions (e.g.
+                            // nested calls) THEN apply the variant
+                            // rewrite.  The variant rewrite operates
+                            // on the un-resolved arm shape (Var or
+                            // Jump-with-Var-callee), so we must
+                            // dispatch BEFORE the generic resolve_expr
+                            // path mangles it (e.g. turning a Var into
+                            // a resolved Var with a non-Unknown ty).
+                            self.rewrite_when_arm_pattern(
+                                en,
+                                pat,
+                                &mut used_variants,
+                                &mut has_wildcard,
+                            )
+                        } else {
+                            self.resolve_expr(pat)
+                        };
+                        let body = body
+                            .into_iter()
+                            .map(|e| self.resolve_expr(e))
+                            .collect();
                         (pat, body)
                     })
                     .collect();
+                if let Some(en) = enum_name {
+                    self.check_exhaustiveness(en, &used_variants, has_wildcard, span);
+                }
                 Expr::When { cond, branches }
             }
 
@@ -456,10 +940,21 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 receiver: Box::new(self.resolve_expr(*receiver)),
                 index: Box::new(self.resolve_expr(*index)),
             },
-            Expr::DotAccess { receiver, field } => Expr::DotAccess {
-                receiver: Box::new(self.resolve_expr(*receiver)),
-                field,
-            },
+            Expr::DotAccess { receiver, field } => {
+                // Nullary enum constructor: `HTTPMethod.Get`.  Detect
+                // before resolving the receiver, otherwise `HTTPMethod`
+                // would surface as an undeclared variable diagnostic.
+                if let Some(rewritten) =
+                    self.try_rewrite_enum_dot_ctor(&receiver.inner, &field, span)
+                {
+                    rewritten
+                } else {
+                    Expr::DotAccess {
+                        receiver: Box::new(self.resolve_expr(*receiver)),
+                        field,
+                    }
+                }
+            }
             Expr::RecordLiteral { name, fields } => Expr::RecordLiteral {
                 name,
                 fields: fields
@@ -548,11 +1043,27 @@ pub fn resolve<'src>(program: Vec<Spanned<Item<'src>>>) -> Vec<Spanned<Item<'src
 /// The registry is mutated only insofar as `current_module` is bumped per
 /// iteration; machine / ffi / import entries remain unchanged.
 pub fn resolve_program<'src>(
-    mut program: ParsedProgram<'src>,
+    program: ParsedProgram<'src>,
     registry: &mut ProgramRegistry<'src>,
 ) -> ParsedProgram<'src> {
+    // Drop the diagnostic stream — callers that need it use
+    // [`resolve_program_with_errors`] directly.  Existing call sites
+    // (tests, the lowering pipeline) keep their pre-Phase-2 contract.
+    resolve_program_with_errors(program, registry).0
+}
+
+/// Same as [`resolve_program`] but also returns diagnostics emitted by
+/// the resolver's enum-aware rewrites (E030 / E031 / E032).  Callers
+/// that participate in the multi-stage error bag (the prelude
+/// `build_program` pipeline) use this entry point so per-module
+/// diagnostics get tagged with the right source path.
+pub fn resolve_program_with_errors<'src>(
+    mut program: ParsedProgram<'src>,
+    registry: &mut ProgramRegistry<'src>,
+) -> (ParsedProgram<'src>, Vec<LakeError>) {
     let modules = std::mem::take(&mut program.modules);
     let mut resolved_modules = Vec::with_capacity(modules.len());
+    let mut all_errors: Vec<LakeError> = Vec::new();
 
     for module in modules {
         let id = registry
@@ -562,6 +1073,13 @@ pub fn resolve_program<'src>(
 
         let mut resolver = Resolver::with_registry(registry, id);
         let resolved_ast = resolver.resolve(module.ast);
+        let mp = module.source_path.clone();
+        for mut e in resolver.take_errors() {
+            if e.source_path.is_none() {
+                e.source_path = Some(mp.clone());
+            }
+            all_errors.push(e);
+        }
 
         resolved_modules.push(crate::loader::ParsedModule {
             module_path: module.module_path,
@@ -571,7 +1089,7 @@ pub fn resolve_program<'src>(
     }
 
     program.modules = resolved_modules;
-    program
+    (program, all_errors)
 }
 
 // ── inference helpers ──────────────────────────────────────────────────────
@@ -1096,6 +1614,184 @@ caller is { _ -> { let r = parse_request(b) let m = r.0 let p = r.1 } }
         assert!(
             matches!(&ty_p.inner, Type::Named(i) if i.inner == Ident::new("buf")),
             "expected r.1 -> buf, got {ty_p:?}"
+        );
+    }
+
+    // ── Phase 2 of #145: enum constructor / pattern rewrites ─────────────
+
+    /// Resolve `src`, return both the first branch body of `main` AND
+    /// the resolver-stage diagnostics so each Phase-2 test can inspect
+    /// the rewritten AST and any E03x errors in one shot.
+    fn resolve_with_reg_errs(
+        src: &str,
+    ) -> (Vec<Expr<'_>>, Vec<crate::error_handle::LakeError>) {
+        let module = parsed_module(src);
+        let program = crate::loader::ParsedProgram { modules: vec![module] };
+        let mut reg: crate::registry::ProgramRegistry<'_> =
+            crate::registry::ProgramRegistry::with_rt();
+        reg.populate_from(&program).expect("populate");
+        let (resolved, errs) =
+            super::resolve_program_with_errors(program, &mut reg);
+        let m = resolved.root();
+        let machine = m
+            .ast
+            .iter()
+            .filter_map(|it| match &it.inner {
+                Item::Machine(mm) => Some(mm),
+                _ => None,
+            })
+            .last()
+            .expect("at least one machine");
+        let MachineItem::Branch(b) = &machine.inner.items[0].inner else {
+            panic!()
+        };
+        let body = b.body.iter().map(|e| e.inner.clone()).collect();
+        // Leak the errors with the same lifetime as `body` — they share
+        // the source &'src str.  We immediately consume them.
+        (body, errs)
+    }
+
+    fn extract_tuple<'a, 'src>(e: &'a Expr<'src>) -> &'a Vec<chumsky::span::Spanned<Expr<'src>>> {
+        match e {
+            Expr::Tuple(elems) => elems,
+            other => panic!("expected Tuple, got {other:?}"),
+        }
+    }
+
+    fn extract_num(e: &Expr<'_>) -> i64 {
+        match e {
+            Expr::Num(s, _) => crate::api::expr::parse_int_literal(s).expect("int"),
+            other => panic!("expected Num, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_nullary_ctor_rewrites_to_tag_tuple() {
+        let src = r#"
+            HTTPMethod is enum { Get Post(buf) }
+            main is { _ -> { let m = HTTPMethod.Get } }
+        "#;
+        let (body, errs) = resolve_with_reg_errs(src);
+        assert!(errs.is_empty(), "unexpected errs: {:?}", errs);
+        let Expr::Let { default: Some(d), .. } = &body[0] else {
+            panic!("expected Let, got {:?}", body[0])
+        };
+        let elems = extract_tuple(&d.inner);
+        assert_eq!(elems.len(), 1);
+        assert_eq!(extract_num(&elems[0].inner), 0);
+    }
+
+    #[test]
+    fn enum_tuple_ctor_rewrites_with_payload() {
+        let src = r#"
+            HTTPMethod is enum { Get Post(buf) }
+            main is { _ -> { let m = HTTPMethod.Post("body") } }
+        "#;
+        let (body, errs) = resolve_with_reg_errs(src);
+        assert!(errs.is_empty(), "unexpected errs: {:?}", errs);
+        let Expr::Let { default: Some(d), .. } = &body[0] else {
+            panic!("expected Let, got {:?}", body[0])
+        };
+        let elems = extract_tuple(&d.inner);
+        assert_eq!(elems.len(), 2, "tag + payload");
+        assert_eq!(extract_num(&elems[0].inner), 1);
+        assert!(
+            matches!(&elems[1].inner, Expr::String("body", _)),
+            "payload should be the literal, got {:?}", elems[1].inner
+        );
+    }
+
+    #[test]
+    fn enum_record_payload_ctor_positional_form() {
+        // Phase 2 ships positional form for record-payload variants
+        // (`Patch("x")`); the named-field surface `Patch { from = "x" }`
+        // depends on a parser extension and is deferred.
+        let src = r#"
+            HTTPMethod is enum { Get Post(buf) Patch { from buf } }
+            main is { _ -> { let m = HTTPMethod.Patch("x") } }
+        "#;
+        let (body, errs) = resolve_with_reg_errs(src);
+        assert!(errs.is_empty(), "unexpected errs: {:?}", errs);
+        let Expr::Let { default: Some(d), .. } = &body[0] else { panic!() };
+        let elems = extract_tuple(&d.inner);
+        assert_eq!(elems.len(), 2);
+        assert_eq!(extract_num(&elems[0].inner), 2);
+    }
+
+    #[test]
+    fn enum_unknown_variant_errors_e030() {
+        let src = r#"
+            HTTPMethod is enum { Get Post(buf) }
+            main is { _ -> { let m = HTTPMethod.Bogus } }
+        "#;
+        let (_body, errs) = resolve_with_reg_errs(src);
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E030")),
+            "expected E030, got {:?}", errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn enum_wrong_arity_errors_e031() {
+        let src = r#"
+            HTTPMethod is enum { Get Post(buf) }
+            main is { _ -> { let m = HTTPMethod.Post() } }
+        "#;
+        let (_body, errs) = resolve_with_reg_errs(src);
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E031")),
+            "expected E031, got {:?}", errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn enum_when_patterns_rewrite_to_tagged_tuples() {
+        let src = r#"
+            HTTPMethod is enum { Get Post(buf) }
+            main is { m HTTPMethod -> { when m { Get -> { 1 } Post(body) -> { 2 } _ -> { 0 } } } }
+        "#;
+        let (body, errs) = resolve_with_reg_errs(src);
+        assert!(errs.is_empty(), "unexpected errs: {:?}", errs);
+        let Expr::When { branches, .. } = &body[0] else {
+            panic!("expected When, got {:?}", body[0])
+        };
+        assert_eq!(branches.len(), 3);
+        // Arm 0: Get → { 0 }
+        let elems = extract_tuple(&branches[0].0.inner);
+        assert_eq!(elems.len(), 1);
+        assert_eq!(extract_num(&elems[0].inner), 0);
+        // Arm 1: Post(body) → { 1, body }
+        let elems = extract_tuple(&branches[1].0.inner);
+        assert_eq!(elems.len(), 2);
+        assert_eq!(extract_num(&elems[0].inner), 1);
+        assert!(matches!(&elems[1].inner, Expr::Var("body", _)));
+        // Arm 2: _ stays as wildcard.
+        assert!(matches!(&branches[2].0.inner, Expr::Var("_", _)));
+    }
+
+    #[test]
+    fn enum_when_non_exhaustive_warns_e032() {
+        let src = r#"
+            HTTPMethod is enum { Get Post(buf) }
+            main is { m HTTPMethod -> { when m { Get -> { 1 } } } }
+        "#;
+        let (_body, errs) = resolve_with_reg_errs(src);
+        assert!(
+            errs.iter().any(|e| e.code.as_deref() == Some("E032")),
+            "expected E032, got {:?}", errs.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn enum_when_with_wildcard_is_exhaustive() {
+        let src = r#"
+            HTTPMethod is enum { Get Post(buf) }
+            main is { m HTTPMethod -> { when m { Get -> { 1 } _ -> { 0 } } } }
+        "#;
+        let (_body, errs) = resolve_with_reg_errs(src);
+        assert!(
+            !errs.iter().any(|e| e.code.as_deref() == Some("E032")),
+            "unexpected E032: {:?}", errs.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
     }
 }
