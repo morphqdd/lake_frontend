@@ -55,6 +55,15 @@ pub fn builtin_signatures() -> Vec<(&'static str, Signature)> {
         // doesn't return.  Wrapped by stdlib `alloc` / `alloc_or_die`
         // helpers that present the tuple-ABI surface.
         ("rt_arena_alloc", s(&["i64"], "buf")),
+        // #150 phase 2 — slab allocator chunk producer.  Takes a
+        // class index (NOT a size!) and returns a raw chunk address.
+        // Callers wire the 16-byte fat-ptr header inside the chunk
+        // themselves.  Wrapped by stdlib `alloc_slab` helper.
+        ("rt_allocate_slab", s(&["i64"], "i64")),
+        // #150 phase 3 — return a chunk previously vended by
+        // rt_allocate_slab.  Address-aligned masking recovers the
+        // owning slab; munmaps the slab when the last chunk is freed.
+        ("rt_free_slab", s(&["i64"], "{}")),
         ("rt_die_actor", s(&[], "{}")),
         ("rt_free", s(&["buf"], "{}")),
         ("rt_store", s(&["buf", "i64", "i64", "i64"], "{}")),

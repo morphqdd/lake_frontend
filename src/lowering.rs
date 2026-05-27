@@ -1830,9 +1830,17 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                             for (offset, sub) in elems_iter.enumerate() {
                                 let idx = offset + 1;
                                 let sub_span = sub.span;
-                                let bind_name = match &sub.inner {
-                                    Expr::Var(n, _) => Some(*n),
-                                    _ => None,
+                                let (bind_name, sub_ty) = match &sub.inner {
+                                    // #145 phase 3: variant-pattern
+                                    // payload binders carry their
+                                    // declared payload type from the
+                                    // resolver; propagate it into the
+                                    // synthesised let so let_expr's
+                                    // codegen finds a concrete type
+                                    // and doesn't bail with
+                                    // "Unknown type '?'".
+                                    Expr::Var(n, ty) => (Some(*n), ty.clone()),
+                                    _ => (None, Type::Unknown),
                                 };
                                 if let Some(n) = bind_name {
                                     if n == "_" {
@@ -1847,7 +1855,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                                         Expr::Let {
                                             ident: Ident::new(n)
                                                 .with_span(sub_span),
-                                            ty: Type::Unknown
+                                            ty: sub_ty
                                                 .with_span(sub_span),
                                             default: Some(Box::new(
                                                 Expr::TupleIndex {
@@ -3789,6 +3797,197 @@ fn type_from_string<'src>(s: &str, span: SimpleSpan) -> Type<'src> {
         }
     };
     Type::Named(Ident::new(static_name).with_span(span))
+}
+
+// ── post-resolver re-lift pass (#145 phase 3) ──────────────────────────────
+
+/// Second narrow lowering sweep over an already-lowered program.
+///
+/// Phase 2 of #145 (enums) rewrites variant constructors and pattern
+/// arms inside the resolver, which runs AFTER `lower_program` in
+/// [`crate::prelude::build_program`].  Two transforms therefore miss
+/// the freshly-emitted shapes:
+///
+///   * `lift_nested_calls` doesn't see nested `Expr::Tuple` ctors
+///     (`foo(Result.Ok(7))` lands as a raw tuple in arg position,
+///     which the backend's `tuple_expr` / `send_expr` refuses —
+///     tuples in value position must be bound to a `let` first).
+///   * `lower_when_tuple_patterns` doesn't see the new
+///     `{ Num(tag) Var(payload) }` arm patterns the resolver emits
+///     for `Ok(n) -> ...`, leaving the payload binders ungenerated
+///     so typeck reports "undeclared variable `n`" inside arm
+///     bodies.
+///
+/// This pass re-fires just those two transforms: for every machine
+/// branch body, it descends through nested control-flow (`when` /
+/// `wait` arms) and applies `lower_when_tuple_patterns` followed by
+/// `lift_nested_calls`.  Other lowering phases (`__caller` prepending,
+/// ret rewriting, pure inlining, `expand_let_with_ret`) are NOT
+/// idempotent across runs and stay one-shot in `lower_program`.
+///
+/// Running `lower_when_tuple_patterns` a second time on an AST whose
+/// non-enum tuple arms were already lowered is safe — those arms now
+/// have a plain (non-tuple) discriminator pattern in the outer
+/// `when`, so `any_tuple` is false and the rewrite is skipped.
+/// `lift_nested_calls` is similarly idempotent: it only fires on
+/// non-leaf positions, which become leaves after one pass.
+pub fn relift_program<'src>(
+    program: ParsedProgram<'src>,
+    registry: &ProgramRegistry<'src>,
+) -> ParsedProgram<'src> {
+    // ret_machines + pure_bodies are only consulted by passes we DON'T
+    // re-run here; lift_nested_calls itself only touches the counter
+    // and registry-aware lookups through `self.registry`.  Empty maps
+    // are fine.
+    let ret_machines: HashMap<RetKey, String> = HashMap::new();
+    let pure_bodies: HashMap<RetKey, PureBodyTemplate<'src>> = HashMap::new();
+    // Bump the counter past any name `lower_program` might have
+    // emitted.  Starting fresh (0) would risk colliding with names
+    // already in the AST; high-water 1_000_000 is well past any
+    // realistic per-program count.
+    let counter = Rc::new(Cell::new(1_000_000u32));
+
+    let modules = program
+        .modules
+        .into_iter()
+        .map(|module| {
+            let module_id = registry
+                .module_id_for_path(&module.module_path)
+                .expect("populate_from must run before relift_program");
+            let cx = LowerCx {
+                registry,
+                module_id,
+                ret_machines: &ret_machines,
+                pure_bodies: &pure_bodies,
+                counter: counter.clone(),
+            };
+            cx.relift_module(module)
+        })
+        .collect();
+    ParsedProgram { modules }
+}
+
+impl<'a, 'src> LowerCx<'a, 'src> {
+    fn relift_module(&self, module: ParsedModule<'src>) -> ParsedModule<'src> {
+        let ast = module
+            .ast
+            .into_iter()
+            .map(|item| {
+                let span = item.span;
+                match item.inner {
+                    Item::Machine(m) => {
+                        let machine_span = m.span;
+                        let mut machine = m.inner;
+                        machine.items = machine
+                            .items
+                            .into_iter()
+                            .map(|mi| {
+                                let mi_span = mi.span;
+                                match mi.inner {
+                                    MachineItem::Branch(b) => {
+                                        let body = self.relift_body(b.body);
+                                        MachineItem::Branch(Branch::new(
+                                            b.label,
+                                            b.patterns,
+                                            b.ret_ty,
+                                            body,
+                                        ))
+                                        .with_span(mi_span)
+                                    }
+                                    other => other.with_span(mi_span),
+                                }
+                            })
+                            .collect();
+                        Item::Machine(machine.with_span(machine_span)).with_span(span)
+                    }
+                    other => other.with_span(span),
+                }
+            })
+            .collect();
+        ParsedModule {
+            module_path: module.module_path,
+            source_path: module.source_path,
+            ast,
+        }
+    }
+
+    /// Re-fire the two resolver-aware transforms on one body: turn
+    /// freshly-emitted enum-arm tuple patterns into wtp-let lowering,
+    /// then hoist nested tuples into argument-position lets.  Finally
+    /// descend through every statement so nested `when` / `wait` arm
+    /// bodies are re-processed too.
+    fn relift_body(&self, body: Vec<Spanned<Expr<'src>>>) -> Vec<Spanned<Expr<'src>>> {
+        // Phase 2's pattern rewrite (Get -> { Num(0) }, Ok(n) ->
+        // { Num(0) Var(n) }) lands in arm-pattern position after
+        // lower_program already ran.  Re-run the tuple-pattern
+        // lowering so the new tuple arms get their __wtp_<id> +
+        // payload let-bindings emitted.
+        let body: Vec<_> = body
+            .into_iter()
+            .flat_map(|e| self.lower_when_tuple_patterns(e))
+            .collect();
+        let body = self.lift_nested_calls(body);
+        body.into_iter().map(|e| self.relift_in_expr(e)).collect()
+    }
+
+    /// Walk an expression and re-lift any `when` / `wait` arm bodies.
+    /// Mirrors `lower_arm_bodies_in_expr` in shape but invokes
+    /// `relift_body` (not `lower_body_impl`) so only the lift pass runs
+    /// at each arm — other lowering phases stay one-shot.
+    fn relift_in_expr(&self, expr: Spanned<Expr<'src>>) -> Spanned<Expr<'src>> {
+        let span = expr.span;
+        let inner = match expr.inner {
+            Expr::When { cond, branches } => {
+                let cond = Box::new(self.relift_in_expr(*cond));
+                let branches = branches
+                    .into_iter()
+                    .map(|(pat, body)| {
+                        let pat = self.relift_in_expr(pat);
+                        let body = self.relift_body(body);
+                        (pat, body)
+                    })
+                    .collect();
+                Expr::When { cond, branches }
+            }
+            Expr::Wait { handlers, filter } => {
+                let filter = filter
+                    .into_iter()
+                    .map(|f| self.relift_in_expr(f))
+                    .collect();
+                let handlers = handlers
+                    .into_iter()
+                    .map(|h| {
+                        let h_span = h.span;
+                        let mut br = h.inner;
+                        br.body = self.relift_body(br.body);
+                        br.with_span(h_span)
+                    })
+                    .collect();
+                Expr::Wait { handlers, filter }
+            }
+            Expr::Let { ident, ty, default } => Expr::Let {
+                ident,
+                ty,
+                default: default.map(|d| Box::new(self.relift_in_expr(*d))),
+            },
+            Expr::Jump { ident, args } => Expr::Jump {
+                ident: Box::new(self.relift_in_expr(*ident)),
+                args: args.into_iter().map(|a| self.relift_in_expr(a)).collect(),
+            },
+            Expr::Ret(inner) => Expr::Ret(Box::new(self.relift_in_expr(*inner))),
+            Expr::Pin(inner) => Expr::Pin(Box::new(self.relift_in_expr(*inner))),
+            Expr::Tuple(elems) => Expr::Tuple(
+                elems.into_iter().map(|e| self.relift_in_expr(e)).collect(),
+            ),
+            Expr::TupleIndex { receiver, index } => Expr::TupleIndex {
+                receiver: Box::new(self.relift_in_expr(*receiver)),
+                index,
+            },
+            Expr::Neg(inner) => Expr::Neg(Box::new(self.relift_in_expr(*inner))),
+            other => other,
+        };
+        inner.with_span(span)
+    }
 }
 
 // ── module-aware machine-symbol mangling (#097, #102) ──────────────────────
