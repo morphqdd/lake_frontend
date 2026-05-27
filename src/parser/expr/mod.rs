@@ -31,6 +31,24 @@ pub fn expr<'t, 'src: 't>()
             Token::String(n) = e =>
                 Expr::String(n, Type::Named(Ident::new("str").with_span(e.span())))
         };
+        // `b"..."` → reuse `Expr::String` with `buf` type.  The raw
+        // inner slice carries un-decoded escapes; backend's `unescape`
+        // resolves them at codegen, exactly like `str` literals.
+        let byte_string_lit = select_ref! {
+            Token::ByteStr(n) = e =>
+                Expr::String(n, Type::Named(Ident::new("buf").with_span(e.span())))
+        };
+        // `'X'` — char literal.  Lexer decoded the byte value; here we
+        // leak its decimal representation into a static slice so the
+        // existing `Expr::Num` shape (which expects `&'src str` and
+        // re-parses via `parse_int_literal`) keeps working uniformly.
+        let char_lit = select_ref! {
+            Token::Char(b) = e => {
+                let leaked: &'static str =
+                    Box::leak((*b as i64).to_string().into_boxed_str());
+                Expr::Num(leaked, Type::Named(Ident::new("i64").with_span(e.span())))
+            }
+        };
         let bool_false = just(Token::False).to(Expr::Bool(false));
         let bool_true = just(Token::True).to(Expr::Bool(true));
         // A bare ident becomes `Expr::Var`; an ident followed by one or
@@ -124,7 +142,9 @@ pub fn expr<'t, 'src: 't>()
             atom_lit.boxed(),
             paren_group.boxed(),
             num.boxed(),
+            char_lit.boxed(),
             string_lit.boxed(),
+            byte_string_lit.boxed(),
             bool_false.boxed(),
             bool_true.boxed(),
             self_kw.boxed(),
@@ -399,6 +419,11 @@ pub fn expr<'t, 'src: 't>()
                                 )
                                 .with_span(span),
                                 Expr::Path(_) => acc,
+                                // `Enum.Variant(args)` — enum constructor
+                                // call.  Phase 2 of #145.  The resolver
+                                // rewrites this into a tagged tuple; the
+                                // parser only needs to admit the shape.
+                                Expr::DotAccess { .. } => acc,
                                 ref other => {
                                     emitter.emit(Rich::custom(
                                         span,

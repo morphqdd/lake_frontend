@@ -7,6 +7,16 @@ pub enum Token<'src> {
     Ident(&'src str),
     Num(&'src str),
     String(&'src str),
+    /// `b"..."` — byte-string literal.  Carries the raw inner slice
+    /// (escapes left un-processed, same shape as `String`).  Lowers to
+    /// `Expr::String` typed as `buf` instead of `str`; the backend's
+    /// existing string-literal codegen path handles both equivalently
+    /// (`unescape` + rodata + fat-ptr).
+    ByteStr(&'src str),
+    /// `'X'` — char literal.  Carries the decoded byte value
+    /// (`'A'` → 65, `'\n'` → 10, `'\xff'` → 255).  Lowers to
+    /// `Expr::Num` typed as `i64` — no dedicated char type exists yet.
+    Char(u8),
     /// `(...)` with at least one whitespace between the opening `(`
     /// and the previous non-comment token.  Use sites:
     ///   * paren-group (`(a + b) * c`).
@@ -87,6 +97,8 @@ impl<'src> Display for Token<'src> {
             Token::Ident(src) => write!(f, "{src}"),
             Token::Num(src) => write!(f, "{src}"),
             Token::String(src) => write!(f, "\"{src}\""),
+            Token::ByteStr(src) => write!(f, "b\"{src}\""),
+            Token::Char(b) => write!(f, "'\\x{b:02x}'"),
             Token::Arrow => write!(f, "->"),
             Token::Dot => write!(f, "."),
             Token::Colon => write!(f, ":"),

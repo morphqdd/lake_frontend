@@ -9,6 +9,53 @@ use chumsky::{
 
 use crate::api::token::Token;
 
+/// Decode the body of a `'...'` char or `b"..."` byte-string at lex
+/// time.  Supports the same escape subset:
+///   `\n` `\r` `\t` `\0` `\\` `\'` `\"` `\xHH`.
+/// Any other backslash-escape yields a lexer error.
+fn decode_escapes(body: &str) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c != b'\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // `\` — consume one more byte (or two for `\xHH`).
+        if i + 1 >= bytes.len() {
+            return Err("trailing backslash".to_string());
+        }
+        let e = bytes[i + 1];
+        match e {
+            b'n' => { out.push(b'\n'); i += 2; }
+            b'r' => { out.push(b'\r'); i += 2; }
+            b't' => { out.push(b'\t'); i += 2; }
+            b'0' => { out.push(0); i += 2; }
+            b'\\' => { out.push(b'\\'); i += 2; }
+            b'\'' => { out.push(b'\''); i += 2; }
+            b'"' => { out.push(b'"'); i += 2; }
+            b'x' => {
+                if i + 3 >= bytes.len() {
+                    return Err("incomplete \\xHH escape".to_string());
+                }
+                let hi = (bytes[i + 2] as char)
+                    .to_digit(16)
+                    .ok_or_else(|| "invalid hex digit in \\xHH".to_string())?;
+                let lo = (bytes[i + 3] as char)
+                    .to_digit(16)
+                    .ok_or_else(|| "invalid hex digit in \\xHH".to_string())?;
+                out.push(((hi << 4) | lo) as u8);
+                i += 4;
+            }
+            other => return Err(format!("unknown escape: \\{}", other as char)),
+        }
+    }
+    Ok(out)
+}
+
 pub fn lexer<'src>()
 -> impl Parser<'src, &'src str, Vec<Spanned<Token<'src>>>, extra::Err<Rich<'src, char>>> {
     recursive(|token| {
@@ -53,11 +100,64 @@ pub fn lexer<'src>()
                 .map(Token::Num),
         ));
 
+        // Byte-string literal `b"..."`.  Same escape grammar as
+        // `String` — body bytes are kept un-decoded; the parser /
+        // codegen path runs `unescape` later.  Must come before the
+        // ident rule, otherwise the lexer would slice `b` as an
+        // identifier and the trailing `"..."` would lex as a separate
+        // plain string.
+        let byte_string = just("b").ignore_then(
+            choice((
+                just('\\').then(any()).to_slice(),
+                any().and_is(one_of("\"\\").not()).to_slice(),
+            ))
+                .repeated()
+                .to_slice()
+                .delimited_by(just("\""), just("\""))
+                .to_slice()
+                .map(|s: &'src str| {
+                    Token::ByteStr(
+                        s.strip_prefix("\"")
+                            .unwrap_or(s)
+                            .strip_suffix("\"")
+                            .unwrap_or(s),
+                    )
+                }),
+        );
+
+        // Char literal `'X'` — single byte value with the same escape
+        // subset as byte-strings, decoded at lex time so the rest of
+        // the pipeline sees a plain `i64`.  Empty (`''`) and
+        // multi-char bodies fall through to the generic Rich error.
+        let char_lit = choice((
+            just('\\').then(any()).to_slice(),
+            any().and_is(one_of("'\\").not()).to_slice(),
+        ))
+            .repeated()
+            .to_slice()
+            .delimited_by(just("'"), just("'"))
+            .try_map(|s: &'src str, span| {
+                decode_escapes(s)
+                    .map_err(|m| Rich::custom(span, m))
+                    .and_then(|bs| {
+                        if bs.len() == 1 {
+                            Ok(Token::Char(bs[0]))
+                        } else {
+                            Err(Rich::custom(
+                                span,
+                                format!("char literal must decode to exactly one byte, got {}", bs.len()),
+                            ))
+                        }
+                    })
+            });
+
         choice((
             // Parse comments as tokens (will be filtered later)
             just("//")
                 .then(any().and_is(just('\n').not()).repeated())
                 .to(Token::Comment),
+            byte_string,
+            char_lit,
             text::ident().map(|s| match s {
                 "is" => Token::Is,
                 "when" => Token::When,
@@ -451,6 +551,68 @@ mod test {
         let tokens = lexer().parse("as foo").into_result().expect("should lex");
         assert!(matches!(tokens[0].inner, Token::As));
         assert!(matches!(tokens[1].inner, Token::Ident("foo")));
+    }
+
+    #[test]
+    fn char_lit_basic() {
+        let tokens = lexer().parse("'A'").into_result().expect("should lex");
+        assert_eq!(tokens.len(), 1);
+        assert!(matches!(tokens[0].inner, Token::Char(65)));
+    }
+
+    #[test]
+    fn char_lit_newline_escape() {
+        let tokens = lexer().parse("'\\n'").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::Char(10)));
+    }
+
+    #[test]
+    fn char_lit_hex_escape() {
+        let tokens = lexer().parse("'\\xff'").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::Char(255)));
+    }
+
+    #[test]
+    fn char_lit_single_quote_escape() {
+        let tokens = lexer().parse("'\\''").into_result().expect("should lex");
+        assert!(matches!(tokens[0].inner, Token::Char(39)));
+    }
+
+    #[test]
+    fn char_lit_unterminated_errors() {
+        let res = lexer().parse("'A").into_result();
+        assert!(res.is_err(), "unterminated char must error");
+    }
+
+    #[test]
+    fn byte_string_basic() {
+        let tokens = lexer().parse("b\"abc\"").into_result().expect("should lex");
+        assert_eq!(tokens.len(), 1);
+        assert!(matches!(tokens[0].inner, Token::ByteStr("abc")));
+    }
+
+    #[test]
+    fn byte_string_empty() {
+        let tokens = lexer().parse("b\"\"").into_result().expect("should lex");
+        assert_eq!(tokens.len(), 1);
+        assert!(matches!(tokens[0].inner, Token::ByteStr("")));
+    }
+
+    #[test]
+    fn byte_string_with_double_quote_escape() {
+        let tokens = lexer().parse("b\"a\\\"b\"").into_result().expect("should lex");
+        match &tokens[0].inner {
+            Token::ByteStr(s) => assert_eq!(*s, "a\\\"b"),
+            other => panic!("expected ByteStr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn byte_string_distinct_from_string() {
+        // `b"x"` must NOT lex as ident `b` + string "x".
+        let tokens = lexer().parse("b\"x\"").into_result().expect("should lex");
+        assert_eq!(tokens.len(), 1);
+        assert!(matches!(tokens[0].inner, Token::ByteStr("x")));
     }
 
     #[test]
