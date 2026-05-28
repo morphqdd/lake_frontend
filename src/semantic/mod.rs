@@ -165,6 +165,29 @@ impl SemanticAnalyzer {
             Type::Unit | Type::Unknown => {
                 // Unit `{}` and unresolved placeholder — nothing to highlight.
             }
+            // agent: generics-142
+            Type::NamedGeneric { name, args } => {
+                self.add_symbol(Symbol {
+                    name: name.inner.0.to_string(),
+                    kind: SymbolKind::TypeName,
+                    typ: "type".to_string(),
+                    span: name.span,
+                });
+                for arg in args {
+                    self.analyze_type(arg);
+                }
+            }
+            // agent: generics-142 — TypeVar references a `<T>` in the
+            // enclosing decl; tag as TypeName so highlighting matches
+            // other type slots.
+            Type::TypeVar(ident) => {
+                self.add_symbol(Symbol {
+                    name: ident.inner.0.to_string(),
+                    kind: SymbolKind::TypeName,
+                    typ: "type".to_string(),
+                    span: ident.span,
+                });
+            }
         }
     }
 
@@ -436,6 +459,16 @@ fn type_to_string(ty: &Type) -> String {
                 .join(" ");
             format!("{{ {} }}", fields_str)
         }
+        // agent: generics-142
+        Type::NamedGeneric { name, args } => {
+            let args_str = args
+                .iter()
+                .map(|a| type_to_string(&a.inner))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}<{}>", name.inner.0, args_str)
+        }
+        Type::TypeVar(ident) => ident.inner.0.to_string(),
     }
 }
 

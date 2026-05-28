@@ -124,6 +124,10 @@ pub struct MachineEntry<'src> {
     pub module: ModuleId,
     /// `pub` makes this entry visible to other modules' imports.
     pub is_pub: bool,
+    /// agent: generics-142 — declared `<T U ...>` type parameters.  Empty
+    /// for non-generic machines.  Monomorphisation in phase 3 consumes
+    /// this list.
+    pub type_params: Vec<&'src str>,
     /// Per-branch parameter signatures.  Each branch's `ret` is `"pid"`
     /// because spawning a machine returns a process id; differentiation
     /// happens via parameter types when call-time dispatch fires.
@@ -150,6 +154,9 @@ pub struct RecordEntry<'src> {
     pub name: &'src str,
     pub module: ModuleId,
     pub is_pub: bool,
+    /// agent: generics-142 — declared `<T U ...>` type parameters.  Empty
+    /// for non-generic records.
+    pub type_params: Vec<&'src str>,
     /// Declared fields in source order; field N's offset in the tuple
     /// ABI is N * 8 bytes (each slot is a fat-pointer-sized i64).
     pub fields: Vec<(Spanned<Ident<'src>>, Spanned<Type<'src>>)>,
@@ -628,6 +635,13 @@ impl<'src> ProgramRegistry<'src> {
                             name,
                             module: id,
                             is_pub: decl.inner.vis,
+                            // agent: generics-142
+                            type_params: decl
+                                .inner
+                                .type_params
+                                .iter()
+                                .map(|p| p.inner.0)
+                                .collect(),
                             fields: new_fields,
                         };
                         self.module_mut(id).records.insert(name, entry);
@@ -745,6 +759,8 @@ fn build_machine_entry<'src>(machine: &Machine<'src>, module: ModuleId) -> Machi
         name: machine.ident.inner.0,
         module,
         is_pub: machine.vis,
+        // agent: generics-142
+        type_params: machine.generics.iter().map(|p| p.inner.0).collect(),
         branches,
     }
 }
@@ -1035,6 +1051,7 @@ mod tests {
             name: "counter",
             module: ModuleId::ROOT,
             is_pub: true,
+            type_params: Vec::new(),
             branches: vec![Signature {
                 params: vec!["i64".to_string()],
                 ret: "pid".to_string(),
@@ -1221,6 +1238,7 @@ mod tests {
                 name: "println",
                 module: core_io,
                 is_pub: true,
+                type_params: Vec::new(),
                 branches: vec![Signature {
                     params: vec!["str".to_string()],
                     ret: "pid".to_string(),
