@@ -6,6 +6,7 @@ use crate::api::ast::Item;
 use crate::api::token::Token;
 use crate::loader::{ParsedProgram, ProgramSources};
 use crate::lowering::{lower_program, mangle_program, relift_program};
+use crate::mono::monomorphise_program;
 use crate::registry::ProgramRegistry;
 use crate::resolver::resolve_program_with_errors;
 use crate::typeck::typecheck_program;
@@ -126,6 +127,24 @@ pub fn build_program<'src>(
         bag
     })?;
 
+    let mut registry: ProgramRegistry<'src> = ProgramRegistry::with_rt();
+    if let Err(e) = registry.populate_from(&parsed) {
+        return Err(e);
+    }
+
+    // #142 phases 2-3 — monomorphise generic records / machines into
+    // concrete copies.  Runs before `lower_program` so the lowering
+    // pass sees only ordinary (non-generic) records.  Re-populate the
+    // registry afterwards so freshly-emitted mono'd items are visible
+    // to downstream passes.
+    let (parsed, mono_errors) = monomorphise_program(parsed, &registry);
+    if !mono_errors.is_empty() {
+        let mut bag = LakeErrors::default();
+        for e in mono_errors {
+            bag.push(e);
+        }
+        return Err(bag);
+    }
     let mut registry: ProgramRegistry<'src> = ProgramRegistry::with_rt();
     if let Err(e) = registry.populate_from(&parsed) {
         return Err(e);
