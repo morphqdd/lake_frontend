@@ -42,6 +42,11 @@ pub struct Resolver<'src, 'r> {
     /// match warning (E032).  See docs/state/features/145_enums.md
     /// Phase 2.
     errors: Vec<LakeError>,
+    /// agent: generics-142 — set of `<T>` type-parameter names currently
+    /// in scope.  Pushed when entering a generic record / machine, popped
+    /// when leaving.  Bare type idents matching one of these get rewritten
+    /// from `Type::Named` to `Type::TypeVar`.
+    type_var_scope: HashMap<&'src str, ()>,
 }
 
 impl Default for Resolver<'_, '_> {
@@ -57,6 +62,7 @@ impl<'src, 'r> Resolver<'src, 'r> {
             registry: None,
             current_module: ModuleId::ROOT,
             errors: Vec::new(),
+            type_var_scope: HashMap::new(),
         }
     }
 
@@ -72,6 +78,7 @@ impl<'src, 'r> Resolver<'src, 'r> {
             registry: Some(registry),
             current_module,
             errors: Vec::new(),
+            type_var_scope: HashMap::new(),
         }
     }
 
@@ -989,11 +996,90 @@ impl<'src, 'r> Resolver<'src, 'r> {
         inner.with_span(span)
     }
 
+    /// agent: generics-142 — rewrite any `Type::Named(T)` whose name is
+    /// currently in the type-var scope into `Type::TypeVar(T)`.  Walks
+    /// recursively so nested type expressions (`Vec<T>`, `{ T i64 }`)
+    /// are handled uniformly.  No-op when the type-var scope is empty,
+    /// which is the case for every non-generic decl.
+    fn rewrite_type_vars(&self, ty: Type<'src>) -> Type<'src> {
+        if self.type_var_scope.is_empty() {
+            return ty;
+        }
+        match ty {
+            Type::Named(ident) => {
+                if self.type_var_scope.contains_key(ident.inner.0) {
+                    Type::TypeVar(ident)
+                } else {
+                    Type::Named(ident)
+                }
+            }
+            Type::Generic(name, args) => {
+                let args = args
+                    .into_iter()
+                    .map(|a| {
+                        let span = a.span;
+                        self.rewrite_type_vars(a.inner).with_span(span)
+                    })
+                    .collect();
+                Type::Generic(name, args)
+            }
+            Type::NamedGeneric { name, args } => {
+                let args = args
+                    .into_iter()
+                    .map(|a| {
+                        let span = a.span;
+                        self.rewrite_type_vars(a.inner).with_span(span)
+                    })
+                    .collect();
+                Type::NamedGeneric { name, args }
+            }
+            Type::Path(seg, rest) => {
+                let span = rest.span;
+                let rewritten = self.rewrite_type_vars(*rest.inner);
+                Type::Path(seg, Box::new(rewritten).with_span(span))
+            }
+            Type::Struct(fields) => {
+                let fields = fields
+                    .into_iter()
+                    .map(|f| {
+                        let span = f.span;
+                        self.rewrite_type_vars(f.inner).with_span(span)
+                    })
+                    .collect();
+                Type::Struct(fields)
+            }
+            // TypeVar / Unit / Unknown pass through unchanged.
+            other => other,
+        }
+    }
+
+    /// agent: generics-142 — rewrite types inside a single [`Spanned<Type>`].
+    fn rewrite_spanned_type(&self, ty: Spanned<Type<'src>>) -> Spanned<Type<'src>> {
+        let span = ty.span;
+        self.rewrite_type_vars(ty.inner).with_span(span)
+    }
+
     fn resolve_branch(&mut self, branch: Branch<'src>) -> Branch<'src> {
         let saved = self.scope.clone();
 
+        // agent: generics-142 — rewrite pattern types and ret_ty so that
+        // any reference to a `<T>` in the enclosing decl resolves to
+        // `Type::TypeVar` instead of `Type::Named`.  Cheap no-op when
+        // the type-var scope is empty.
+        let patterns: Vec<Spanned<crate::api::ast::Pattern<'src>>> = branch
+            .patterns
+            .into_iter()
+            .map(|p| {
+                let span = p.span;
+                let mut pat = p.inner;
+                pat.ty = self.rewrite_spanned_type(pat.ty);
+                pat.with_span(span)
+            })
+            .collect();
+        let ret_ty = branch.ret_ty.map(|t| self.rewrite_spanned_type(t));
+
         // Bind all non-wildcard, non-literal-guard pattern variables into scope.
-        for pat in &branch.patterns {
+        for pat in &patterns {
             if !pat.inner.is_wildcard() && !pat.inner.is_literal_guard() {
                 self.bind(pat.inner.ident.inner.0, pat.inner.ty.inner.clone());
             }
@@ -1006,10 +1092,18 @@ impl<'src, 'r> Resolver<'src, 'r> {
             .collect();
 
         self.scope = saved;
-        Branch::new(branch.label, branch.patterns, branch.ret_ty, body)
+        Branch::new(branch.label, patterns, ret_ty, body)
     }
 
     fn resolve_machine(&mut self, machine: Machine<'src>) -> Machine<'src> {
+        // agent: generics-142 — push declared `<T U ...>` into the
+        // type-var scope before walking branches so `T` in patterns /
+        // returns becomes `Type::TypeVar`.  Restored at the end.
+        let saved_type_vars = self.type_var_scope.clone();
+        for tp in &machine.generics {
+            self.type_var_scope.insert(tp.inner.0, ());
+        }
+
         let items = machine
             .items
             .into_iter()
@@ -1023,6 +1117,9 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 }
             })
             .collect();
+
+        self.type_var_scope = saved_type_vars;
+
         Machine::new(
             machine.attrs,
             machine.vis,

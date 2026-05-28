@@ -795,6 +795,126 @@ mod tests {
         assert!(matches!(&parsed.inner, Item::Machine(_)));
     }
 
+    // ── #142 generics phase 1 — parser/AST tests ────────────────────────────
+    // agent: generics-142 — see docs/state/features/142_generics.md
+
+    #[test]
+    fn parses_generic_record_single_param() {
+        let src = "Vec[T] is { data buf  len i64 }";
+        let parsed = parse_one_item(src);
+        let Item::Record(rec) = &parsed.inner else {
+            panic!("not a record: {parsed:?}")
+        };
+        assert_eq!(rec.inner.ident.inner.0, "Vec");
+        assert_eq!(rec.inner.type_params.len(), 1);
+        assert_eq!(rec.inner.type_params[0].inner.0, "T");
+        assert_eq!(rec.inner.fields.len(), 2);
+        assert_eq!(rec.inner.fields[0].inner.name.inner.0, "data");
+    }
+
+    #[test]
+    fn parses_generic_record_two_params() {
+        let src = "Map[K V] is { keys buf  values buf }";
+        let parsed = parse_one_item(src);
+        let Item::Record(rec) = &parsed.inner else {
+            panic!("not a record: {parsed:?}")
+        };
+        assert_eq!(rec.inner.ident.inner.0, "Map");
+        assert_eq!(rec.inner.type_params.len(), 2);
+        assert_eq!(rec.inner.type_params[0].inner.0, "K");
+        assert_eq!(rec.inner.type_params[1].inner.0, "V");
+    }
+
+    #[test]
+    fn non_generic_record_has_empty_type_params() {
+        let src = "Request is { method buf  path buf }";
+        let parsed = parse_one_item(src);
+        let Item::Record(rec) = &parsed.inner else { panic!("not a record") };
+        assert!(rec.inner.type_params.is_empty());
+    }
+
+    #[test]
+    fn parses_generic_machine_with_brackets() {
+        // `id[T] is { x T -> ret T { ret x } }` — the `T` in param and
+        // return position parses as Type::Named at this stage (resolver
+        // rewrites to Type::TypeVar later, exercised in resolver tests).
+        let src = "id[T] is { x T -> ret T { ret x } }";
+        let parsed = parse_one_item(src);
+        let Item::Machine(m) = &parsed.inner else {
+            panic!("not a machine: {parsed:?}")
+        };
+        assert_eq!(m.inner.ident.inner.0, "id");
+        assert_eq!(m.inner.generics.len(), 1);
+        assert_eq!(m.inner.generics[0].inner.0, "T");
+        // First branch pattern's type is `T` — Type::Named pre-resolve.
+        let crate::api::ast::MachineItem::Branch(b) = &m.inner.items[0].inner else {
+            panic!("expected branch")
+        };
+        let pat_ty = &b.patterns[0].inner.ty.inner;
+        assert!(matches!(pat_ty, Type::Named(i) if i.inner.0 == "T"));
+        let ret_ty = b.ret_ty.as_ref().expect("ret_ty");
+        assert!(matches!(&ret_ty.inner, Type::Named(i) if i.inner.0 == "T"));
+    }
+
+    #[test]
+    fn parses_named_generic_use_site() {
+        // Use-site `Vec[i64]` in a let-binding type position becomes
+        // `Type::NamedGeneric { name: "Vec", args: [Named("i64")] }`.
+        let src = "m is { _ -> { let v Vec[i64] = 0 } }";
+        let parsed = parse_one_item(src);
+        let Item::Machine(m) = &parsed.inner else { panic!("not a machine") };
+        let crate::api::ast::MachineItem::Branch(b) = &m.inner.items[0].inner else {
+            panic!("expected branch")
+        };
+        let Expr::Let { ty, .. } = &b.body[0].inner else {
+            panic!("expected let, got {:?}", b.body[0].inner)
+        };
+        let Type::NamedGeneric { name, args } = &ty.inner else {
+            panic!("expected NamedGeneric, got {:?}", ty.inner)
+        };
+        assert_eq!(name.inner.0, "Vec");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(&args[0].inner, Type::Named(i) if i.inner.0 == "i64"));
+    }
+
+    #[test]
+    fn non_generic_machine_has_empty_type_params() {
+        let src = "echo is { x i64 -> ret i64 { ret x } }";
+        let parsed = parse_one_item(src);
+        let Item::Machine(m) = &parsed.inner else { panic!("not a machine") };
+        assert!(m.inner.generics.is_empty());
+    }
+
+    #[test]
+    fn resolver_rewrites_typevar_in_generic_machine() {
+        // Through the full resolver pipeline: `id<T>` should produce
+        // pattern + ret_ty types of Type::TypeVar(T), not Type::Named.
+        use chumsky::input::Input;
+        let src = "id[T] is { x T -> ret T { ret x } }";
+        let tokens = lexer().parse(src).into_result().expect("lex");
+        let ast = super::program()
+            .parse(tokens[..].split_spanned((0..src.len()).into()))
+            .into_result()
+            .expect("parse");
+        let resolved = crate::resolver::resolve(ast);
+        let Item::Machine(m) = &resolved[0].inner else { panic!() };
+        let crate::api::ast::MachineItem::Branch(b) = &m.inner.items[0].inner else {
+            panic!()
+        };
+        let pat_ty = &b.patterns[0].inner.ty.inner;
+        assert!(
+            matches!(pat_ty, Type::TypeVar(i) if i.inner.0 == "T"),
+            "expected TypeVar(T) in pattern, got {:?}",
+            pat_ty
+        );
+        let ret_ty = b.ret_ty.as_ref().expect("ret_ty").inner.clone();
+        assert!(
+            matches!(&ret_ty, Type::TypeVar(i) if i.inner.0 == "T"),
+            "expected TypeVar(T) in ret_ty, got {:?}",
+            ret_ty
+        );
+    }
+
     // ── tuple pattern helpers ────────────────────────────────────────────────
 
     fn parse_one_pattern(src: &str) -> chumsky::span::Spanned<Pattern<'_>> {

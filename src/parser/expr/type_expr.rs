@@ -2,8 +2,7 @@ use chumsky::{
     IterParser, Parser,
     error::Rich,
     extra::Err,
-    input::Input,
-    prelude::{choice, recursive},
+    prelude::{choice, just, recursive},
     select_ref,
     span::Spanned,
 };
@@ -16,11 +15,13 @@ use crate::{
 /// Parses a type expression:
 /// - `i32`, `str`              → `Type::Named`
 /// - `box(T)`, `result({})`   → `Type::Generic`
+/// - `Vec[T]`, `Map[K V]`     → `Type::NamedGeneric` (agent: generics-142)
 /// - `{}`                     → `Type::Unit`
 /// - `{ i64 usize }`          → `Type::Struct`
 pub fn type_expr<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Type<'src>>, Err<Rich<'t, Token<'src>>>> {
     recursive(|ty| {
+        use chumsky::input::Input;
         // Struct / unit type inside `{ ... }`
         let struct_ty = ty
             .clone()
@@ -36,21 +37,39 @@ pub fn type_expr<'t, 'src: 't>()
             })
             .spanned();
 
-        // Simple ident, optionally followed by generic args `(T U)`
+        // Simple ident, optionally followed by:
+        //   * `(T U)` — historical paren-form generic (Type::Generic)
+        //   * `[T U]` — agent: generics-142 bracket form
+        //                (Type::NamedGeneric)
+        let paren_args = ty
+            .clone()
+            .repeated()
+            .collect::<Vec<_>>()
+            .nested_in(select_ref!(
+                Token::Parens(ts) = e => ts.split_spanned(e.span()),
+                Token::TightParens(ts) = e => ts.split_spanned(e.span()),
+            ));
+
+        let bracket_args = ty
+            .clone()
+            .repeated()
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .nested_in(select_ref!(
+                Token::SquareBrackets(ts) = e => ts.split_spanned(e.span()),
+                Token::TightSquareBrackets(ts) = e => ts.split_spanned(e.span()),
+            ));
+
         let named = ident_parser()
-            .then(
-                ty.clone()
-                    .repeated()
-                    .collect::<Vec<_>>()
-                    .nested_in(select_ref!(
-                        Token::Parens(ts) = e => ts.split_spanned(e.span()),
-                        Token::TightParens(ts) = e => ts.split_spanned(e.span()),
-                    ))
-                    .or_not(),
-            )
+            .then(choice((
+                paren_args.map(|args| Some((false, args))),
+                bracket_args.map(|args| Some((true, args))),
+                chumsky::prelude::empty().to(None),
+            )))
             .map(|(name, args)| match args {
                 None => Type::Named(name),
-                Some(args) => Type::Generic(name, args),
+                Some((false, args)) => Type::Generic(name, args),
+                Some((true, args)) => Type::NamedGeneric { name, args },
             })
             .spanned();
 

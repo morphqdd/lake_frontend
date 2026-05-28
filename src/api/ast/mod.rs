@@ -43,6 +43,18 @@ pub enum Type<'src> {
     /// resolver has not yet filled in.  Distinct from [`Type::Unit`], which
     /// represents an explicit `{}` in source.
     Unknown,
+    /// agent: generics-142 — `Vec<i64>`, `Map<K, V>` — parametric type
+    /// applied to concrete (or still-symbolic) type arguments.  Phase 1
+    /// parses these; monomorphisation lands in phase 3.
+    NamedGeneric {
+        name: Spanned<Ident<'src>>,
+        args: Vec<Spanned<Type<'src>>>,
+    },
+    /// agent: generics-142 — references a `<T>` type parameter introduced
+    /// by an enclosing generic record or machine declaration.  Resolver
+    /// rewrites bare uppercase idents to this variant when a matching
+    /// `<T>` is in scope.
+    TypeVar(Spanned<Ident<'src>>),
 }
 
 impl<'src> Clean<Ident<'src>> for Type<'src> {
@@ -111,6 +123,19 @@ impl std::fmt::Display for Type<'_> {
                 }
                 write!(f, " }}")
             }
+            // agent: generics-142
+            Type::NamedGeneric { name, args } => {
+                write!(f, "{}<", name.inner)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg.inner)?;
+                }
+                write!(f, ">")
+            }
+            // agent: generics-142
+            Type::TypeVar(ident) => write!(f, "{}", ident.inner),
         }
     }
 }
@@ -358,6 +383,9 @@ pub struct RecordField<'src> {
 pub struct RecordDecl<'src> {
     pub vis: bool,
     pub ident: Spanned<Ident<'src>>,
+    /// agent: generics-142 — `Vec<T>` → `["T"]`.  Empty for non-generic
+    /// records (back-compat with existing call sites).
+    pub type_params: Vec<Spanned<Ident<'src>>>,
     pub fields: Vec<Spanned<RecordField<'src>>>,
 }
 
