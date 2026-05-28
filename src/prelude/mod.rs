@@ -5,9 +5,9 @@ use chumsky::{Parser, input::Input, span::Spanned};
 use crate::api::ast::Item;
 use crate::api::token::Token;
 use crate::loader::{ParsedProgram, ProgramSources};
-use crate::lowering::{lower_program, mangle_program};
+use crate::lowering::{lower_program, mangle_program, relift_program};
 use crate::registry::ProgramRegistry;
-use crate::resolver::resolve_program;
+use crate::resolver::resolve_program_with_errors;
 use crate::typeck::typecheck_program;
 use crate::{error_handle::LakeErrors, lexer::lexer, parser::program};
 
@@ -139,7 +139,25 @@ pub fn build_program<'src>(
         return Err(e);
     }
 
-    let resolved = resolve_program(parsed, &mut registry);
+    let (resolved, resolver_errors) = resolve_program_with_errors(parsed, &mut registry);
+    // #145 phase 4 — surface resolver diagnostics
+    // (E030/E031/E032) emitted by the enum-aware rewrites.  Without
+    // this the pipeline silently dropped the non-exhaustive `when`
+    // warning along with constructor arity / unknown-variant errors.
+    if !resolver_errors.is_empty() {
+        let mut bag = LakeErrors::default();
+        for e in resolver_errors {
+            bag.push(e);
+        }
+        return Err(bag);
+    }
+    // #145 phase 4/5 — resolver rewrites variant patterns
+    // (`Ok(n)` → tagged tuple) and constructor calls after
+    // `lower_program` has already run, so re-fire the two
+    // resolver-aware transforms (`lower_when_tuple_patterns` +
+    // `lift_nested_calls`) over the freshly-emitted shapes.
+    // See docs/state/features/145_enums.md.
+    let resolved = relift_program(resolved, &registry);
     let errors = typecheck_program(&resolved, &registry);
     if !errors.is_empty() {
         return Err(errors);

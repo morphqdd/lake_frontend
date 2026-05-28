@@ -881,10 +881,31 @@ impl<'src, 'r> Resolver<'src, 'r> {
                         } else {
                             self.resolve_expr(pat)
                         };
+                        // #145 phase 4 — variant pattern binders
+                        // (`Ok(n)` → Tuple([Num, Var("n", i64)])) must
+                        // be in scope while the arm body resolves so
+                        // references like `ret n + 100` carry the
+                        // declared payload type.  Snapshot/restore the
+                        // surrounding scope to keep bindings local to
+                        // the arm.  See docs/state/features/145_enums.md.
+                        let saved_scope = self.scope.clone();
+                        if let Expr::Tuple(elems) = &pat.inner {
+                            for (i, sub) in elems.iter().enumerate() {
+                                if i == 0 {
+                                    continue;
+                                }
+                                if let Expr::Var(name, ty) = &sub.inner {
+                                    if *name != "_" {
+                                        self.bind(name, ty.clone());
+                                    }
+                                }
+                            }
+                        }
                         let body = body
                             .into_iter()
                             .map(|e| self.resolve_expr(e))
                             .collect();
+                        self.scope = saved_scope;
                         (pat, body)
                     })
                     .collect();

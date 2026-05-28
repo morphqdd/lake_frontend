@@ -1772,30 +1772,33 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                     ];
                 }
 
-                // All non-wildcard arms must use tuple patterns of
-                // the same arity (the discriminator is the first
-                // slot; remaining slots are sub-bindings).  A bare
-                // `_` arm is still allowed as a catch-all and keeps
-                // its existing wildcard semantics.
-                let arity = branches
-                    .iter()
-                    .filter_map(|(p, _)| match &p.inner {
-                        Expr::Tuple(elems) => Some(elems.len()),
-                        _ => None,
-                    })
-                    .next()
-                    .expect("any_tuple was true");
-
+                // #145 phase 4 — enum variants are tagged tuples
+                // whose arity differs per variant (nullary = 1 slot,
+                // payload-bearing = 1+N slots).  Each arm is rewritten
+                // independently against its own arity; only the
+                // head-slot discriminator value matters at dispatch
+                // time, the remaining slots become payload binders.
                 let id = self.fresh_id();
                 let synth_name: &'static str =
                     Box::leak(format!("__wtp_{id}").into_boxed_str());
 
+                // #145 phase 4 — give the synthetic __wtp binding a
+                // backend-resolvable type.  The cond is either a
+                // record / enum (`Type::Named(...)` — collapses to i64
+                // at the ABI), an atom-tuple, or i64.  let_expr's
+                // codegen aborts on `Type::Unknown` ('?'), so default
+                // to i64 when the cond doesn't carry a more specific
+                // shape.  See docs/state/features/145_enums.md.
+                let synth_ty = match &cond.inner {
+                    Expr::Var(_, ty) if !matches!(ty, Type::Unknown) => ty.clone(),
+                    _ => Type::Named(Ident::new("i64").with_span(span)),
+                };
                 // let __wtp_<id> = <cond>
                 let mut out: Vec<Spanned<Expr<'src>>> = Vec::with_capacity(2);
                 out.push(
                     Expr::Let {
                         ident: Ident::new(synth_name).with_span(span),
-                        ty: Type::Unknown.with_span(span),
+                        ty: synth_ty.with_span(span),
                         default: Some(Box::new(cond)),
                     }
                     .with_span(span),
@@ -1810,15 +1813,6 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                     let pat_span = pat.span;
                     match pat.inner {
                         Expr::Tuple(elems) => {
-                            if elems.len() != arity {
-                                // Arity mismatch — leave the arm
-                                // untouched (typeck / backend will
-                                // surface a clearer error).
-                                let restored =
-                                    Expr::Tuple(elems).with_span(pat_span);
-                                new_branches.push((restored, body));
-                                continue;
-                            }
                             let mut elems_iter = elems.into_iter();
                             let head = elems_iter.next().expect("arity >= 1");
                             let head_span = head.span;
@@ -1846,6 +1840,20 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                                     if n == "_" {
                                         continue;
                                     }
+                                    // #145 phase 4 — default payload
+                                    // binders to i64 when the resolver
+                                    // left the type Unknown (e.g.
+                                    // non-enum tuple destructures).
+                                    // let_expr aborts on '?', and the
+                                    // payload is fat-ptr-sized either
+                                    // way at the ABI.
+                                    let final_sub_ty = if matches!(sub_ty, Type::Unknown) {
+                                        Type::Named(
+                                            Ident::new("i64").with_span(sub_span),
+                                        )
+                                    } else {
+                                        sub_ty
+                                    };
                                     let receiver = Expr::Var(
                                         synth_name,
                                         Type::Unknown,
@@ -1855,7 +1863,7 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                                         Expr::Let {
                                             ident: Ident::new(n)
                                                 .with_span(sub_span),
-                                            ty: sub_ty
+                                            ty: final_sub_ty
                                                 .with_span(sub_span),
                                             default: Some(Box::new(
                                                 Expr::TupleIndex {
