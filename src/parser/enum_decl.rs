@@ -82,14 +82,27 @@ fn enum_kw<'t, 'src: 't>()
     select_ref!(Token::Ident(n) = _e if *n == "enum" => ())
 }
 
-/// Parses `IDENT 'is' 'enum' '{' variant* '}'`.
+/// Parses `IDENT [[T ...]] 'is' 'enum' '{' variant* '}'`.
 ///
 /// Must be tried BEFORE `record()` in the top-level `choice` — both start
 /// with `IDENT 'is' '{` and `record()` would happily eat `enum { ... }`
 /// as a `field type` pair.
+///
+/// agent: generics-142 phase 4 — the optional `[T U ...]` clause after
+/// the enum name mirrors the record syntax landed in phase 1.
 pub fn enum_decl<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<EnumDecl<'src>>, Err<Rich<'t, Token<'src>>>> {
+    let type_param_list = ident_parser()
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .nested_in(select_ref!(
+            Token::SquareBrackets(ts) = e => ts.split_spanned(e.span()),
+            Token::TightSquareBrackets(ts) = e => ts.split_spanned(e.span()),
+        ));
+
     ident_parser()
+        .then(type_param_list.or_not().map(|p| p.unwrap_or_default()))
         .then_ignore(just(Token::Is))
         .then_ignore(enum_kw())
         .then(
@@ -99,9 +112,9 @@ pub fn enum_decl<'t, 'src: 't>()
                 .collect::<Vec<_>>()
                 .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span()))),
         )
-        .map(|(name, variants)| EnumDecl {
+        .map(|((name, type_params), variants)| EnumDecl {
             name,
-            type_params: Vec::new(),
+            type_params,
             variants,
         })
         .spanned()
@@ -236,6 +249,36 @@ mod tests {
             panic!("expected Item::Enum, got {:?}", items[0].inner)
         };
         assert_eq!(decl.inner.variants.len(), 3);
+    }
+
+    #[test]
+    fn parses_generic_enum_single_param() {
+        let src = "Option[T] is enum { Some(T) None }";
+        let decl = parse_enum(src).expect("parses");
+        assert_eq!(decl.inner.name.inner.0, "Option");
+        assert_eq!(decl.inner.type_params.len(), 1);
+        assert_eq!(decl.inner.type_params[0].inner.0, "T");
+        assert_eq!(decl.inner.variants.len(), 2);
+    }
+
+    #[test]
+    fn parses_generic_enum_two_params() {
+        let src = "Result[T E] is enum { Ok(T) Err(E) }";
+        let decl = parse_enum(src).expect("parses");
+        assert_eq!(decl.inner.type_params.len(), 2);
+        assert_eq!(decl.inner.type_params[0].inner.0, "T");
+        assert_eq!(decl.inner.type_params[1].inner.0, "E");
+    }
+
+    #[test]
+    fn generic_enum_top_level_parses() {
+        let src = "Option[T] is enum { Some(T) None }";
+        let items = parse_top(src).expect("parses");
+        assert_eq!(items.len(), 1);
+        let Item::Enum(decl) = &items[0].inner else {
+            panic!("expected Item::Enum, got {:?}", items[0].inner)
+        };
+        assert_eq!(decl.inner.type_params.len(), 1);
     }
 
     #[test]

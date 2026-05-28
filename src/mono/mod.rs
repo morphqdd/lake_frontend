@@ -23,8 +23,8 @@ use chumsky::span::{SimpleSpan, SpanWrap, Spanned};
 
 use crate::api::{
     ast::{
-        Branch, Ident, Item, Machine, MachineItem, Pattern, PatternKind, RecordDecl, RecordField,
-        Type,
+        Branch, EnumDecl, Ident, Item, Machine, MachineItem, Pattern, PatternKind, RecordDecl,
+        RecordField, Type, Variant, VariantPayload,
     },
     expr::Expr,
 };
@@ -56,6 +56,10 @@ struct MonoCx<'src, 'a> {
     /// at the registry layer).
     mono_records: HashMap<(String, Vec<String>), String>,
     mono_machines: HashMap<(String, Vec<String>), String>,
+    /// agent: generics-142 phase 4 — enum mono cache.  Same key shape
+    /// as records / machines so an `Option[i64]` site shares the
+    /// `Option_i64` mangled name across modules.
+    mono_enums: HashMap<(String, Vec<String>), String>,
     /// Pending mono jobs — drained until empty after the first walk
     /// pass.  Each job re-enters the walker so transitive mono'd calls
     /// surface fresh sub-instantiations.
@@ -64,12 +68,23 @@ struct MonoCx<'src, 'a> {
     record_templates: HashMap<String, RecordDecl<'src>>,
     /// Generic machine templates indexed by source name.
     machine_templates: HashMap<String, Machine<'src>>,
+    /// agent: generics-142 phase 4 — generic enum templates indexed by
+    /// source name.  Populated in pass 1; consulted during walk_expr
+    /// when rewriting `Enum.Variant(args)` constructors and Let-bound
+    /// `NamedGeneric` type annotations.
+    enum_templates: HashMap<String, EnumDecl<'src>>,
     /// Module owning each generic template — used so we emit the
     /// concrete copy back into the same module the template lived in.
     template_module: HashMap<String, ModuleId>,
     /// Mono'd item names whose source-borrowed `&'src str` we need to
     /// keep alive for the rest of compilation.  Leaked once per name.
     leaked: HashSet<String>,
+    /// agent: generics-142 phase 4 — per-enum-name ordered type-arg
+    /// stack.  Pushed by Let walks when the annotation is a known
+    /// generic enum's `NamedGeneric`; consulted by the variant ctor
+    /// rewrite for sites like `Option.None` where no payload args
+    /// would otherwise pin down T.  Popped on exit.
+    enum_hints: HashMap<&'src str, Vec<Vec<Type<'src>>>>,
     errors: Vec<LakeError>,
 }
 
@@ -85,6 +100,12 @@ enum MonoJob<'src> {
         args: Vec<Type<'src>>,
         mangled: &'src str,
     },
+    /// agent: generics-142 phase 4 — concrete enum instance to emit.
+    Enum {
+        base: String,
+        args: Vec<Type<'src>>,
+        mangled: &'src str,
+    },
 }
 
 impl<'src, 'a> MonoCx<'src, 'a> {
@@ -93,11 +114,14 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             registry,
             mono_records: HashMap::new(),
             mono_machines: HashMap::new(),
+            mono_enums: HashMap::new(),
             work: Vec::new(),
             record_templates: HashMap::new(),
             machine_templates: HashMap::new(),
+            enum_templates: HashMap::new(),
             template_module: HashMap::new(),
             leaked: HashSet::new(),
+            enum_hints: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -135,6 +159,14 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                         self.machine_templates.insert(name.clone(), m.inner.clone());
                         self.template_module.insert(name, module_id);
                     }
+                    // agent: generics-142 phase 4 — index generic enums
+                    // alongside records / machines so call sites that
+                    // mention `Option[T]` resolve via the same path.
+                    Item::Enum(d) if !d.inner.type_params.is_empty() => {
+                        let name = d.inner.name.inner.0.to_string();
+                        self.enum_templates.insert(name.clone(), d.inner.clone());
+                        self.template_module.insert(name, module_id);
+                    }
                     _ => {}
                 }
             }
@@ -157,6 +189,7 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                         // concrete copies queued below replace them.
                         Item::Record(d) if !d.inner.type_params.is_empty() => None,
                         Item::Machine(m) if !m.inner.generics.is_empty() => None,
+                        Item::Enum(d) if !d.inner.type_params.is_empty() => None,
                         Item::Machine(m) => {
                             let m_span = m.span;
                             let new_machine = self.walk_machine(m.inner, module_id);
@@ -218,6 +251,26 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                     let span = new_machine.ident.span;
                     module.ast.push(
                         Item::Machine(new_machine.with_span(span)).with_span(span),
+                    );
+                }
+                MonoJob::Enum { base, args, mangled } => {
+                    let module_id = *self
+                        .template_module
+                        .get(&base)
+                        .expect("enum template module");
+                    let new_enum = self.instantiate_enum(&base, &args, mangled);
+                    let module = modules
+                        .iter_mut()
+                        .find(|m| {
+                            self.registry
+                                .module_id_for_path(&m.module_path)
+                                .map(|id| id == module_id)
+                                .unwrap_or(false)
+                        })
+                        .expect("owning module present");
+                    let span = new_enum.name.span;
+                    module.ast.push(
+                        Item::Enum(new_enum.with_span(span)).with_span(span),
                     );
                 }
             }
@@ -284,19 +337,69 @@ impl<'src, 'a> MonoCx<'src, 'a> {
         let span = expr.span;
         let inner = match expr.inner {
             Expr::Let { ident, ty, default } => {
+                // agent: generics-142 phase 4 — when the user writes
+                // `let r Result[i64 buf] = ...`, fold the NamedGeneric
+                // annotation through `substitute_type` (empty subst).
+                // That walk queues the matching enum / record mono job
+                // and returns a `Type::Named(<mangled>)` we can stash
+                // in scope.  Mirror it for the side-effect of pushing
+                // an enum hint so the default expr's bare
+                // `Enum.Variant(...)` ctor sees the right concrete
+                // arg list.
+                let ty_span = ty.span;
+                let (new_ty_inner, enum_hint_key) = match ty.inner.clone() {
+                    Type::NamedGeneric { name, args }
+                        if self.enum_templates.contains_key(name.inner.0) =>
+                    {
+                        let arg_tys: Vec<Type<'src>> =
+                            args.iter().map(|a| a.inner.clone()).collect();
+                        let folded =
+                            self.substitute_type(&Type::NamedGeneric { name: name.clone(), args }, &HashMap::new());
+                        // Stash hint under enum source name.
+                        let key = name.inner.0;
+                        self.enum_hints
+                            .entry(key)
+                            .or_default()
+                            .push(arg_tys);
+                        (folded, Some(key))
+                    }
+                    Type::NamedGeneric { name, args }
+                        if self.record_templates.contains_key(name.inner.0) =>
+                    {
+                        // Records get folded too — keeps Let.ty in
+                        // sync with the call-site rewrite below.
+                        let folded = self.substitute_type(
+                            &Type::NamedGeneric { name, args },
+                            &HashMap::new(),
+                        );
+                        (folded, None)
+                    }
+                    other => (other, None),
+                };
+                let new_ty = new_ty_inner.clone().with_span(ty_span);
                 let default = default.map(|d| Box::new(self.walk_expr(*d, scope, module_id)));
+                // Pop the hint after the default has been walked.
+                if let Some(key) = enum_hint_key {
+                    if let Some(stack) = self.enum_hints.get_mut(key) {
+                        stack.pop();
+                        if stack.is_empty() {
+                            self.enum_hints.remove(key);
+                        }
+                    }
+                }
                 // Infer the binding's type so later references see it.
-                // Use declared `ty` when present; else infer from default.
-                let bound_ty = if matches!(ty.inner, Type::Unknown) {
+                // Use declared `ty` (post-mono) when present; else
+                // infer from default.
+                let bound_ty = if matches!(new_ty.inner, Type::Unknown) {
                     default
                         .as_ref()
                         .map(|d| self.infer_expr_type(&d.inner, scope))
                         .unwrap_or(Type::Unknown)
                 } else {
-                    ty.inner.clone()
+                    new_ty.inner.clone()
                 };
                 scope.insert(ident.inner.0, bound_ty);
-                Expr::Let { ident, ty, default }
+                Expr::Let { ident, ty: new_ty, default }
             }
             Expr::Jump { ident, args } => {
                 // Rewrite args first.
@@ -304,10 +407,45 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                     .into_iter()
                     .map(|a| self.walk_expr(a, scope, module_id))
                     .collect();
-                let new_ident = self.maybe_rewrite_callee(*ident, &args, scope, module_id, span);
+                // agent: generics-142 phase 4 — variant constructor on
+                // a generic enum: `Option.Some(42)` / `Result.Ok(7)`.
+                // Rewrite the receiver from the generic head to its
+                // mono'd name BEFORE the resolver gets to see it.
+                let new_ident = if let Some(rewritten) =
+                    self.maybe_rewrite_enum_dot_ctor(&ident, &args, scope, span, /*has_args=*/true)
+                {
+                    rewritten
+                } else {
+                    self.maybe_rewrite_callee(*ident, &args, scope, module_id, span)
+                };
                 Expr::Jump {
                     ident: Box::new(new_ident),
                     args,
+                }
+            }
+            // agent: generics-142 phase 4 — nullary variant ctor like
+            // `Option.None`.  Pure DotAccess with no Jump.  Same
+            // rewrite, no args to drive inference — relies entirely on
+            // an `enum_hints` entry pushed by the enclosing Let.
+            Expr::DotAccess { receiver, field } => {
+                let synthetic_callee = Expr::DotAccess {
+                    receiver: receiver.clone(),
+                    field: field.clone(),
+                }
+                .with_span(span);
+                if let Some(rewritten) = self.maybe_rewrite_enum_dot_ctor(
+                    &synthetic_callee,
+                    &[],
+                    scope,
+                    span,
+                    /*has_args=*/ false,
+                ) {
+                    rewritten.inner
+                } else {
+                    Expr::DotAccess {
+                        receiver: Box::new(self.walk_expr(*receiver, scope, module_id)),
+                        field,
+                    }
                 }
             }
             Expr::Add(l, r) => Expr::Add(
@@ -504,6 +642,109 @@ impl<'src, 'a> MonoCx<'src, 'a> {
         ident
     }
 
+    /// agent: generics-142 phase 4 — rewrite a `Enum.Variant` /
+    /// `Enum.Variant(args)` callee whose head is a known generic enum
+    /// template.  Returns the rewritten ident with the receiver Var
+    /// swapped for the mono'd enum name.  Returns `None` when the
+    /// shape doesn't match an enum constructor.
+    ///
+    /// Inference precedence:
+    /// 1. `enum_hints` set by the enclosing Let annotation;
+    /// 2. unifying arg types against the variant's declared payload.
+    fn maybe_rewrite_enum_dot_ctor(
+        &mut self,
+        callee: &Spanned<Expr<'src>>,
+        args: &[Spanned<Expr<'src>>],
+        scope: &HashMap<&'src str, Type<'src>>,
+        call_span: SimpleSpan,
+        _has_args: bool,
+    ) -> Option<Spanned<Expr<'src>>> {
+        let Expr::DotAccess { receiver, field } = &callee.inner else {
+            return None;
+        };
+        let Expr::Var(enum_name, _) = &receiver.inner else {
+            return None;
+        };
+        let decl = self.enum_templates.get(*enum_name).cloned()?;
+        // Try the Let-supplied hint first — it carries the full arg
+        // list (handles `Option.None` where args is empty).
+        let concrete_args: Vec<Type<'src>> = if let Some(stack) =
+            self.enum_hints.get(*enum_name)
+        {
+            stack.last().cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let concrete_args = if !concrete_args.is_empty() {
+            concrete_args
+        } else {
+            // Infer from arg types against the variant's declared
+            // payload types.
+            let variant_name = field.inner.0;
+            let payload_tys: Vec<Type<'src>> = decl
+                .variants
+                .iter()
+                .find(|v| v.inner.name.inner.0 == variant_name)
+                .map(|v| match &v.inner.payload {
+                    VariantPayload::None => Vec::new(),
+                    VariantPayload::Tuple(ts) => {
+                        ts.iter().map(|t| t.inner.clone()).collect()
+                    }
+                    VariantPayload::Record(fs) => {
+                        fs.iter().map(|(_, t)| t.inner.clone()).collect()
+                    }
+                })
+                .unwrap_or_default();
+            let type_params: HashSet<&'src str> =
+                decl.type_params.iter().map(|p| p.inner.0).collect();
+            let mut subst: Subst<'src> = HashMap::new();
+            let n = payload_tys.len().min(args.len());
+            for i in 0..n {
+                let actual = self.infer_expr_type(&args[i].inner, scope);
+                self.unify(&payload_tys[i], &actual, &type_params, &mut subst);
+            }
+            // Build the ordered concrete arg list — if a type param
+            // couldn't be inferred (e.g. `Result.Ok(7)` leaves E
+            // unbound) bail out and let the resolver / typeck flag.
+            let mut all_args: Vec<Type<'src>> = Vec::with_capacity(decl.type_params.len());
+            let mut bound = true;
+            for tp in &decl.type_params {
+                match subst.get(tp.inner.0) {
+                    Some(t) => all_args.push(t.clone()),
+                    None => {
+                        bound = false;
+                        break;
+                    }
+                }
+            }
+            if !bound {
+                self.errors.push(
+                    LakeError::new(
+                        format!(
+                            "cannot infer type parameter(s) for enum `{}` — \
+                             annotate the binding (e.g. `let x EnumName[T] = ...`)",
+                            enum_name,
+                        ),
+                        call_span,
+                    )
+                    .code("E040"),
+                );
+                return None;
+            }
+            all_args
+        };
+        let mangled = self.intern_enum_mono(enum_name, &concrete_args, call_span);
+        // Rewrite the receiver Var to the mono'd enum name.
+        let recv_span = receiver.span;
+        let new_receiver =
+            Expr::Var(mangled, Type::Unknown).with_span(recv_span);
+        let new_callee = Expr::DotAccess {
+            receiver: Box::new(new_receiver),
+            field: field.clone(),
+        };
+        Some(new_callee.with_span(callee.span))
+    }
+
     /// Unify a list of inferred arg types against a record's declared
     /// field types (in order), binding type parameters in the returned
     /// substitution.
@@ -688,6 +929,18 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                         });
                     }
                 }
+                // agent: generics-142 phase 4 — same lookup for enums.
+                for ((base, arg_strs), m) in &self.mono_enums {
+                    if m == mangled && base == n1.inner.0 && arg_strs.len() == a1.len() {
+                        let concrete_args: Vec<Type<'src>> = arg_strs
+                            .iter()
+                            .map(|s| type_from_string(s))
+                            .collect();
+                        return a1.iter().zip(concrete_args.iter()).all(|(decl, conc)| {
+                            self.unify(&decl.inner, conc, type_params, subst)
+                        });
+                    }
+                }
                 false
             }
             _ => false,
@@ -756,9 +1009,29 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                     .collect(),
             ),
             Expr::Jump { ident, args } => {
-                // Generic ctor calls — once we've already walked, the
-                // callee should be the mangled name.  Look up in the
-                // mono cache or the registry directly.
+                // agent: generics-142 phase 4 — variant constructor on
+                // a (possibly mono'd) enum.  Returns `Type::Named(<enum>)`.
+                if let Expr::DotAccess { receiver, .. } = &ident.inner {
+                    if let Expr::Var(enum_name, _) = &receiver.inner {
+                        // Post-rewrite: receiver is already the mono'd
+                        // enum name; lookup hits mono_enums.
+                        for (_, mangled) in &self.mono_enums {
+                            if mangled == enum_name {
+                                let s: Box<str> = mangled.clone().into_boxed_str();
+                                let leaked: &'static str = Box::leak(s);
+                                return src_named(leaked);
+                            }
+                        }
+                        // Non-generic enum (or generic template — caller
+                        // is responsible for hint context); fall back to
+                        // a plain Named tag.
+                        if self.registry.lookup_enum_in(ModuleId::ROOT, enum_name).is_some() {
+                            let s: Box<str> = (*enum_name).to_string().into_boxed_str();
+                            let leaked: &'static str = Box::leak(s);
+                            return src_named(leaked);
+                        }
+                    }
+                }
                 if let Expr::Var(name, _) = &ident.inner {
                     // Generic record before rewrite (in tree we walk
                     // top-down so args come first).
@@ -852,6 +1125,27 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                 }
                 Type::Unknown
             }
+            // agent: generics-142 phase 4 — nullary variant ctor:
+            // `Option_i64.None` evaluated as a value.  Same lookup as
+            // the Jump path so the enclosing Let infers the right
+            // `Type::Named(<enum>)` for its binding.
+            Expr::DotAccess { receiver, .. } => {
+                if let Expr::Var(enum_name, _) = &receiver.inner {
+                    for (_, mangled) in &self.mono_enums {
+                        if mangled == enum_name {
+                            let s: Box<str> = mangled.clone().into_boxed_str();
+                            let leaked: &'static str = Box::leak(s);
+                            return src_named(leaked);
+                        }
+                    }
+                    if self.registry.lookup_enum_in(ModuleId::ROOT, enum_name).is_some() {
+                        let s: Box<str> = (*enum_name).to_string().into_boxed_str();
+                        let leaked: &'static str = Box::leak(s);
+                        return src_named(leaked);
+                    }
+                }
+                Type::Unknown
+            }
             _ => Type::Unknown,
         }
     }
@@ -905,6 +1199,93 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             mangled: mangled_leaked,
         });
         mangled_leaked
+    }
+
+    /// Intern an enum mono.  Returns the mangled `&'src str` name.
+    fn intern_enum_mono(
+        &mut self,
+        base: &str,
+        args: &[Type<'src>],
+        _call_span: SimpleSpan,
+    ) -> &'src str {
+        let arg_strs: Vec<String> = args.iter().map(mangle_type).collect();
+        let key = (base.to_string(), arg_strs.clone());
+        if let Some(m) = self.mono_enums.get(&key) {
+            let s = m.clone();
+            return Box::leak(s.into_boxed_str());
+        }
+        let mangled_owned = format!("{}_{}", base, arg_strs.join("_"));
+        let mangled_leaked = self.leak_name(mangled_owned.clone());
+        self.mono_enums.insert(key, mangled_owned);
+        self.work.push(MonoJob::Enum {
+            base: base.to_string(),
+            args: args.to_vec(),
+            mangled: mangled_leaked,
+        });
+        mangled_leaked
+    }
+
+    /// Materialize a concrete enum from a template + substitution.
+    /// Variant payload types are walked through [`substitute_type`] so
+    /// nested generic references (e.g. `Some(Box[T])`) flatten into
+    /// their mono'd shape and queue further jobs as needed.
+    fn instantiate_enum(
+        &mut self,
+        base: &str,
+        args: &[Type<'src>],
+        mangled: &'src str,
+    ) -> EnumDecl<'src> {
+        let template = self
+            .enum_templates
+            .get(base)
+            .cloned()
+            .expect("enum template");
+        let subst: Subst<'src> = template
+            .type_params
+            .iter()
+            .zip(args.iter())
+            .map(|(p, t)| (p.inner.0, t.clone()))
+            .collect();
+        let variants: Vec<Spanned<Variant<'src>>> = template
+            .variants
+            .into_iter()
+            .map(|v| {
+                let span = v.span;
+                let Variant { name, payload } = v.inner;
+                let new_payload = match payload {
+                    VariantPayload::None => VariantPayload::None,
+                    VariantPayload::Tuple(ts) => VariantPayload::Tuple(
+                        ts.into_iter()
+                            .map(|t| {
+                                let sp = t.span;
+                                self.substitute_type(&t.inner, &subst).with_span(sp)
+                            })
+                            .collect(),
+                    ),
+                    VariantPayload::Record(fs) => VariantPayload::Record(
+                        fs.into_iter()
+                            .map(|(n, t)| {
+                                let sp = t.span;
+                                let new_ty =
+                                    self.substitute_type(&t.inner, &subst).with_span(sp);
+                                (n, new_ty)
+                            })
+                            .collect(),
+                    ),
+                };
+                Variant {
+                    name,
+                    payload: new_payload,
+                }
+                .with_span(span)
+            })
+            .collect();
+        let name_span = template.name.span;
+        EnumDecl {
+            name: Ident::new(mangled).with_span(name_span),
+            type_params: Vec::new(),
+            variants,
+        }
     }
 
     /// Materialize a concrete record from a template + substitution.
@@ -1077,6 +1458,15 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                         new_args.iter().map(|a| a.inner.clone()).collect();
                     let mangled =
                         self.intern_record_mono(head, &arg_tys, name.span);
+                    let id = Ident::new(mangled).with_span(name.span);
+                    return Type::Named(id);
+                }
+                // agent: generics-142 phase 4 — same fold for enums.
+                if self.enum_templates.contains_key(head) {
+                    let arg_tys: Vec<Type<'src>> =
+                        new_args.iter().map(|a| a.inner.clone()).collect();
+                    let mangled =
+                        self.intern_enum_mono(head, &arg_tys, name.span);
                     let id = Ident::new(mangled).with_span(name.span);
                     return Type::Named(id);
                 }
