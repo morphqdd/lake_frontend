@@ -2683,11 +2683,26 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                             // `.field` access can be lowered to TupleIndex.
                             // First-branch ret_ty is canonical (the typeck
                             // checks consistency across branches).
+                            //
+                            // Cross-module lookup: a stdlib helper in
+                            // `std/postgres/mod.lake` returning a `Conn`
+                            // declared in the same module isn't visible
+                            // through current_module.records — scan all
+                            // modules' record tables so the dot-access
+                            // rewrite still kicks in.
                             for sig in &m.branches {
                                 let ret = sig.ret.as_str();
                                 let scope = self.registry.module(self.module_id);
                                 if let Some(rec) = scope.records.get(ret) {
                                     return Some(rec.name);
+                                }
+                                for i in 0..self.registry.modules.len() {
+                                    let mid = crate::registry::ModuleId(i as u32);
+                                    if let Some(rec) =
+                                        self.registry.module(mid).records.get(ret)
+                                    {
+                                        return Some(rec.name);
+                                    }
                                 }
                             }
                             return None;
