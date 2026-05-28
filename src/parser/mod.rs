@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn parses_generic_record_single_param() {
-        let src = "Vec<T> is { data buf  len i64 }";
+        let src = "Vec[T] is { data buf  len i64 }";
         let parsed = parse_one_item(src);
         let Item::Record(rec) = &parsed.inner else {
             panic!("not a record: {parsed:?}")
@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn parses_generic_record_two_params() {
-        let src = "Map<K V> is { keys buf  values buf }";
+        let src = "Map[K V] is { keys buf  values buf }";
         let parsed = parse_one_item(src);
         let Item::Record(rec) = &parsed.inner else {
             panic!("not a record: {parsed:?}")
@@ -834,11 +834,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_generic_machine_with_angle_brackets() {
-        // `id<T> is { x T -> ret T { ret x } }` — the `T` in param and
+    fn parses_generic_machine_with_brackets() {
+        // `id[T] is { x T -> ret T { ret x } }` — the `T` in param and
         // return position parses as Type::Named at this stage (resolver
         // rewrites to Type::TypeVar later, exercised in resolver tests).
-        let src = "id<T> is { x T -> ret T { ret x } }";
+        let src = "id[T] is { x T -> ret T { ret x } }";
         let parsed = parse_one_item(src);
         let Item::Machine(m) = &parsed.inner else {
             panic!("not a machine: {parsed:?}")
@@ -858,9 +858,9 @@ mod tests {
 
     #[test]
     fn parses_named_generic_use_site() {
-        // Use-site `Vec<i64>` in a let-binding type position becomes
+        // Use-site `Vec[i64]` in a let-binding type position becomes
         // `Type::NamedGeneric { name: "Vec", args: [Named("i64")] }`.
-        let src = "m is { _ -> { let v Vec<i64> = 0 } }";
+        let src = "m is { _ -> { let v Vec[i64] = 0 } }";
         let parsed = parse_one_item(src);
         let Item::Machine(m) = &parsed.inner else { panic!("not a machine") };
         let crate::api::ast::MachineItem::Branch(b) = &m.inner.items[0].inner else {
@@ -890,7 +890,7 @@ mod tests {
         // Through the full resolver pipeline: `id<T>` should produce
         // pattern + ret_ty types of Type::TypeVar(T), not Type::Named.
         use chumsky::input::Input;
-        let src = "id<T> is { x T -> ret T { ret x } }";
+        let src = "id[T] is { x T -> ret T { ret x } }";
         let tokens = lexer().parse(src).into_result().expect("lex");
         let ast = super::program()
             .parse(tokens[..].split_spanned((0..src.len()).into()))

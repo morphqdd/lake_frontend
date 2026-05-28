@@ -36,16 +36,16 @@ fn machine_item<'t, 'src: 't>()
     ))
 }
 
-/// Parses `[pub] ident[(generics) | <generics>] is { item* }`.
+/// Parses `[pub] ident[(generics) | [generics]] is { item* }`.
 ///
 /// Two equivalent generic-parameter syntaxes are accepted:
 ///   * `name(T U)` — historical paren-form, predates #142.
-///   * `name<T U>` — angle-bracket form introduced by #142 to align
-///     records and machines.  See docs/state/features/142_generics.md.
+///   * `name[T U]` — bracket form introduced by #142 to align records
+///     and machines.  See docs/state/features/142_generics.md.
 pub fn machine<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Machine<'src>>, Err<Rich<'t, Token<'src>>>> {
     // Historical `(T U)` form — kept for back-compat with stdlib code
-    // that predates the angle-bracket syntax.
+    // that predates the bracket syntax.
     let paren_generics = ident_parser()
         .repeated()
         .collect::<Vec<_>>()
@@ -54,22 +54,23 @@ pub fn machine<'t, 'src: 't>()
             Token::TightParens(ts) = e => ts.split_spanned(e.span()),
         ));
 
-    // agent: generics-142 — `<T U ...>` form.
-    let angle_generics = just(Token::Less)
-        .ignore_then(
-            ident_parser()
-                .repeated()
-                .at_least(1)
-                .collect::<Vec<_>>(),
-        )
-        .then_ignore(just(Token::Greater));
+    // agent: generics-142 — `[T U ...]` form.  Both spaced and tight
+    // bracket tokens accepted (e.g. `id [T]` and `id[T]`).
+    let bracket_generics = ident_parser()
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .nested_in(select_ref!(
+            Token::SquareBrackets(ts) = e => ts.split_spanned(e.span()),
+            Token::TightSquareBrackets(ts) = e => ts.split_spanned(e.span()),
+        ));
 
     just(Token::Pub)
         .or_not()
         .map(|p| p.is_some())
         .then(ident_parser())
         .then(
-            choice((angle_generics, paren_generics))
+            choice((bracket_generics, paren_generics))
                 .or_not()
                 .map(|g| g.unwrap_or_default()),
         )
