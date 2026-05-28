@@ -263,12 +263,34 @@ impl<'src, 'r> Resolver<'src, 'r> {
                 if let Type::Named(rec_name_ident) = &recv_ty {
                     let rec_name = rec_name_ident.inner.0;
                     if let Some(reg) = self.registry {
+                        // Local module first.
                         let scope = reg.module(self.current_module);
                         if let Some(entry) = scope.records.get(rec_name) {
                             if let Some((_, field_ty)) =
                                 entry.fields.iter().find(|(n, _)| n.inner.0 == field.inner.0)
                             {
                                 return field_ty.inner.clone();
+                            }
+                        }
+                        // Cross-module: a record from a sibling module
+                        // imported via `+other.{ Foo }` (or transitively
+                        // visible as a return type) won't be in the
+                        // current module's `records` map.  Scan every
+                        // loaded module for a matching pub record so
+                        // dot-access propagates field types through
+                        // imported records.  Required by stdlib code that
+                        // returns records across module boundaries.
+                        for m in &reg.modules {
+                            if let Some(entry) = m.records.get(rec_name) {
+                                if entry.is_pub {
+                                    if let Some((_, field_ty)) = entry
+                                        .fields
+                                        .iter()
+                                        .find(|(n, _)| n.inner.0 == field.inner.0)
+                                    {
+                                        return field_ty.inner.clone();
+                                    }
+                                }
                             }
                         }
                     }
