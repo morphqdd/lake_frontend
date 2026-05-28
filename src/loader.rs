@@ -117,6 +117,12 @@ impl SearchPaths {
                 return ResolveOutcome::Found(candidate);
             }
             tried.push(candidate);
+            // Directory-style: <module>/mod.lake.
+            let mod_candidate = root.join(module.to_filesystem_mod());
+            if mod_candidate.is_file() {
+                return ResolveOutcome::Found(mod_candidate);
+            }
+            tried.push(mod_candidate);
         }
         // Per-lib root: first segment names the library, env var holds
         // the directory the library's tree starts at.  The first
@@ -144,6 +150,11 @@ impl SearchPaths {
                         return ResolveOutcome::Found(candidate);
                     }
                     tried.push(candidate);
+                    let mod_candidate = root.join(rest.to_filesystem_mod());
+                    if mod_candidate.is_file() {
+                        return ResolveOutcome::Found(mod_candidate);
+                    }
+                    tried.push(mod_candidate);
                 }
             }
         }
@@ -153,6 +164,11 @@ impl SearchPaths {
                 return ResolveOutcome::Found(candidate);
             }
             tried.push(candidate);
+            let mod_candidate = root.join(module.to_filesystem_mod());
+            if mod_candidate.is_file() {
+                return ResolveOutcome::Found(mod_candidate);
+            }
+            tried.push(mod_candidate);
         }
         ResolveOutcome::NotFound { tried }
     }

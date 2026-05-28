@@ -85,6 +85,18 @@ impl ModulePath {
         p
     }
 
+    /// Render as a directory-style module path: `core.io` → `core/io/mod.lake`.
+    /// Used as a fallback when a package is laid out as a directory whose
+    /// entry-point is `mod.lake` (Rust-style).
+    pub fn to_filesystem_mod(&self) -> PathBuf {
+        let mut p = PathBuf::new();
+        for seg in &self.0 {
+            p.push(seg);
+        }
+        p.push("mod.lake");
+        p
+    }
+
     /// True for the root module (`ModulePath::root`).
     pub fn is_root(&self) -> bool {
         self.0.is_empty()

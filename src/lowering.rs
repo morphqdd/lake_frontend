@@ -2751,6 +2751,27 @@ impl<'a, 'src> LowerCx<'a, 'src> {
                         scope.insert(ident.inner.0, rname);
                     }
 
+                    // #142 generics phases 2-3 — tag the Let's `ty`
+                    // with the inferred record name when the user
+                    // didn't write one.  Without this, the post-
+                    // lowering default is `Tuple([...])` and the
+                    // resolver would infer `Type::Struct(...)`,
+                    // causing downstream calls (`unbox(b)` where
+                    // `unbox` declares `b Box`) to miss-match at
+                    // typeck.  This was a latent issue on non-
+                    // generic record let-bindings too; surface fix
+                    // benefits both.
+                    let ty = if matches!(ty.inner, Type::Unknown) {
+                        if let Some(rname) = record_name {
+                            let span = ty.span;
+                            Type::Named(Ident::new(rname).with_span(span)).with_span(span)
+                        } else {
+                            ty
+                        }
+                    } else {
+                        ty
+                    };
+
                     out.push(
                         Expr::Let { ident, ty, default: lowered_default }.with_span(span),
                     );
