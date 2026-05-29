@@ -55,7 +55,11 @@ struct MonoCx<'src, 'a> {
     /// is already globally unique per source name (T028 enforces that
     /// at the registry layer).
     mono_records: HashMap<(String, Vec<String>), String>,
-    mono_machines: HashMap<(String, Vec<String>), String>,
+    // Keyed by (base name, owner module, mangled type-args).  The owner
+    // is part of the key so two same-named overloaded methods (e.g.
+    // `Vec.index[T]` and a user's `Struct.index[T]`) instantiated with
+    // the same type-arg don't collide on one cache slot / symbol (#101).
+    mono_machines: HashMap<(String, ModuleId, Vec<String>), String>,
     /// agent: generics-142 phase 4 — enum mono cache.  Same key shape
     /// as records / machines so an `Option[i64]` site shares the
     /// `Option_i64` mangled name across modules.
@@ -1253,23 +1257,31 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                     // Snapshot the cache entries before calling
                     // `substitute_type_pure` so we don't borrow self
                     // mutably and immutably at once.
-                    let snapshot: Vec<(String, Vec<String>, String)> = self
+                    let snapshot: Vec<(String, ModuleId, Vec<String>, String)> = self
                         .mono_machines
                         .iter()
-                        .map(|((b, a), m)| (b.clone(), a.clone(), m.clone()))
+                        .map(|((b, o, a), m)| (b.clone(), *o, a.clone(), m.clone()))
                         .collect();
-                    for (base, arg_strs, mangled) in snapshot {
+                    for (base, owner_id, arg_strs, mangled) in snapshot {
                         if mangled == *name {
-                            // Pick the same-named template whose generic
-                            // arity matches this instance's arg count —
-                            // distinguishes e.g. unwrap_or[T] from
-                            // unwrap_or[T E].
+                            // Pick the template owned by the same module
+                            // (disambiguates overloaded methods like two
+                            // `index[T]`), falling back to generic-arity
+                            // match (unwrap_or[T] vs unwrap_or[T E]).
                             if let Some(decl) = self
                                 .machine_templates
                                 .get(&base)
                                 .and_then(|v| {
                                     v.iter()
-                                        .find(|(_, d)| d.generics.len() == arg_strs.len())
+                                        .find(|(o, d)| {
+                                            *o == owner_id
+                                                && d.generics.len() == arg_strs.len()
+                                        })
+                                        .or_else(|| {
+                                            v.iter().find(|(_, d)| {
+                                                d.generics.len() == arg_strs.len()
+                                            })
+                                        })
                                         .or_else(|| v.first())
                                         .map(|(_, d)| d.clone())
                                 })
@@ -1358,16 +1370,28 @@ impl<'src, 'a> MonoCx<'src, 'a> {
         _call_span: SimpleSpan,
     ) -> &'src str {
         let arg_strs: Vec<String> = args.iter().map(mangle_type).collect();
-        let key = (base.to_string(), arg_strs.clone());
+        let key = (base.to_string(), owner, arg_strs.clone());
         if let Some(m) = self.mono_machines.get(&key) {
             let s = m.clone();
             return Box::leak(s.into_boxed_str());
         }
         // agent: protocols-146 — verify `[T: Eq]` bounds against the
         // concrete substituted types before emitting the instance.  Runs
-        // once per unique (base, args) pair (after the cache check).
+        // once per unique (base, owner, args) pair (after the cache check).
         self.verify_bounds(base, args, owner, _call_span);
-        let mangled_owned = format!("{}_{}", base, arg_strs.join("_"));
+        // #101 — when `base` is overloaded across modules (e.g. two
+        // `index[T]` for different receiver types), owner-qualify the
+        // symbol so the instances don't share one mangled name.  Single
+        // (non-overloaded) methods keep their plain `name_args` symbol.
+        let overloaded = self
+            .machine_templates
+            .get(base)
+            .map_or(false, |c| c.len() > 1);
+        let mangled_owned = if overloaded {
+            format!("{}_o{}_{}", base, owner.0, arg_strs.join("_"))
+        } else {
+            format!("{}_{}", base, arg_strs.join("_"))
+        };
         let mangled_leaked = self.leak_name(mangled_owned.clone());
         self.mono_machines.insert(key, mangled_owned);
         self.work.push(MonoJob::Machine {
