@@ -91,6 +91,12 @@ struct MonoCx<'src, 'a> {
     /// rewrite for sites like `Option.None` where no payload args
     /// would otherwise pin down T.  Popped on exit.
     enum_hints: HashMap<&'src str, Vec<Vec<Type<'src>>>>,
+    /// #88 — expected return type of the current zero-arg generic call,
+    /// taken from the enclosing `let x T = f()` annotation.  Lets a
+    /// no-argument generic constructor like `vec_new[T]` (`_ -> ret
+    /// Vec[T]`) recover `T` by unifying its declared return against the
+    /// binding's annotation.  Set only around a zero-arg default walk.
+    ret_hint: Option<Type<'src>>,
     errors: Vec<LakeError>,
 }
 
@@ -131,6 +137,7 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             template_module: HashMap::new(),
             leaked: HashSet::new(),
             enum_hints: HashMap::new(),
+            ret_hint: None,
             errors: Vec::new(),
         }
     }
@@ -326,6 +333,25 @@ impl<'src, 'a> MonoCx<'src, 'a> {
         _enclosing_generics: &[Spanned<Ident<'src>>],
     ) -> Branch<'src> {
         let Branch { label, patterns, ret_ty, body } = branch;
+        // #88 — fold concrete generic annotations in param + return
+        // types (e.g. `v Vec[i64]` → `v Vec_i64`) so they match the
+        // mono'd record/enum names that call sites resolve to.  Empty
+        // subst: only already-concrete `NamedGeneric`s collapse; bare
+        // type-vars (in a still-generic template) pass through.
+        let empty: Subst<'src> = HashMap::new();
+        let patterns: Vec<Spanned<Pattern<'src>>> = patterns
+            .into_iter()
+            .map(|p| {
+                let span = p.span;
+                let Pattern { ident, ty, kind } = p.inner;
+                let new_ty = self.substitute_type(&ty.inner, &empty).with_span(ty.span);
+                Pattern { ident, ty: new_ty, kind }.with_span(span)
+            })
+            .collect();
+        let ret_ty = ret_ty.map(|t| {
+            let sp = t.span;
+            self.substitute_type(&t.inner, &empty).with_span(sp)
+        });
         // Build a per-branch scope: pattern binders → declared type.
         let mut scope: HashMap<&'src str, Type<'src>> = HashMap::new();
         for pat in &patterns {
@@ -389,7 +415,22 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                     other => (other, None),
                 };
                 let new_ty = new_ty_inner.clone().with_span(ty_span);
+                // #88 — if the default is a zero-arg generic call
+                // (`vec_new()`), expose the binding's annotation as the
+                // return hint so the callee can recover its type param
+                // from the declared return.  Only zero-arg defaults, so
+                // no nested call can mis-consume the hint.
+                let set_ret_hint = matches!(
+                    default.as_deref().map(|d| &d.inner),
+                    Some(Expr::Jump { args, .. }) if args.is_empty()
+                ) && !matches!(new_ty_inner, Type::Unknown);
+                if set_ret_hint {
+                    self.ret_hint = Some(new_ty_inner.clone());
+                }
                 let default = default.map(|d| Box::new(self.walk_expr(*d, scope, module_id)));
+                if set_ret_hint {
+                    self.ret_hint = None;
+                }
                 // Pop the hint after the default has been walked.
                 if let Some(key) = enum_hint_key {
                     if let Some(stack) = self.enum_hints.get_mut(key) {
@@ -888,6 +929,14 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             }
             if !ok {
                 continue;
+            }
+            // #88 — bind any leftover params from the return hint
+            // (`let x T = f()`): unify the branch's declared return
+            // type against the enclosing annotation.  Needed for
+            // zero-arg constructors like `vec_new[T]` whose params
+            // can't pin T.
+            if let (Some(hint), Some(ret_ty)) = (self.ret_hint.clone(), b.ret_ty.as_ref()) {
+                self.unify(&ret_ty.inner, &hint, &type_params, &mut subst);
             }
             // Validate every declared type param ended up bound.
             let mut all_bound = true;
@@ -1591,13 +1640,52 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                 },
                 default: default.map(|d| Box::new(self.substitute_expr(*d, subst))),
             },
-            Expr::Jump { ident, args } => Expr::Jump {
-                ident: Box::new(self.substitute_expr(*ident, subst)),
-                args: args
-                    .into_iter()
-                    .map(|a| self.substitute_expr(a, subst))
-                    .collect(),
-            },
+            Expr::Jump { ident, args } => {
+                // #88 — fold a generic-record constructor inside a
+                // template body using the active substitution.  Records
+                // like `Vec[T] { data buf, len i64, cap i64 }` have a
+                // PHANTOM `T` (storage is a raw buf), so the ctor args
+                // can't pin it — but when we instantiate the enclosing
+                // generic (e.g. `vec_new_i64`, subst {T:i64}) the ctor's
+                // type IS known.  Rewrite `Vec(...)` → `Vec_i64(...)`
+                // before the re-walk so it isn't re-inferred from args.
+                let folded_ident = if let Expr::Var(rname, vty) = &ident.inner {
+                    if let Some(decl) = self.record_templates.get(*rname).cloned() {
+                        let concrete: Vec<Type<'src>> = decl
+                            .type_params
+                            .iter()
+                            .map(|p| subst.get(p.inner.0).cloned())
+                            .collect::<Option<Vec<_>>>()
+                            .unwrap_or_default();
+                        if !decl.type_params.is_empty()
+                            && concrete.len() == decl.type_params.len()
+                        {
+                            let mangled =
+                                self.intern_record_mono(rname, &concrete, ident.span);
+                            Some(
+                                Expr::Var(mangled, vty.clone()).with_span(ident.span),
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let new_ident = match folded_ident {
+                    Some(i) => i,
+                    None => self.substitute_expr(*ident, subst),
+                };
+                Expr::Jump {
+                    ident: Box::new(new_ident),
+                    args: args
+                        .into_iter()
+                        .map(|a| self.substitute_expr(a, subst))
+                        .collect(),
+                }
+            }
             Expr::Add(l, r) => Expr::Add(
                 Box::new(self.substitute_expr(*l, subst)),
                 Box::new(self.substitute_expr(*r, subst)),
