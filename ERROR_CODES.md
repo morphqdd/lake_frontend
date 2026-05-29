@@ -107,3 +107,18 @@ counter is {
     }
 }
 ```
+
+---
+
+### E041 — Malformed `@cfg(...)` directive
+
+A `@cfg(arch="...")` directive had no key, an unknown key, or was not
+attached to a following item.  See docs/state/features/054_cfg.md.
+
+```lake
+@cfg(os="linux")   -- E041: unknown `@cfg` key `os`
+pub const X = 1
+```
+
+**Fix:** use `@cfg(arch="x86_64")` or `@cfg(arch="aarch64")` placed
+immediately before a `const` or machine item.

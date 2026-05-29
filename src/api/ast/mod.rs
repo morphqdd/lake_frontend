@@ -357,16 +357,32 @@ pub enum MachineItem<'src> {
     Branch(Branch<'src>),
 }
 
-/// Built-in macro attribute: `@rt_st(...)`, `@ffi(...)`, `@rt(...)`
+/// Built-in macro attribute: `@rt_st(...)`, `@ffi(...)`, `@rt(...)`,
+/// `@cfg(arch="x86_64")`.
+///
+/// `args` carries the historical type-expression argument list
+/// (`@rt(name {…} {…})`).  `kv_args` carries `key="string"` pairs used by
+/// `@cfg` for conditional compilation — see docs/state/features/054_cfg.md.
 #[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
 pub struct Directive<'src> {
     pub name: Spanned<Ident<'src>>,
     pub args: Vec<Spanned<Type<'src>>>,
+    /// `key="value"` arguments, e.g. `arch="x86_64"`.  Empty for every
+    /// directive except `@cfg`.
+    pub kv_args: Vec<(Spanned<Ident<'src>>, Spanned<&'src str>)>,
 }
 
 impl<'src> Directive<'src> {
     pub fn new(name: Spanned<Ident<'src>>, args: Vec<Spanned<Type<'src>>>) -> Self {
-        Self { name, args }
+        Self { name, args, kv_args: Vec::new() }
+    }
+
+    /// Construct a directive carrying `key="value"` arguments (`@cfg`).
+    pub fn with_kv(
+        name: Spanned<Ident<'src>>,
+        kv_args: Vec<(Spanned<Ident<'src>>, Spanned<&'src str>)>,
+    ) -> Self {
+        Self { name, args: Vec::new(), kv_args }
     }
 }
 
