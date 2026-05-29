@@ -2517,11 +2517,34 @@ impl<'a, 'src> LowerCx<'a, 'src> {
             // intentionally NOT descended (their let-bindings have
             // their own scope; Phase 4 re-enters each arm via
             // `lower_body`, which fires this pass per-arm).
-            Expr::When { cond, branches } => Expr::When {
-                cond: Box::new(self.lift_in_expr(*cond, lifts)),
-                branches,
+            Expr::When { cond, branches } => {
+                // A ret-machine call used DIRECTLY as a `when` scrutinee
+                // (`when at64(b 0) { ... }`) must be lifted into a
+                // `let __wc = at64(b 0)` first: as a bare cond it never
+                // reaches the let-with-ret-call sweep, so it never gets
+                // the implicit `__caller`/`self` prepend (or pure
+                // inline) and the call hash ends up one arg short.
+                // Lifting routes it through the normal ret-call path.
+                let cond = if self.ret_target(&cond.inner).is_some() {
+                    let lifted_call = self.lift_in_expr(*cond, lifts);
+                    let cspan = lifted_call.span;
+                    let id = self.fresh_id();
+                    let name: &'static str =
+                        Box::leak(format!("__wc{id}").into_boxed_str());
+                    lifts.push(
+                        Expr::Let {
+                            ident: Ident::new(name).with_span(cspan),
+                            ty: Type::Unknown.with_span(cspan),
+                            default: Some(Box::new(lifted_call)),
+                        }
+                        .with_span(cspan),
+                    );
+                    Box::new(Expr::Var(name, Type::Unknown).with_span(cspan))
+                } else {
+                    Box::new(self.lift_in_expr(*cond, lifts))
+                };
+                Expr::When { cond, branches }.with_span(span)
             }
-            .with_span(span),
             // when / wait arm bodies have their own scope; Phase 4 in
             // `lower_body` re-enters each arm by recursively calling
             // lower_body, which fires this pass on the arm body in
