@@ -126,18 +126,8 @@ impl<'src, 'r> Resolver<'src, 'r> {
         lookup_module: crate::registry::ModuleId,
     ) -> Type<'src> {
         let Type::Named(name_id) = ty else {
-            if std::env::var("LAKE_DBG91").is_ok() {
-                eprintln!("DBG91 expand: non-Named ty = {:?}", ty);
-            }
             return ty.clone();
         };
-        if std::env::var("LAKE_DBG91").is_ok() {
-            let found = self.registry.map(|r| {
-                r.module(self.current_module).records.contains_key(name_id.inner.0)
-                    || (0..r.modules.len()).any(|i| r.module(crate::registry::ModuleId(i as u32)).records.contains_key(name_id.inner.0))
-            });
-            eprintln!("DBG91 expand: Named({}) found_in_records={:?}", name_id.inner.0, found);
-        }
         // Try the lookup module first, then the current module (handles
         // both cross-module field types and current-module record refs).
         let entry = reg
