@@ -91,14 +91,17 @@ pub fn proto_decl<'t, 'src: 't>()
 /// `Name is A B ...` shape.
 pub fn impl_decl<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<ImplDecl<'src>>, Err<Rich<'t, Token<'src>>>> {
+    // A proto-name in the list is a bare ident that is NOT immediately
+    // followed by `is`.  Without this guard the `repeated()` greedily
+    // swallows the *next* top-level item's leading ident (`main is …`
+    // parses as proto `main`, then chokes on `is {`).  The negative
+    // lookahead `(ident is).not()` stops the list at the boundary
+    // between this impl and the following declaration.
+    let proto_name = ident_parser().and_is(ident_parser().ignore_then(just(Token::Is)).not());
+
     ident_parser()
         .then_ignore(just(Token::Is))
-        .then(
-            ident_parser()
-                .repeated()
-                .at_least(1)
-                .collect::<Vec<_>>(),
-        )
+        .then(proto_name.repeated().at_least(1).collect::<Vec<_>>())
         .map(|(ty, protos)| ImplDecl { ty, protos })
         .spanned()
 }
@@ -172,5 +175,26 @@ mod tests {
         assert_eq!(d.inner.protos.len(), 2);
         assert_eq!(d.inner.protos[0].inner.0, "Eq");
         assert_eq!(d.inner.protos[1].inner.0, "Show");
+    }
+
+    #[test]
+    fn impl_does_not_swallow_following_item() {
+        // Regression: the proto-name list `Eq` must stop before the next
+        // top-level `main is { … }` — the negative lookahead `(ident
+        // is).not()` prevents `main` from being parsed as a proto name.
+        let src = "Color is Eq\nmain is { _ -> { } }";
+        let items = parse_top(src).expect("parses two items");
+        assert_eq!(items.len(), 2, "got items: {items:?}");
+        let Item::Impl(d) = &items[0].inner else {
+            panic!("expected Impl first, got {:?}", items[0].inner)
+        };
+        assert_eq!(d.inner.ty.inner.0, "Color");
+        assert_eq!(d.inner.protos.len(), 1);
+        assert_eq!(d.inner.protos[0].inner.0, "Eq");
+        assert!(
+            matches!(items[1].inner, Item::Machine(_)),
+            "expected Machine second, got {:?}",
+            items[1].inner
+        );
     }
 }

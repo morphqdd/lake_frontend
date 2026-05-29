@@ -630,8 +630,34 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                 let index = self.walk_expr(*index, scope, module_id);
                 let recv_ty = self.infer_expr_type(&receiver.inner, scope);
                 if self.is_indexable_via_proto(&recv_ty) {
+                    // Nominal opt-in: a composite receiver must carry an
+                    // explicit `X is Index` assertion.  Without it `[]`
+                    // is rejected — `index` is a proto method, not a bare
+                    // naming convention (#146 phase 2).
+                    let base = self.index_base_name(&recv_ty);
+                    let ok = base
+                        .as_deref()
+                        .is_some_and(|b| self.implements_proto(b, "Index"));
+                    if !ok {
+                        let tyname = base.unwrap_or_else(|| "<receiver>".to_string());
+                        self.errors.push(
+                            LakeError::new(
+                                format!(
+                                    "type `{tyname}` does not implement proto `Index`: \
+                                     `[]` requires it"
+                                ),
+                                span,
+                            )
+                            .code("E042")
+                            .help(format!(
+                                "declare `{tyname} is Index` and provide an `index` machine"
+                            )),
+                        );
+                    }
                     // Build `index(receiver index)` and re-run callee
                     // rewriting so a generic `index[T]` resolves / monos.
+                    // (Emitted even on the error path so resolution
+                    // continues without a cascade of follow-on errors.)
                     let idx_name = self.leak_name("index".to_string());
                     let callee = Expr::Var(idx_name, Type::Unknown).with_span(span);
                     let args = vec![receiver, index];
@@ -1386,6 +1412,34 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             }
             _ => false,
         }
+    }
+
+    /// Base nominal name of an indexable receiver — strips generic args
+    /// and reverses any mono-mangling so `Vec[i64]` and `Vec_i64` both
+    /// map back to the declared `Vec`.  The `is Index` assertion is
+    /// always keyed on this base name.
+    fn index_base_name(&self, ty: &Type<'src>) -> Option<String> {
+        match ty {
+            Type::NamedGeneric { name, .. } => Some(name.inner.0.to_string()),
+            Type::Named(name) => {
+                let n = name.inner.0;
+                for ((base, _), mangled) in &self.mono_records {
+                    if mangled == n {
+                        return Some(base.clone());
+                    }
+                }
+                Some(n.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// True when an explicit `base is <proto>` assertion exists anywhere
+    /// in the program.  Nominal opt-in for operator protos (`Index`).
+    fn implements_proto(&self, base: &str, proto: &str) -> bool {
+        self.registry.all_impls().any(|i| {
+            i.ty.to_string() == base && i.protos.iter().any(|p| p.to_string() == proto)
+        })
     }
 
     /// agent: protocols-146 — verify the proto bounds on a generic machine

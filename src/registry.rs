@@ -562,7 +562,9 @@ impl<'src> ProgramRegistry<'src> {
         for module in &self.modules {
             if let Some(m) = module.machines.get(name) {
                 for b in &m.branches {
-                    if b.params == params && (b.ret == ret || ret == "pid") {
+                    if params_loosely_match(params, &b.params)
+                        && (ret == "_" || ty_base(&b.ret) == ty_base(ret) || ret == "pid")
+                    {
                         return true;
                     }
                 }
@@ -867,6 +869,34 @@ fn build_machine_entry<'src>(machine: &Machine<'src>, module: ModuleId) -> Machi
         type_params: machine.generics.iter().map(|p| p.inner.0).collect(),
         branches,
     }
+}
+
+/// Base type name with any generic argument clause stripped:
+/// `Vec[T]` → `Vec`, `i64` → `i64`.  Used by proto verification so a
+/// generic container's method (`index[T] { v Vec[T] … }`, registered
+/// with param string `Vec[T]`) satisfies a proto requirement whose
+/// `Self` substituted to the bare base name `Vec`.
+fn ty_base(s: &str) -> &str {
+    // `Type::Display` renders generics with angle brackets (`Vec<T>`)
+    // while source / mangling uses square brackets (`Vec[T]`) — accept
+    // either so the base name is recovered regardless of origin.
+    match s.find(['[', '<']) {
+        Some(i) => s[..i].trim_end(),
+        None => s,
+    }
+}
+
+/// Proto-requirement param matcher: same arity, and each required param
+/// equals the candidate either exactly, by base name (generic args
+/// ignored), or via the `_` wildcard.  Looser than `==` only where
+/// generics are involved — for fully concrete protos (`eq(Self Self)`)
+/// it degenerates to exact comparison.
+fn params_loosely_match(required: &[String], got: &[String]) -> bool {
+    required.len() == got.len()
+        && required
+            .iter()
+            .zip(got.iter())
+            .all(|(r, g)| r == "_" || r == g || ty_base(r) == ty_base(g))
 }
 
 fn branch_signature(branch: &Branch<'_>) -> Signature {
