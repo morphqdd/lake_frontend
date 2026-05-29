@@ -1142,11 +1142,12 @@ impl<'src, 'r> Resolver<'src, 'r> {
 
         self.type_var_scope = saved_type_vars;
 
-        Machine::new(
+        Machine::with_bounds(
             machine.attrs,
             machine.vis,
             machine.ident,
             machine.generics,
+            machine.bounds,
             items,
         )
     }

@@ -8,12 +8,13 @@ use chumsky::{
 
 use crate::{
     api::{
-        ast::{ConstDecl, Directive, EnumDecl, Item, Machine, RecordDecl},
+        ast::{ConstDecl, Directive, EnumDecl, ImplDecl, Item, Machine, ProtoDecl, RecordDecl},
         token::Token,
     },
     parser::{
         const_item::const_item, directive::directive, enum_decl::enum_decl,
-        helpers::TokenInput, import::import, machine::machine, record::record,
+        helpers::TokenInput, import::import, machine::machine,
+        proto::{impl_decl, proto_decl}, record::record,
     },
 };
 
@@ -26,6 +27,7 @@ mod helpers;
 mod import;
 mod machine;
 mod pattern;
+mod proto;
 mod record;
 
 /// Top-level parser.  Returns a flat list of `Item`s: imports, standalone
@@ -70,9 +72,33 @@ pub fn program<'t, 'src: 't>()
         Item::Const(c).with_span(span)
     });
 
-    choice((import_item, directive_item, const_item_node, enum_item, record_item, machine_item))
-        .repeated()
-        .collect::<Vec<_>>()
+    // agent: protocols-146 — `proto` decls share the `IDENT is { ... }`
+    // prefix with records / enums / machines, so try them BEFORE those.
+    let proto_item = proto_decl().map(|p: Spanned<ProtoDecl>| {
+        let span = p.span;
+        Item::Proto(p).with_span(span)
+    });
+
+    // `X is Eq Show` — bare ident-list assertion.  Tried LAST: every
+    // brace / `enum` / `proto` form wins first; this catches the
+    // remaining `Name is A B ...` shape.
+    let impl_item = impl_decl().map(|d: Spanned<ImplDecl>| {
+        let span = d.span;
+        Item::Impl(d).with_span(span)
+    });
+
+    choice((
+        import_item,
+        directive_item,
+        const_item_node,
+        proto_item,
+        enum_item,
+        record_item,
+        machine_item,
+        impl_item,
+    ))
+    .repeated()
+    .collect::<Vec<_>>()
 }
 
 #[cfg(test)]
@@ -883,6 +909,97 @@ mod tests {
         let parsed = parse_one_item(src);
         let Item::Machine(m) = &parsed.inner else { panic!("not a machine") };
         assert!(m.inner.generics.is_empty());
+        assert!(m.inner.bounds.is_empty());
+    }
+
+    // ── #146 protocols phase 1 — bound + impl parser tests ───────────────────
+
+    #[test]
+    fn parses_single_bound_generic() {
+        // `[T: Eq]` — one type param, one bound.
+        let src = "dedupe[T: Eq] is { xs T -> ret T { ret xs } }";
+        let parsed = parse_one_item(src);
+        let Item::Machine(m) = &parsed.inner else { panic!("not a machine") };
+        assert_eq!(m.inner.generics.len(), 1);
+        assert_eq!(m.inner.generics[0].inner.0, "T");
+        assert_eq!(m.inner.bounds.len(), 1);
+        assert_eq!(m.inner.bounds[0].0.inner.0, "T");
+        assert_eq!(m.inner.bounds[0].1.len(), 1);
+        assert_eq!(m.inner.bounds[0].1[0].inner.0, "Eq");
+    }
+
+    #[test]
+    fn parses_multi_bound_generic() {
+        // `[T: Eq Ord]` — one type param, two bounds.
+        let src = "sort[T: Eq Ord] is { xs T -> ret T { ret xs } }";
+        let parsed = parse_one_item(src);
+        let Item::Machine(m) = &parsed.inner else { panic!("not a machine") };
+        assert_eq!(m.inner.generics.len(), 1);
+        assert_eq!(m.inner.bounds.len(), 1);
+        let bs: Vec<&str> = m.inner.bounds[0].1.iter().map(|b| b.inner.0).collect();
+        assert_eq!(bs, vec!["Eq", "Ord"]);
+    }
+
+    #[test]
+    fn parses_mixed_bound_and_unbounded_params() {
+        // `[U T: Eq]` — unbounded param first, then a bounded one.  The
+        // comma-less grammar disambiguates a new param only by a following
+        // `:`, so an unbounded param must precede bounded ones (or use the
+        // two-bounded form which is colon-delimited).
+        let src = "f[U T: Eq] is { a U b T -> ret T { ret b } }";
+        let parsed = parse_one_item(src);
+        let Item::Machine(m) = &parsed.inner else { panic!("not a machine") };
+        let names: Vec<&str> = m.inner.generics.iter().map(|g| g.inner.0).collect();
+        assert_eq!(names, vec!["U", "T"]);
+        // Only T carries a bound.
+        assert_eq!(m.inner.bounds.len(), 1);
+        assert_eq!(m.inner.bounds[0].0.inner.0, "T");
+        assert_eq!(m.inner.bounds[0].1[0].inner.0, "Eq");
+    }
+
+    #[test]
+    fn parses_two_bounded_params() {
+        // `[T: Eq  U: Show]` — comma-less; the colon-lookahead fold must
+        // split U off as its own param, not as another bound of T.
+        let src = "g[T: Eq U: Show] is { a T b U -> ret T { ret a } }";
+        let parsed = parse_one_item(src);
+        let Item::Machine(m) = &parsed.inner else { panic!("not a machine") };
+        let names: Vec<&str> = m.inner.generics.iter().map(|g| g.inner.0).collect();
+        assert_eq!(names, vec!["T", "U"]);
+        assert_eq!(m.inner.bounds.len(), 2);
+        assert_eq!(m.inner.bounds[0].0.inner.0, "T");
+        assert_eq!(m.inner.bounds[0].1[0].inner.0, "Eq");
+        assert_eq!(m.inner.bounds[1].0.inner.0, "U");
+        assert_eq!(m.inner.bounds[1].1[0].inner.0, "Show");
+    }
+
+    #[test]
+    fn back_compat_record_still_parses_after_proto() {
+        // `X is { f T }` record still parses (not an impl assertion).
+        let src = "Wrapper is { f i64 }";
+        let parsed = parse_one_item(src);
+        assert!(matches!(parsed.inner, Item::Record(_)), "got {:?}", parsed.inner);
+    }
+
+    #[test]
+    fn back_compat_enum_still_parses_after_proto() {
+        // `X is enum {...}` still parses as an enum, not an impl with
+        // proto `enum`.
+        let src = "Color is enum { Red Green Blue }";
+        let parsed = parse_one_item(src);
+        assert!(matches!(parsed.inner, Item::Enum(_)), "got {:?}", parsed.inner);
+    }
+
+    #[test]
+    fn impl_assertion_not_record() {
+        // `HTTPMethod is Eq Show` must be Impl, not a record.
+        let src = "HTTPMethod is Eq Show";
+        let parsed = parse_one_item(src);
+        let Item::Impl(d) = &parsed.inner else {
+            panic!("expected Impl, got {:?}", parsed.inner)
+        };
+        assert_eq!(d.inner.ty.inner.0, "HTTPMethod");
+        assert_eq!(d.inner.protos.len(), 2);
     }
 
     #[test]
