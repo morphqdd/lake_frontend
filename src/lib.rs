@@ -15,6 +15,7 @@ pub mod lexer;
 pub mod loader;
 pub mod lowering;
 pub mod mono;
+pub mod panic_loc;
 pub mod parser;
 pub mod prelude;
 pub mod registry;

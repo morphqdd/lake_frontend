@@ -164,6 +164,11 @@ pub fn build_program_for_target<'src>(
         return Err(bag);
     }
 
+    // Inject call-site `(file, line)` into `panic` / `assert` calls
+    // (track_caller-style) BEFORE the registry sees them, so the extra
+    // args are part of every call's arity at typeck / mono time.
+    let parsed = crate::panic_loc::inject_panic_location(parsed);
+
     let mut registry: ProgramRegistry<'src> = ProgramRegistry::with_rt();
     if let Err(e) = registry.populate_from(&parsed) {
         return Err(e);
