@@ -1225,9 +1225,25 @@ impl<'a, 'src> LowerCx<'a, 'src> {
         // Rewrite the final `ret <expr>` to `let <user_ident> = <expr>`
         // so the caller sees the value bound to its target name.  All
         // prior statements in the substituted body (rt_store etc.) are
-        // kept as-is.
+        // kept as-is — EXCEPT bare ret-machine calls, which we wrap in a
+        // throwaway `let __discard = …`.
+        //
+        // #155: a pure helper's template body keeps its internal calls
+        // in source form (`set(b off val)` as a bare statement).  When
+        // the helper is inlined into a *non-inlineable* caller (one with
+        // a `self()` loop, so it survives as a real machine), those bare
+        // calls are spliced in after the caller's own Phase 1c bare-call
+        // wrap already ran — so they reach the backend un-wrapped, never
+        // get the implicit `__caller`/`self` prepend, and the call hash
+        // omits the leading pid → "no branch matching".  Wrapping them
+        // here routes each through the recursion below (pure → inlined
+        // further; impure → Phase 2 self-prepend).  When the caller is
+        // itself inlineable this path never mattered because the whole
+        // chain collapsed at the outermost let-bound call site.
         let (prefix, ret_expr) = split_final_ret(substituted);
-        out.extend(prefix);
+        for stmt in prefix {
+            out.push(self.wrap_bare_ret_call_in_let(stmt));
+        }
         out.push(
             Expr::Let {
                 ident: user_ident.clone(),
