@@ -321,7 +321,11 @@ impl SemanticAnalyzer {
                 Item::Const(_) => {
                     // C3 will register const symbols here.  Placeholder.
                 }
-                Item::Import(_) | Item::Record(_) | Item::Enum(_) => {}
+                Item::Import(_)
+                | Item::Record(_)
+                | Item::Enum(_)
+                | Item::Proto(_)
+                | Item::Impl(_) => {}
             }
         }
     }
@@ -340,6 +344,8 @@ impl<'src> Visit<'src> for SemanticAnalyzer {
             }
             Item::Record(_) => {}
             Item::Enum(_) => {}
+            Item::Proto(_) => {}
+            Item::Impl(_) => {}
         }
     }
 

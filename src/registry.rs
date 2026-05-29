@@ -205,6 +205,33 @@ pub enum VariantPayloadEntry<'src> {
     Record(Vec<(&'src str, Type<'src>)>),
 }
 
+/// agent: protocols-146 — a `Name is proto { ... }` declaration.
+///
+/// `required` holds each method's name plus its parameter type strings and
+/// return type, with `Self` left as the literal placeholder `"Self"`.
+/// Bound verification substitutes `Self := <concrete type>` and looks up a
+/// matching machine branch.  See docs/state/features/146_protos.md.
+#[derive(Debug, Clone)]
+pub struct ProtoEntry<'src> {
+    pub name: &'src str,
+    pub module: ModuleId,
+    /// Parent protos (`+Eq`) whose requirements are inherited transitively.
+    pub parents: Vec<&'src str>,
+    /// `(method_name, param_type_strings, ret_type_string)` per method.
+    pub required: Vec<(&'src str, Vec<String>, String)>,
+}
+
+/// agent: protocols-146 — an explicit `X is Eq Show` assertion.  Records
+/// that the user *promised* `ty` implements every proto in `protos`; the
+/// mono pass verifies the machines exist and errors (E042) if they drift.
+#[derive(Debug, Clone)]
+pub struct ImplEntry<'src> {
+    pub ty: &'src str,
+    pub protos: Vec<&'src str>,
+    pub module: ModuleId,
+    pub span: chumsky::span::SimpleSpan,
+}
+
 /// All callable items declared in a single `.lake` file, plus the local
 /// `+import` bindings that bring foreign names into scope.
 #[derive(Debug, Default)]
@@ -227,6 +254,10 @@ pub struct ModuleScope<'src> {
     /// Enum type declarations defined in this file, keyed by source name.
     /// See docs/state/features/145_enums.md — resolver / typeck land later.
     pub enums: HashMap<&'src str, EnumEntry<'src>>,
+    /// agent: protocols-146 — proto declarations defined in this file.
+    pub protos: HashMap<&'src str, ProtoEntry<'src>>,
+    /// agent: protocols-146 — explicit `X is Eq` assertions in this file.
+    pub impls: Vec<ImplEntry<'src>>,
     /// Aliases brought into scope by `+import` lines.
     /// Key = local binding name (alias or last path segment).
     /// Value = (target module, target item's source name).
@@ -500,6 +531,46 @@ impl<'src> ProgramRegistry<'src> {
         None
     }
 
+    /// agent: protocols-146 — look up a proto by source name across all
+    /// modules (Lake's symbol space is flat).  Used by the mono pass to
+    /// resolve `[T: Eq]` bounds and `+Parent` chains.
+    pub fn lookup_proto(&self, name: &str) -> Option<&ProtoEntry<'src>> {
+        for module in &self.modules {
+            if let Some(p) = module.protos.get(name) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// agent: protocols-146 — every explicit `X is Eq` assertion across
+    /// all modules.  The mono pass walks these to enforce the drift lock.
+    pub fn all_impls(&self) -> impl Iterator<Item = &ImplEntry<'src>> {
+        self.modules.iter().flat_map(|m| m.impls.iter())
+    }
+
+    /// agent: protocols-146 — does a machine named `name` exist anywhere
+    /// with a branch whose parameter type strings equal `params` and whose
+    /// return type equals `ret`?  Used by proto bound verification: a type
+    /// X satisfies a method-proto if the required machine branch exists
+    /// after `Self := X` substitution (structural / auto-implement).
+    ///
+    /// Matching is exact-string on the rendered types.  `_` in the proto's
+    /// declared param (rare) and trailing-arity differences are NOT special-
+    /// cased — protos declare concrete shapes.
+    pub fn has_method_with_sig(&self, name: &str, params: &[String], ret: &str) -> bool {
+        for module in &self.modules {
+            if let Some(m) = module.machines.get(name) {
+                for b in &m.branches {
+                    if b.params == params && (b.ret == ret || ret == "pid") {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Same as [`lookup_enum`] but pinned to a specific module's scope.
     pub fn lookup_enum_in(&self, current: ModuleId, name: &str) -> Option<&EnumEntry<'src>> {
         if let Some(e) = self.module(current).enums.get(name) {
@@ -677,6 +748,7 @@ impl<'src> ProgramRegistry<'src> {
                             ));
                             continue;
                         }
+                        // duplicate-symbol checks unchanged below.
                         match build_enum_entry(&decl.inner, id) {
                             Ok(entry) => {
                                 // Idempotent re-insert if we already saw this
@@ -706,6 +778,26 @@ impl<'src> ProgramRegistry<'src> {
                             }
                             Err(e) => errors.push(tag(e)),
                         }
+                    }
+                    // agent: protocols-146 — record proto declarations.
+                    Item::Proto(decl) => {
+                        let entry = build_proto_entry(&decl.inner, id);
+                        self.module_mut(id).protos.insert(entry.name, entry);
+                    }
+                    // agent: protocols-146 — record explicit impl asserts.
+                    Item::Impl(decl) => {
+                        let entry = ImplEntry {
+                            ty: decl.inner.ty.inner.0,
+                            protos: decl
+                                .inner
+                                .protos
+                                .iter()
+                                .map(|p| p.inner.0)
+                                .collect(),
+                            module: id,
+                            span: decl.inner.ty.span,
+                        };
+                        self.module_mut(id).impls.push(entry);
                     }
                 }
             }
@@ -837,6 +929,36 @@ fn build_enum_entry<'src>(
         type_params: decl.type_params.iter().map(|p| p.inner.0).collect(),
         variants,
     })
+}
+
+/// agent: protocols-146 — convert a parsed [`ProtoDecl`] into its registry
+/// view.  `Self` is preserved verbatim in the type strings; substitution
+/// happens at bound-verification time.
+fn build_proto_entry<'src>(
+    decl: &crate::api::ast::ProtoDecl<'src>,
+    module: ModuleId,
+) -> ProtoEntry<'src> {
+    let required = decl
+        .methods
+        .iter()
+        .map(|m| {
+            let params: Vec<String> =
+                m.inner.params.iter().map(|t| t.inner.to_string()).collect();
+            let ret = m
+                .inner
+                .ret
+                .as_ref()
+                .map(|t| t.inner.to_string())
+                .unwrap_or_else(|| "pid".to_string());
+            (m.inner.name.inner.0, params, ret)
+        })
+        .collect();
+    ProtoEntry {
+        name: decl.name.inner.0,
+        module,
+        parents: decl.parents.iter().map(|p| p.inner.0).collect(),
+        required,
+    }
 }
 
 /// Extract `(name, signature)` from an `@ffi(name { params } { ret })`

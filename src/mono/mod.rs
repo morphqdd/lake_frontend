@@ -194,6 +194,23 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             }
         }
 
+        // agent: protocols-146 — drift lock.  Every explicit `X is Eq`
+        // assertion must hold even if X never appears in a bounded
+        // generic.  Verify each up front so removing a required machine
+        // surfaces at the impl site.
+        let impls: Vec<(String, String, SimpleSpan)> = self
+            .registry
+            .all_impls()
+            .flat_map(|i| {
+                i.protos
+                    .iter()
+                    .map(move |p| (i.ty.to_string(), p.to_string(), i.span))
+            })
+            .collect();
+        for (ty, proto, span) in impls {
+            self.check_proto_satisfied(&proto, &ty, span);
+        }
+
         // Pass 2: walk every non-generic machine, rewriting call sites.
         let mut modules: Vec<ParsedModule<'src>> = Vec::with_capacity(program.modules.len());
         for module in program.modules.drain(..) {
@@ -299,7 +316,7 @@ impl<'src, 'a> MonoCx<'src, 'a> {
     }
 
     fn walk_machine(&mut self, machine: Machine<'src>, module_id: ModuleId) -> Machine<'src> {
-        let Machine { attrs, vis, ident, generics, items } = machine;
+        let Machine { attrs, vis, ident, generics, bounds, items } = machine;
         let new_items = items
             .into_iter()
             .map(|item| {
@@ -318,6 +335,7 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             vis,
             ident,
             generics,
+            bounds,
             items: new_items,
         }
     }
@@ -601,10 +619,35 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                 receiver: Box::new(self.walk_expr(*receiver, scope, module_id)),
                 index,
             },
-            Expr::Index { receiver, index } => Expr::Index {
-                receiver: Box::new(self.walk_expr(*receiver, scope, module_id)),
-                index: Box::new(self.walk_expr(*index, scope, module_id)),
-            },
+            // agent: protocols-146 — `recv[i]` desugar.  `buf[i]` stays the
+            // built-in postfix load; a non-buf receiver (record / enum /
+            // NamedGeneric / mono'd-record) lowers to `index(recv i)` so
+            // the overload machinery dispatches to the type's `index`
+            // method (e.g. Vec's `vec_get` alias).  See
+            // docs/state/features/146_protos.md.
+            Expr::Index { receiver, index } => {
+                let receiver = self.walk_expr(*receiver, scope, module_id);
+                let index = self.walk_expr(*index, scope, module_id);
+                let recv_ty = self.infer_expr_type(&receiver.inner, scope);
+                if self.is_indexable_via_proto(&recv_ty) {
+                    // Build `index(receiver index)` and re-run callee
+                    // rewriting so a generic `index[T]` resolves / monos.
+                    let idx_name = self.leak_name("index".to_string());
+                    let callee = Expr::Var(idx_name, Type::Unknown).with_span(span);
+                    let args = vec![receiver, index];
+                    let new_ident =
+                        self.maybe_rewrite_callee(callee, &args, scope, module_id, span);
+                    Expr::Jump {
+                        ident: Box::new(new_ident),
+                        args,
+                    }
+                } else {
+                    Expr::Index {
+                        receiver: Box::new(receiver),
+                        index: Box::new(index),
+                    }
+                }
+            }
             Expr::DotAccess { receiver, field } => Expr::DotAccess {
                 receiver: Box::new(self.walk_expr(*receiver, scope, module_id)),
                 field,
@@ -1294,6 +1337,10 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             let s = m.clone();
             return Box::leak(s.into_boxed_str());
         }
+        // agent: protocols-146 — verify `[T: Eq]` bounds against the
+        // concrete substituted types before emitting the instance.  Runs
+        // once per unique (base, args) pair (after the cache check).
+        self.verify_bounds(base, args, owner, _call_span);
         let mangled_owned = format!("{}_{}", base, arg_strs.join("_"));
         let mangled_leaked = self.leak_name(mangled_owned.clone());
         self.mono_machines.insert(key, mangled_owned);
@@ -1304,6 +1351,140 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             module: owner,
         });
         mangled_leaked
+    }
+
+    /// agent: protocols-146 — does `recv[i]` on this receiver type lower to
+    /// an `index(recv i)` call rather than the built-in `buf[i]` load?
+    ///
+    /// True for record / enum / NamedGeneric receivers and mono'd-record
+    /// named types.  False for `buf` (the built-in stays), for primitives,
+    /// and for `Unknown` (no info → leave as built-in; typeck/backend
+    /// surface a real error if it's genuinely wrong).
+    fn is_indexable_via_proto(&self, ty: &Type<'src>) -> bool {
+        match ty {
+            // Still-generic use site — index always goes through a method.
+            Type::NamedGeneric { .. } => true,
+            Type::Named(name) => {
+                let n = name.inner.0;
+                if n == "buf" {
+                    return false;
+                }
+                // A name resolving to a record / enum (incl. mono'd copies
+                // emitted this pass) indexes via a method.
+                if self.registry.resolve_bare_in(ModuleId::ROOT, n).map_or(false, |r| {
+                    matches!(r, Resolution::Record(_))
+                }) {
+                    return true;
+                }
+                if self.registry.lookup_enum_in(ModuleId::ROOT, n).is_some() {
+                    return true;
+                }
+                // Mono'd record / enum names emitted in this pass aren't in
+                // the (pre-mono) registry yet — recognise them by cache.
+                self.mono_records.values().any(|m| m == n)
+                    || self.mono_enums.values().any(|m| m == n)
+            }
+            _ => false,
+        }
+    }
+
+    /// agent: protocols-146 — verify the proto bounds on a generic machine
+    /// against the concrete type arguments being substituted.
+    ///
+    /// For each `[Tᵢ: Proto …]` bound, resolve `Tᵢ`'s concrete type, then
+    /// for every method the proto requires (including inherited `+Parent`
+    /// requirements) check a machine of that name with the `Self := Tᵢ`
+    /// substituted signature exists.  Missing → E042.
+    fn verify_bounds(
+        &mut self,
+        base: &str,
+        args: &[Type<'src>],
+        owner: ModuleId,
+        call_span: SimpleSpan,
+    ) {
+        // Pick the matching template (by module when ambiguous).
+        let Some(cands) = self.machine_templates.get(base) else {
+            return;
+        };
+        let template = if cands.len() == 1 {
+            cands[0].1.clone()
+        } else if let Some((_, d)) = cands.iter().find(|(m, _)| *m == owner) {
+            d.clone()
+        } else {
+            return;
+        };
+        if template.bounds.is_empty() {
+            return;
+        }
+        // Map generic name → concrete substituted type string (positional).
+        let mut concrete: HashMap<&'src str, String> = HashMap::new();
+        for (tp, arg) in template.generics.iter().zip(args.iter()) {
+            concrete.insert(tp.inner.0, mangle_type(arg));
+        }
+        for (param, protos) in &template.bounds {
+            let Some(cty) = concrete.get(param.inner.0) else {
+                continue;
+            };
+            for proto in protos {
+                self.check_proto_satisfied(proto.inner.0, cty, call_span);
+            }
+        }
+    }
+
+    /// Check a single `proto` is satisfied by concrete type string `cty`.
+    /// Walks the proto's own methods plus all transitively-inherited
+    /// parent requirements; emits E042 per missing method.
+    fn check_proto_satisfied(&mut self, proto: &str, cty: &str, call_span: SimpleSpan) {
+        // Gather this proto + all ancestors (cycle-guarded).
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = vec![proto.to_string()];
+        // (proto_name, method_name, substituted_params, substituted_ret)
+        let mut reqs: Vec<(String, String, Vec<String>, String)> = Vec::new();
+        while let Some(pname) = stack.pop() {
+            if !seen.insert(pname.clone()) {
+                continue;
+            }
+            let Some(entry) = self.registry.lookup_proto(&pname) else {
+                // Unknown proto name in a bound — surface once.
+                self.errors.push(
+                    LakeError::new(
+                        format!("unknown proto `{pname}` in bound"),
+                        call_span,
+                    )
+                    .code("E042"),
+                );
+                continue;
+            };
+            for parent in &entry.parents {
+                stack.push(parent.to_string());
+            }
+            for (mname, params, ret) in &entry.required {
+                let sub_params: Vec<String> = params
+                    .iter()
+                    .map(|p| if p == "Self" { cty.to_string() } else { p.clone() })
+                    .collect();
+                let sub_ret = if ret == "Self" { cty.to_string() } else { ret.clone() };
+                reqs.push((pname.clone(), (*mname).to_string(), sub_params, sub_ret));
+            }
+        }
+        for (pname, mname, params, ret) in reqs {
+            if !self.registry.has_method_with_sig(&mname, &params, &ret) {
+                let sig = format!("{}({}) -> {}", mname, params.join(" "), ret);
+                self.errors.push(
+                    LakeError::new(
+                        format!(
+                            "type `{cty}` does not implement proto `{pname}`: \
+                             missing `{sig}`"
+                        ),
+                        call_span,
+                    )
+                    .code("E042")
+                    .help(format!(
+                        "define a machine `{mname}` with that signature for `{cty}`"
+                    )),
+                );
+            }
+        }
     }
 
     /// Intern an enum mono.  Returns the mangled `&'src str` name.
@@ -1477,6 +1658,7 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             vis: template.vis,
             ident: Ident::new(mangled).with_span(ident_span),
             generics: Vec::new(),
+            bounds: Vec::new(),
             items: new_items,
         }
     }

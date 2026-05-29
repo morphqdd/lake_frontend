@@ -436,6 +436,36 @@ pub enum VariantPayload<'src> {
     Record(Vec<(Spanned<Ident<'src>>, Spanned<Type<'src>>)>),
 }
 
+/// A single method signature inside a `proto` declaration:
+/// `eq is { Self Self -> bool }`.  `Self` parses as `Type::Named("Self")`
+/// and is substituted with the implementing type during bound verification.
+// See docs/state/features/146_protos.md.
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub struct MethodSig<'src> {
+    pub name: Spanned<Ident<'src>>,
+    pub params: Vec<Spanned<Type<'src>>>,
+    pub ret: Option<Spanned<Type<'src>>>,
+}
+
+/// `Name is proto [+Parent ...] { method* }` — protocol declaration.
+// See docs/state/features/146_protos.md.
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub struct ProtoDecl<'src> {
+    pub name: Spanned<Ident<'src>>,
+    /// Parent protos pulled in via `+Eq` on the header — their requirements
+    /// are inherited transitively.
+    pub parents: Vec<Spanned<Ident<'src>>>,
+    pub methods: Vec<Spanned<MethodSig<'src>>>,
+}
+
+/// `X is Eq Show` — explicit proto-implementation assertion (drift lock).
+// See docs/state/features/146_protos.md.
+#[derive(Debug, PartialEq, PartialOrd, Clone, Hash)]
+pub struct ImplDecl<'src> {
+    pub ty: Spanned<Ident<'src>>,
+    pub protos: Vec<Spanned<Ident<'src>>>,
+}
+
 /// A top-level item in a Lake program.  These constructs only appear at the
 /// program root, never as values inside an expression body.
 #[derive(Debug, PartialEq, PartialOrd, Clone)]
@@ -454,6 +484,10 @@ pub enum Item<'src> {
     Record(Spanned<RecordDecl<'src>>),
     /// `Name is enum { variant ... }` — nominal tagged-sum type.
     Enum(Spanned<EnumDecl<'src>>),
+    /// `Name is proto [+Parent] { method* }` — protocol declaration (#146).
+    Proto(Spanned<ProtoDecl<'src>>),
+    /// `X is Eq Show` — explicit proto-implementation assertion (#146).
+    Impl(Spanned<ImplDecl<'src>>),
 }
 
 /// `[pub] const NAME = <literal>`.
@@ -492,6 +526,11 @@ pub struct Machine<'src> {
     pub ident: Spanned<Ident<'src>>,
     /// Generic type parameters: `result(T)` → `["T"]`
     pub generics: Vec<Spanned<Ident<'src>>>,
+    /// agent: protocols-146 — proto bounds declared via `[T: Eq Ord]`.
+    /// Each entry maps a type-parameter name to the protos that constrain
+    /// it.  Empty for unbounded generics (back-compat).  Verified at
+    /// monomorphisation time against the concrete substituted type.
+    pub bounds: Vec<(Spanned<Ident<'src>>, Vec<Spanned<Ident<'src>>>)>,
     pub items: Vec<Spanned<MachineItem<'src>>>,
 }
 
@@ -508,6 +547,26 @@ impl<'src> Machine<'src> {
             vis,
             ident,
             generics,
+            bounds: Vec::new(),
+            items,
+        }
+    }
+
+    /// Construct a machine carrying proto bounds (`[T: Eq]`).
+    pub fn with_bounds(
+        attrs: Vec<Spanned<Directive<'src>>>,
+        vis: bool,
+        ident: Spanned<Ident<'src>>,
+        generics: Vec<Spanned<Ident<'src>>>,
+        bounds: Vec<(Spanned<Ident<'src>>, Vec<Spanned<Ident<'src>>>)>,
+        items: Vec<Spanned<MachineItem<'src>>>,
+    ) -> Self {
+        Self {
+            attrs,
+            vis,
+            ident,
+            generics,
+            bounds,
             items,
         }
     }

@@ -11,15 +11,24 @@ use chumsky::{
 
 use crate::{
     api::{
-        ast::{Branch, Field, Machine, MachineItem},
+        ast::{Branch, Field, Ident, Machine, MachineItem},
         token::Token,
     },
     parser::{
         branch::branch,
-        helpers::{TokenInput, ident_parser},
+        helpers::{TokenInput, ident_parser, type_param_bounds_body},
         machine::field_decl::field_decl,
     },
 };
+
+/// Type-parameter clause shared shape: ordered names + parallel bounds.
+type Generics<'src> = (
+    Vec<chumsky::span::Spanned<Ident<'src>>>,
+    Vec<(
+        chumsky::span::Spanned<Ident<'src>>,
+        Vec<chumsky::span::Spanned<Ident<'src>>>,
+    )>,
+);
 
 mod field_decl;
 
@@ -45,25 +54,23 @@ fn machine_item<'t, 'src: 't>()
 pub fn machine<'t, 'src: 't>()
 -> impl Parser<'t, TokenInput<'t, 'src>, Spanned<Machine<'src>>, Err<Rich<'t, Token<'src>>>> {
     // Historical `(T U)` form — kept for back-compat with stdlib code
-    // that predates the bracket syntax.
+    // that predates the bracket syntax.  No bounds in paren form.
     let paren_generics = ident_parser()
         .repeated()
         .collect::<Vec<_>>()
         .nested_in(select_ref!(
             Token::Parens(ts) = e => ts.split_spanned(e.span()),
             Token::TightParens(ts) = e => ts.split_spanned(e.span()),
-        ));
+        ))
+        .map(|g: Vec<_>| -> Generics { (g, Vec::new()) });
 
-    // agent: generics-142 — `[T U ...]` form.  Both spaced and tight
-    // bracket tokens accepted (e.g. `id [T]` and `id[T]`).
-    let bracket_generics = ident_parser()
-        .repeated()
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .nested_in(select_ref!(
-            Token::SquareBrackets(ts) = e => ts.split_spanned(e.span()),
-            Token::TightSquareBrackets(ts) = e => ts.split_spanned(e.span()),
-        ));
+    // agent: generics-142 / protocols-146 — `[T U ...]` / `[T: Eq Ord]`
+    // form.  Both spaced and tight bracket tokens accepted.  The body
+    // parser also captures proto bounds (`T: Eq`).
+    let bracket_generics = type_param_bounds_body().nested_in(select_ref!(
+        Token::SquareBrackets(ts) = e => ts.split_spanned(e.span()),
+        Token::TightSquareBrackets(ts) = e => ts.split_spanned(e.span()),
+    ));
 
     just(Token::Pub)
         .or_not()
@@ -72,7 +79,7 @@ pub fn machine<'t, 'src: 't>()
         .then(
             choice((bracket_generics, paren_generics))
                 .or_not()
-                .map(|g| g.unwrap_or_default()),
+                .map(|g: Option<Generics>| g.unwrap_or_default()),
         )
         .then_ignore(just(Token::Is))
         .then(
@@ -81,6 +88,8 @@ pub fn machine<'t, 'src: 't>()
                 .collect::<Vec<_>>()
                 .nested_in(select_ref!(Token::CurlyBrackets(ts) = e => ts.split_spanned(e.span()))),
         )
-        .map(|(((vis, ident), generics), items)| Machine::new(vec![], vis, ident, generics, items))
+        .map(|(((vis, ident), (generics, bounds)), items)| {
+            Machine::with_bounds(vec![], vis, ident, generics, bounds, items)
+        })
         .spanned()
 }
