@@ -9,6 +9,7 @@
 )]
 
 pub mod api;
+pub mod cfg_filter;
 pub mod error_handle;
 pub mod lexer;
 pub mod loader;

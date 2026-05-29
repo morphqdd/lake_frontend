@@ -4,6 +4,7 @@ use chumsky::{Parser, input::Input, span::Spanned};
 
 use crate::api::ast::Item;
 use crate::api::token::Token;
+use crate::cfg_filter::{CfgTarget, filter_program};
 use crate::loader::{ParsedProgram, ProgramSources};
 use crate::lowering::{lower_program, mangle_program, relift_program};
 use crate::mono::monomorphise_program;
@@ -116,6 +117,30 @@ pub fn load_and_build<P: AsRef<Path>>(
 pub fn build_program<'src>(
     sources: &'src ProgramSources,
 ) -> Result<LakeProgram<'src>, LakeErrors> {
+    build_program_for_target(sources, host_arch_str())
+}
+
+/// Host architecture as the canonical `@cfg(arch="...")` string.
+/// Defaults the target when the backend does not pass `--target`.
+pub fn host_arch_str() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        // Unknown host: hand back the raw arch so `@cfg` simply never
+        // matches x86_64/aarch64 predicates rather than panicking here.
+        other => other,
+    }
+}
+
+/// Like [`build_program`] but filters `@cfg(arch="...")` items against an
+/// explicit target arch string (`"x86_64"` / `"aarch64"`).  The backend
+/// threads its `--target` choice in here so stdlib's per-arch syscall
+/// constants resolve to the right value before registry / typeck / codegen
+/// ever run.  See docs/state/features/054_cfg.md.
+pub fn build_program_for_target<'src>(
+    sources: &'src ProgramSources,
+    target_arch: &str,
+) -> Result<LakeProgram<'src>, LakeErrors> {
     let parsed = sources.parse_all().map_err(|errs| {
         // Flatten per-file ParseErrors into a single LakeErrors bag,
         // tagging each error with the file its span belongs to so the
@@ -126,6 +151,18 @@ pub fn build_program<'src>(
         }
         bag
     })?;
+
+    // #054 — drop `@cfg(arch=...)` items whose arch != target BEFORE the
+    // registry sees them, so two per-arch items with the same name never
+    // collide.  Malformed `@cfg` surfaces as E041.
+    let (parsed, cfg_errors) = filter_program(parsed, CfgTarget::new(target_arch));
+    if !cfg_errors.is_empty() {
+        let mut bag = LakeErrors::default();
+        for e in cfg_errors {
+            bag.push(e);
+        }
+        return Err(bag);
+    }
 
     let mut registry: ProgramRegistry<'src> = ProgramRegistry::with_rt();
     if let Err(e) = registry.populate_from(&parsed) {
