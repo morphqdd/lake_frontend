@@ -66,8 +66,14 @@ struct MonoCx<'src, 'a> {
     work: Vec<MonoJob<'src>>,
     /// Generic record templates indexed by source name.
     record_templates: HashMap<String, RecordDecl<'src>>,
-    /// Generic machine templates indexed by source name.
-    machine_templates: HashMap<String, Machine<'src>>,
+    /// Generic machine templates indexed by source name.  A name can
+    /// map to MORE THAN ONE template when distinct modules define a
+    /// same-named generic (e.g. `std.option.unwrap_or[T]` vs
+    /// `std.result.unwrap_or[T E]`) — Lake's symbol space is flat but
+    /// module-aware dispatch resolves the right one per call site.
+    /// Single-entry names (the common case) behave exactly as a plain
+    /// map.  Each entry carries its owning module.
+    machine_templates: HashMap<String, Vec<(ModuleId, Machine<'src>)>>,
     /// agent: generics-142 phase 4 — generic enum templates indexed by
     /// source name.  Populated in pass 1; consulted during walk_expr
     /// when rewriting `Enum.Variant(args)` constructors and Let-bound
@@ -99,6 +105,9 @@ enum MonoJob<'src> {
         base: String,
         args: Vec<Type<'src>>,
         mangled: &'src str,
+        /// Owning module of the chosen template — disambiguates
+        /// same-named generics across modules (e.g. two `unwrap_or`).
+        module: ModuleId,
     },
     /// agent: generics-142 phase 4 — concrete enum instance to emit.
     Enum {
@@ -156,7 +165,13 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                     }
                     Item::Machine(m) if !m.inner.generics.is_empty() => {
                         let name = m.inner.ident.inner.0.to_string();
-                        self.machine_templates.insert(name.clone(), m.inner.clone());
+                        self.machine_templates
+                            .entry(name.clone())
+                            .or_default()
+                            .push((module_id, m.inner.clone()));
+                        // template_module keeps the LAST owner for the
+                        // legacy single-entry path; the per-instance
+                        // owner now travels in MonoJob::Machine.module.
                         self.template_module.insert(name, module_id);
                     }
                     // agent: generics-142 phase 4 — index generic enums
@@ -233,11 +248,8 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                         Item::Record(new_record.with_span(span)).with_span(span),
                     );
                 }
-                MonoJob::Machine { base, args, mangled } => {
-                    let module_id = *self
-                        .template_module
-                        .get(&base)
-                        .expect("machine template module");
+                MonoJob::Machine { base, args, mangled, module } => {
+                    let module_id = module;
                     let new_machine = self.instantiate_machine(&base, &args, mangled, module_id);
                     let module = modules
                         .iter_mut()
@@ -624,19 +636,33 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                 let mangled = self.intern_record_mono(name, &concrete_args, call_span);
                 return Expr::Var(mangled, ty.clone()).with_span(span);
             }
-            // Generic machine call?
-            if let Some(decl) = self.machine_templates.get(*name).cloned() {
-                let subst = match self.unify_against_machine(&decl, args, scope, call_span) {
-                    Some(s) => s,
-                    None => return ident,
-                };
-                let concrete_args: Vec<Type<'src>> = decl
-                    .generics
-                    .iter()
-                    .map(|p| subst.get(p.inner.0).cloned().unwrap_or(Type::Unknown))
-                    .collect();
-                let mangled = self.intern_machine_mono(name, &concrete_args, call_span);
-                return Expr::Var(mangled, ty.clone()).with_span(span);
+            // Generic machine call?  A name may map to several
+            // same-named generic templates from different modules
+            // (e.g. `Option.unwrap_or[T]` and `Result.unwrap_or[T E]`).
+            // Overload-resolve by argument types: try each candidate
+            // quietly and keep the one whose params bind cleanly.
+            if let Some(cands) = self.machine_templates.get(*name).cloned() {
+                if !cands.is_empty() {
+                    for (owner, decl) in &cands {
+                        if let Some(subst) =
+                            self.unify_against_machine_quiet(decl, args, scope)
+                        {
+                            let concrete_args: Vec<Type<'src>> = decl
+                                .generics
+                                .iter()
+                                .map(|p| subst.get(p.inner.0).cloned().unwrap_or(Type::Unknown))
+                                .collect();
+                            let mangled = self
+                                .intern_machine_mono(name, &concrete_args, *owner, call_span);
+                            return Expr::Var(mangled, ty.clone()).with_span(span);
+                        }
+                    }
+                    // No candidate unified — emit one diagnostic against
+                    // the first (best-effort UX), leave the call as-is.
+                    let (_, first) = &cands[0];
+                    self.unify_against_machine(first, args, scope, call_span);
+                    return ident;
+                }
             }
         }
         ident
@@ -801,6 +827,40 @@ impl<'src, 'a> MonoCx<'src, 'a> {
         scope: &HashMap<&'src str, Type<'src>>,
         call_span: SimpleSpan,
     ) -> Option<Subst<'src>> {
+        if let Some(s) = self.unify_against_machine_quiet(decl, args, scope) {
+            return Some(s);
+        }
+        if let Some(tp) = decl.generics.first() {
+            self.errors.push(
+                LakeError::new(
+                    format!(
+                        "cannot infer type parameter `{}` for `{}`",
+                        tp.inner.0, decl.ident.inner.0,
+                    ),
+                    call_span,
+                )
+                .code("E040")
+                .help(
+                    "supply arguments whose types fix the parameter(s), or \
+                     annotate the binding explicitly",
+                ),
+            );
+        }
+        None
+    }
+
+    /// Argument-driven unification without emitting diagnostics.  Used
+    /// by overload resolution: when a name has several same-named
+    /// generic templates (e.g. `Option.unwrap_or[T]` /
+    /// `Result.unwrap_or[T E]`) the caller tries each candidate and
+    /// keeps the one whose params bind cleanly, so a failed attempt on
+    /// the wrong candidate must stay silent.
+    fn unify_against_machine_quiet(
+        &mut self,
+        decl: &Machine<'src>,
+        args: &[Spanned<Expr<'src>>],
+        scope: &HashMap<&'src str, Type<'src>>,
+    ) -> Option<Subst<'src>> {
         let type_params: HashSet<&'src str> =
             decl.generics.iter().map(|p| p.inner.0).collect();
         for item in &decl.items {
@@ -840,24 +900,6 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             if all_bound {
                 return Some(subst);
             }
-        }
-        // No branch unified — surface E040 against the first unbound
-        // type parameter (a typical UX cue).
-        if let Some(tp) = decl.generics.first() {
-            self.errors.push(
-                LakeError::new(
-                    format!(
-                        "cannot infer type parameter `{}` for `{}`",
-                        tp.inner.0, decl.ident.inner.0,
-                    ),
-                    call_span,
-                )
-                .code("E040")
-                .help(
-                    "supply arguments whose types fix the parameter(s), or \
-                     annotate the binding explicitly",
-                ),
-            );
         }
         None
     }
@@ -1100,7 +1142,19 @@ impl<'src, 'a> MonoCx<'src, 'a> {
                         .collect();
                     for (base, arg_strs, mangled) in snapshot {
                         if mangled == *name {
-                            if let Some(decl) = self.machine_templates.get(&base).cloned()
+                            // Pick the same-named template whose generic
+                            // arity matches this instance's arg count —
+                            // distinguishes e.g. unwrap_or[T] from
+                            // unwrap_or[T E].
+                            if let Some(decl) = self
+                                .machine_templates
+                                .get(&base)
+                                .and_then(|v| {
+                                    v.iter()
+                                        .find(|(_, d)| d.generics.len() == arg_strs.len())
+                                        .or_else(|| v.first())
+                                        .map(|(_, d)| d.clone())
+                                })
                             {
                                 let subst: Subst<'src> = decl
                                     .generics
@@ -1182,6 +1236,7 @@ impl<'src, 'a> MonoCx<'src, 'a> {
         &mut self,
         base: &str,
         args: &[Type<'src>],
+        owner: ModuleId,
         _call_span: SimpleSpan,
     ) -> &'src str {
         let arg_strs: Vec<String> = args.iter().map(mangle_type).collect();
@@ -1197,6 +1252,7 @@ impl<'src, 'a> MonoCx<'src, 'a> {
             base: base.to_string(),
             args: args.to_vec(),
             mangled: mangled_leaked,
+            module: owner,
         });
         mangled_leaked
     }
@@ -1336,7 +1392,15 @@ impl<'src, 'a> MonoCx<'src, 'a> {
         let template = self
             .machine_templates
             .get(base)
-            .cloned()
+            .and_then(|v| {
+                if v.len() == 1 {
+                    Some(v[0].1.clone())
+                } else {
+                    v.iter()
+                        .find(|(m, _)| *m == module_id)
+                        .map(|(_, d)| d.clone())
+                }
+            })
             .expect("machine template");
         let subst: Subst<'src> = template
             .generics
